@@ -1,24 +1,29 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 
-const databaseUrl = process.env.DATABASE_URL;
-
-if (!databaseUrl) {
-  throw new Error("DATABASE_URL is required");
-}
+type Database = ReturnType<typeof drizzle>;
 
 const globalForDb = globalThis as typeof globalThis & {
   __arenaNextJsPostgresqlPool?: Pool;
+  __arenaNextJsDatabase?: Database;
 };
 
-export const pool =
-  globalForDb.__arenaNextJsPostgresqlPool ??
-  new Pool({
-    connectionString: databaseUrl,
-  });
+/**
+ * Resolve the database only when an API handler actually needs it. Next.js
+ * imports route modules during `next build`, when runtime secrets such as
+ * DATABASE_URL may not yet be available.
+ */
+export function getDb(): Database {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL is required");
+  }
 
-if (process.env.NODE_ENV !== "production") {
-  globalForDb.__arenaNextJsPostgresqlPool = pool;
+  const pool =
+    globalForDb.__arenaNextJsPostgresqlPool ??
+    (globalForDb.__arenaNextJsPostgresqlPool = new Pool({
+      connectionString: databaseUrl,
+    }));
+
+  return (globalForDb.__arenaNextJsDatabase ??= drizzle(pool));
 }
-
-export const db = drizzle(pool);
