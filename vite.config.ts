@@ -13,7 +13,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), viteSingleFile()],
   server: {
     host: "0.0.0.0",
-    allowedHosts: ["starafk.onrender.com"],
+    allowedHosts: ["starafk.onrender.com", ".e2b.app"], // Render + Arena preview hosts
   },
   resolve: {
     alias: {
