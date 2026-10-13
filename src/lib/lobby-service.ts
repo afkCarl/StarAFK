@@ -1,6 +1,6 @@
 import { and, asc, eq, lt } from "drizzle-orm";
 
-import { db } from "@/db";
+import { getDb } from "@/db";
 import { lobbies, players, type PlayerRow } from "@/db/schema";
 import {
   DEFAULT_COLOR,
@@ -73,6 +73,7 @@ function toLobbyPlayer(row: PlayerRow): LobbyPlayer {
 }
 
 async function listPlayers(code: string): Promise<PlayerRow[]> {
+  const db = getDb();
   return db
     .select()
     .from(players)
@@ -84,6 +85,7 @@ export async function createLobby(
   mode: string,
   profileInput: unknown,
 ): Promise<{ selfId: string; lobby: LobbyState }> {
+  const db = getDb();
   const profile = sanitizeProfile(profileInput);
 
   let code = generateCode();
@@ -116,6 +118,7 @@ export async function joinLobby(
   const code = (codeInput || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 6);
   if (code.length !== 6) return null;
 
+  const db = getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
   if (!lobby) return null;
 
@@ -137,6 +140,7 @@ export async function joinLobby(
 }
 
 export async function touchPlayer(code: string, playerId: string): Promise<void> {
+  const db = getDb();
   await db
     .update(players)
     .set({ lastSeen: new Date() })
@@ -151,6 +155,7 @@ export async function getLobbyState(
   const code = (codeInput || "").toUpperCase().slice(0, 6);
   if (code.length !== 6) return null;
 
+  const db = getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
   if (!lobby) return null;
 
@@ -192,6 +197,7 @@ export async function updateProfile(
   playerId: string,
   profileInput: unknown,
 ): Promise<boolean> {
+  const db = getDb();
   const profile = sanitizeProfile(profileInput);
   const updated = await db
     .update(players)
@@ -206,6 +212,7 @@ export async function updateRoleCounts(
   playerId: string,
   roleCountsInput: unknown,
 ): Promise<boolean> {
+  const db = getDb();
   const [host] = await db
     .select({ id: players.id })
     .from(players)
@@ -227,6 +234,7 @@ export async function updateRoleCounts(
 }
 
 export async function removePlayer(code: string, playerId: string): Promise<void> {
+  const db = getDb();
   await db
     .delete(players)
     .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
