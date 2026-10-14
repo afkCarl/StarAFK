@@ -27,6 +27,15 @@ Rollen-Setup und der Spielstart werden live für alle synchronisiert.
 - **Selbstheilend**: Schlägt die Datenbank fehl, baut das Backend die Verbindung
   automatisch neu auf (`src/db/index.ts`); `/api/health` zeigt Modus, Speicherart
   und Fehlerzähler.
+- **Die Seite bleibt immer erreichbar**: `/api/health` prüft die Datenbank
+  **im Hintergrund** und antwortet sofort (immer HTTP 200, solange der Server
+  lebt). Hintergrund: Render bricht seinen Health-Check nach **5 s** ab. Wartet
+  die Route selbst auf die Datenbank, gilt die Instanz bei einer langsamen oder
+  kurz nicht erreichbaren Datenbank als „kaputt“: Render startet sie neu, der
+  nächste Check läuft wieder ins Zeitlimit – die Seite bleibt dann dauerhaft
+  mit **502 „This service is currently unavailable“** weg, obwohl sie selbst in
+  Millisekunden antworten würde (gemessen: 34 s Health-Antwort bei
+  nicht erreichbarer Datenbank, Startseite gleichzeitig 17 ms).
 
 ## Render + Datenbank: läuft automatisch (nichts einzurichten)
 
@@ -63,10 +72,51 @@ aufwachenden/kurz nicht erreichbaren Datenbank aufrufbar – der Health-Check
 antwortet dann `ok: false` mit Fehlertext in `status.lastError`, statt dass
 Render die Instanz in einer Neustart-Schleife festhält.
 
+Antwort von `/api/health` (Beispiel):
+
+```json
+{
+  "ok": true, "starting": false, "db": "postgres", "provider": "postgres",
+  "status": { "mode": "postgres", "provider": "postgres", "storage": "external",
+              "ready": true, "failures": 0, "resets": 0 },
+  "services": { "postgres": "postgres", "auth": false, "objectStorage": false,
+                "aiGateway": false, "functions": false },
+  "check": { "running": false, "checkedAt": "2026-10-14T15:55:35.645Z",
+             "ageMs": 1234, "latencyMs": 3 }
+}
+```
+
+`ok` ist das Ergebnis der letzten Hintergrundprüfung, `check.checkedAt` ihr
+Zeitpunkt (`starting: true` = die allererste Prüfung läuft noch). Wie oft im
+Hintergrund geprüft wird, bestimmt `HEALTH_CHECK_INTERVAL_MS`
+(Standard 60000 = 1 Minute).
+
 > **Kein Datenbank-Download nötig.** Falls du wirklich offline/lokal spielen
 > willst: Die eingebettete PGlite-Datenbank liegt als normaler Ordner unter
 > `.data/pglite` und wird automatisch erzeugt – die „herunterzuladende Datenbank"
 > ist also einfach mit im Projekt. Nichts zu installieren.
+
+## Seite zeigt „502 – This service is currently unavailable“
+
+Das heißt: Render bekommt keine Antwort **oder** die Instanz fällt durch die
+Health-Checks (Render bricht `/api/health` nach **5 s** ab und startet die
+Instanz bei wiederholten Fehlern neu – dann bleibt die Seite dauerhaft weg).
+
+Die App ist dagegen gebaut: `/api/health` wartet **nie** auf die Datenbank,
+sondern antwortet sofort aus dem letzten geprüften Zustand (die
+Datenbankprüfung läuft im Hintergrund). Trotzdem kurz durchgehen:
+
+1. **Render-Logs öffnen** (Dashboard → Service → Logs, Filter `level: error`).
+   Dort steht, ob der Build fehlgeschlagen ist oder woran die Instanz stirbt.
+2. **Letzten Deploy prüfen** (Dashboard → Deploys): steht dort „Deploy failed",
+   steht die Ursache in den Build-Logs (meist ein `npm ci`/Dependency-Problem).
+3. **Health-Check-Pfad** (Settings): `/api/health`. Die Route antwortet immer
+   mit 200 – fällt sie trotzdem aus, hängt der Server selbst (Logs!).
+4. **Free-Instanz schläft**: der erste Aufruf nach 15 Minuten Pause dauert
+   ~30–50 s. Einfach noch einmal neu laden.
+
+Zur Not kann der Health-Check im Dashboard vorübergehend entfernt werden –
+Render prüft dann nur per TCP, ob der Port offen ist.
 
 ## Lobby erstellen geht nicht / „Fehlercode" auf Render – Checkliste
 
@@ -197,6 +247,7 @@ Die Attrappen liegen in `scripts/dev-mocks.mjs` und werden nur für Tests benutz
 | `DATABASE_POOL_MAX` | Größe des Verbindungspools (Standard 4). |
 | `PGLITE_DIR` | Ablageort der eingebetteten Datenbank (Standard `.data/pglite`). |
 | `LOBBY_STALE_MS` | Lebenszeichen-Fenster in ms (Standard 120000). |
+| `HEALTH_CHECK_INTERVAL_MS` | Abstand der Datenbankprüfung im Hintergrund in ms (Standard 60000). `/api/health` antwortet unabhängig davon immer sofort. |
 | `NEON_AUTH_*` | Neon Auth (siehe Neon-Setup) – ohne sie bleibt der Login aus. |
 | `AWS_*` | Neon Object Storage – ohne sie liegen Profilbilder als Data-URL in Postgres. |
 | `NEON_AI_GATEWAY_*`, `NEON_FUNCTION_GAMEMASTER_BASE_URL` | AI Game Master – ohne sie wird die Karte als „nicht konfiguriert“ angezeigt. |

@@ -76,13 +76,21 @@ src/db/index.ts
 src/db/migrate.ts
 src/db/schema.ts
 src/lib/api.ts
+src/lib/health.ts
 src/lib/game.ts
 src/lib/image.ts
 src/lib/lobby-service.ts
+src/lib/game-master.ts
+src/lib/storage.ts
+src/lib/auth/server.ts
+src/lib/auth/guard.ts
+src/lib/auth/client.ts
 src/app/layout.tsx
 src/app/page.tsx
 src/app/globals.css
 src/app/api/health/route.ts
+src/app/api/config/route.ts
+src/app/api/auth/[...path]/route.ts
 src/app/api/lobby/create/route.ts
 src/app/api/lobby/join/route.ts
 src/app/api/lobby/state/route.ts
@@ -96,6 +104,8 @@ src/components/werwolf/sky-background.tsx
 src/components/werwolf/walking-cat.tsx
 src/components/werwolf/role-icon.tsx
 src/components/werwolf/glass-card.tsx
+src/components/auth/auth-gate.tsx
+src/components/auth/sign-in-screen.tsx
 public/favicon-light.svg
 public/favicon-dark.svg
 public/roles/Amoricon.svg
@@ -336,20 +346,50 @@ databases:
 /**
  * Läuft einmal beim Start des Servers (Next.js Instrumentation-Hook).
  *
- * Hier wird die Datenbank absichtlich schon im Hintergrund geöffnet: das
- * Anlegen/Öffnen der eingebetteten PostgreSQL-Datenbank (PGlite) dauert beim
- * allerersten Zugriff ein paar Sekunden und auch eine externe Datenbank
- * (Neon) braucht für den ersten Verbindungsaufbau kurz. Ohne diesen Vorlauf
- * müsste der erste „Lobby erstellen“-Klick darauf warten (auf
- * Render-Free-Instanzen spürbar).
+ * Drei Aufgaben, alle bewusst nicht blockierend:
  *
- * Wichtig: Der Vorlauf darf den Serverstart nie blockieren. Antwortet die
- * Datenbank nicht innerhalb des Zeitlimits, startet der Server trotzdem –
- * die API-Routen bauen die Verbindung dann bei Bedarf selbst auf (inkl.
- * Wiederholung, siehe `getDb` in `src/db/index.ts`).
+ * 1. **Absturzschutz** (`installCrashGuards`): Eine unbehandelte
+ *    Promise-Ablehnung beendet sonst den ganzen Node-Prozess. Auf Render
+ *    bedeutete das bisher: Instanz weg, Neustart, und in der Zwischenzeit
+ *    „502 – Service unavailable“ für alle Besucher.
+ * 2. **Health-Monitor** (`startHealthMonitor`): prüft die Datenbank regelmäßig
+ *    im Hintergrund (Standard: 1× pro Minute, einstellbar über
+ *    `HEALTH_CHECK_INTERVAL_MS`), damit `/api/health` sofort aus dem Cache
+ *    antworten kann (Render bricht die Prüfung nach 5 s ab – siehe
+ *    src/lib/health.ts).
+ * 3. **Datenbank-Vorlauf**: Das Anlegen/Öffnen der eingebetteten
+ *    PostgreSQL-Datenbank (PGlite) dauert beim allerersten Zugriff ein paar
+ *    Sekunden, eine externe Datenbank (Neon) braucht für den ersten
+ *    Verbindungsaufbau kurz. Ohne Vorlauf müsste der erste
+ *    „Lobby erstellen“-Klick darauf warten.
+ *
+ * Wichtig: Nichts davon darf den Serverstart blockieren. Antwortet die
+ * Datenbank nicht innerhalb des Zeitlimits, startet der Server trotzdem – die
+ * API-Routen bauen die Verbindung dann bei Bedarf selbst auf (inkl.
+ * Wiederholung, siehe `getDb` in src/db/index.ts).
  */
 export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  try {
+    const { installCrashGuards, startHealthMonitor } = await import("@/lib/health");
+    // 1) Nicht mehr wegen eines einzelnen Fehlers komplett abbrechen.
+    installCrashGuards();
+    // 2) Datenbankzustand regelmäßig im Hintergrund prüfen.
+    startHealthMonitor();
+  } catch (error) {
+    console.error("[start] Gesundheitsprüfung konnte nicht starten", error);
+  }
+
+  // Bewusst NICHT abwarten (`void`): Next.js lässt Anfragen erst durch, wenn
+  // dieser Hook fertig ist. Ein blockierender Vorlauf würde also genau die
+  // ersten Health-Checks verzögern, die Render sofort nach dem Start schickt
+  // (und die nach 5 s abbrechen). Der Vorlauf läuft daher im Hintergrund.
+  void warmUpDatabase();
+}
+
+/** Öffnet die Datenbank im Hintergrund, damit der erste Klick nicht wartet. */
+async function warmUpDatabase(): Promise<void> {
   try {
     const { getDb, dbStatus } = await import("@/db");
     const warmup = getDb().then(() => true);
@@ -362,7 +402,7 @@ export async function register(): Promise<void> {
       );
     } else {
       console.warn(
-        "[start] Datenbank-Vorlauf dauert länger als 15 s – Server startet trotzdem, die Verbindung wird bei der ersten Anfrage aufgebaut.",
+        "[start] Datenbank-Vorlauf dauert länger als 15 s – die Verbindung wird bei der ersten Anfrage aufgebaut.",
       );
     }
   } catch (error) {
@@ -983,6 +1023,227 @@ export function route(label: string, handler: RouteHandler): RouteHandler {
       return json({ ok: false, reason: "server" }, 500);
     }
   };
+}
+```
+
+## Datei: `src/lib/health.ts`
+
+```tsx
+/**
+ * Gesundheitsprüfung im Hintergrund (ohne Datenbank-Warterei).
+ *
+ * Warum das nötig ist: Render prüft `healthCheckPath` alle paar Sekunden und
+ * **bricht die Prüfung nach 5 Sekunden ab**. Würde `/api/health` dabei selbst
+ * auf die Datenbank warten, passiert genau das, was die Seite zuletzt lahmgelegt
+ * hat: Antwortet die Datenbank langsam (oder ist gerade nicht erreichbar, z. B.
+ * eine aufwachende Neon-Instanz), dauert die Antwort durch die eingebauten
+ * Zeitlimits und den automatischen Verbindungs-Neuaufbau über 30 Sekunden.
+ * Render wertet das als „Instanz kaputt“, startet sie neu – und die nächste
+ * Prüfung läuft wieder ins Zeitlimit. Ergebnis: dauerhaft
+ * „502 – This service is currently unavailable“, obwohl die Seite selbst in
+ * wenigen Millisekunden antworten würde (gemessen: Startseite 17 ms).
+ *
+ * Deshalb gilt hier: Die Route antwortet **sofort** aus dem letzten bekannten
+ * Zustand (immer HTTP 200, solange der Server selbst lebt) und die eigentliche
+ * Datenbankprüfung läuft daneben im Hintergrund. Dadurch bleibt die Seite
+ * erreichbar, während die Datenbank hochfährt, und Render startet die Instanz
+ * nicht mehr grundlos neu.
+ */
+
+import { sql } from "drizzle-orm";
+
+import {
+  dbStatus,
+  getDb,
+  noteDbFailure,
+  noteDbSuccess,
+  type DbMode,
+  type DbProvider,
+  type DbStatus,
+} from "@/db";
+import { authEnabled } from "@/lib/auth/server";
+import { aiGatewayConfigured, gameMasterEnabled } from "@/lib/game-master";
+import { BUCKET, storageEnabled } from "@/lib/storage";
+
+/**
+ * Standardabstand der Hintergrundprüfung. Render ruft `/api/health` alle paar
+ * Sekunden auf – würde jeder Aufruf die Datenbank prüfen, käme eine Abfrage pro
+ * paar Sekunden zusammen. Ein Ergebnis gilt deshalb so lange als frisch, bis
+ * dieses Zeitfenster abgelaufen ist (dann erst wird neu geprüft).
+ *
+ * Über `HEALTH_CHECK_INTERVAL_MS` (Millisekunden, mindestens 1000)
+ * einstellbar – wer z. B. eine Neon-Datenbank mit Scale-to-Zero sparsam
+ * einschlafen lassen will, setzt ihn höher (etwa `600000` = 10 Minuten).
+ */
+export const HEALTH_CHECK_DEFAULT_MS = 60_000;
+
+function checkIntervalMs(): number {
+  const configured = Number(process.env.HEALTH_CHECK_INTERVAL_MS);
+  return Number.isFinite(configured) && configured >= 1_000
+    ? configured
+    : HEALTH_CHECK_DEFAULT_MS;
+}
+
+export interface HealthServices {
+  postgres: DbMode;
+  provider: DbProvider;
+  auth: boolean;
+  objectStorage: string | false;
+  aiGateway: boolean;
+  functions: boolean;
+}
+
+export interface HealthCheckInfo {
+  /** Läuft gerade eine Datenbankprüfung? */
+  running: boolean;
+  /** Zeitpunkt der letzten abgeschlossenen Prüfung (ISO) – `null` = noch keine. */
+  checkedAt: string | null;
+  /** Alter des letzten Ergebnisses in ms – `null` = noch keine Prüfung. */
+  ageMs: number | null;
+  /** Dauer der letzten abgeschlossenen Prüfung in ms – `null` = noch keine. */
+  latencyMs: number | null;
+}
+
+export interface HealthSnapshot {
+  /** Letztes Prüfergebnis (oder `true`, solange noch nichts geprüft wurde). */
+  ok: boolean;
+  /** `true`, solange die erste Datenbankprüfung noch nicht fertig ist. */
+  starting: boolean;
+  db: DbMode;
+  provider: DbProvider;
+  status: DbStatus;
+  services: HealthServices;
+  check: HealthCheckInfo;
+  uptimeSec: number;
+}
+
+interface HealthState {
+  ok?: boolean;
+  checkedAtMs?: number;
+  latencyMs?: number;
+  running?: Promise<void>;
+  monitor?: ReturnType<typeof setInterval>;
+  guardsInstalled?: boolean;
+}
+
+function state(): HealthState {
+  const g = globalThis as typeof globalThis & { __starafkHealth?: HealthState };
+  g.__starafkHealth ??= {};
+  return g.__starafkHealth;
+}
+
+/** Welche Neon-Dienste sind verdrahtet? (Nur Anzeige – ohne Secrets.) */
+function services(): HealthServices {
+  return {
+    postgres: dbStatus().mode,
+    provider: dbStatus().provider,
+    auth: authEnabled,
+    objectStorage: storageEnabled ? `bucket:${BUCKET}` : false,
+    aiGateway: aiGatewayConfigured,
+    functions: gameMasterEnabled,
+  };
+}
+
+/**
+ * Aktueller Zustand – **ohne** auf die Datenbank zu warten. Liefert den letzten
+ * bekannten Stand plus die live verfügbaren Werte (Modus, Anbieter, Dienste).
+ */
+export function readHealth(): HealthSnapshot {
+  const g = state();
+  const checkedAt = g.checkedAtMs;
+  return {
+    // Ohne abgeschlossene Prüfung gilt der Server selbst als gesund: Render
+    // braucht dann HTTP 200 und startet die Instanz nicht neu.
+    ok: g.ok ?? true,
+    starting: checkedAt === undefined,
+    db: dbStatus().mode,
+    provider: dbStatus().provider,
+    status: dbStatus(),
+    services: services(),
+    check: {
+      running: Boolean(g.running),
+      checkedAt: checkedAt ? new Date(checkedAt).toISOString() : null,
+      ageMs: checkedAt === undefined ? null : Date.now() - checkedAt,
+      latencyMs: g.latencyMs ?? null,
+    },
+    uptimeSec: Math.round(process.uptime()),
+  };
+}
+
+/** Die eigentliche Prüfung: eine einzige Datenbankabfrage (`select 1`). */
+async function runCheck(): Promise<void> {
+  const g = state();
+  const started = Date.now();
+  try {
+    const db = await getDb();
+    await db.execute(sql`select 1`);
+    noteDbSuccess();
+    g.ok = true;
+  } catch (error) {
+    // Fehler zählen + ggf. Verbindung neu aufbauen (siehe src/db/index.ts).
+    noteDbFailure(error);
+    console.error("[health] Datenbankprüfung im Hintergrund fehlgeschlagen", error);
+    g.ok = false;
+  } finally {
+    g.latencyMs = Date.now() - started;
+    g.checkedAtMs = Date.now();
+  }
+}
+
+/**
+ * Startet bei Bedarf eine Prüfung im Hintergrund. **Nie awaiten** – der
+ * aufrufende Route-Handler soll sofort antworten können.
+ */
+export function startHealthCheck(force = false): void {
+  const g = state();
+  if (g.running) return; // eine Prüfung läuft noch – keine zweite anstoßen
+  const fresh =
+    g.checkedAtMs !== undefined &&
+    Date.now() - g.checkedAtMs < checkIntervalMs();
+  if (!force && fresh) return;
+  g.running = runCheck().finally(() => {
+    g.running = undefined;
+  });
+}
+
+/** Periodische Hintergrundprüfung (hält den Zustand aktuell). */
+export function startHealthMonitor(): void {
+  const g = state();
+  if (g.monitor) return;
+  startHealthCheck(true);
+  const timer = setInterval(() => startHealthCheck(true), checkIntervalMs());
+  // Verhindert, dass der Timer den Node-Prozess am Beenden hindert.
+  timer.unref?.();
+  g.monitor = timer;
+}
+
+/**
+ * Absturzschutz für den laufenden Betrieb.
+ *
+ * Node beendet den Prozess standardmäßig bei einer unbehandelten
+ * Promise-Ablehnung bzw. einem unbehandelten Fehler. Auf Render heißt das:
+ * Instanz weg, Neustart, und währenddessen 502 für alle Besucher. Stattdessen
+ * wird hier nur geloggt (der Fehler steht damit in den Render-Logs) und der
+ * Server bleibt für alle weiteren Anfragen am Leben.
+ */
+export function installCrashGuards(): void {
+  const g = state();
+  if (g.guardsInstalled) return;
+  g.guardsInstalled = true;
+
+  process.on("unhandledRejection", (reason: unknown) => {
+    console.error(
+      "[start] Nicht behandelte Promise-Ablehnung – Server läuft weiter:",
+      reason,
+    );
+  });
+
+  process.on("uncaughtException", (error: unknown) => {
+    console.error(
+      "[start] Nicht behandelter Fehler – Server läuft weiter:",
+      error,
+    );
+  });
 }
 ```
 
@@ -2027,6 +2288,265 @@ export async function removePlayer(
 }
 ```
 
+## Datei: `src/lib/game-master.ts`
+
+```tsx
+/**
+ * AI Game Master – App-Seite.
+ *
+ * Die Texte erzeugt die Neon Function `gamemaster` (siehe `functions/gamemaster.ts`
+ * und `neon.ts`): Sie läuft neben der Datenbank, nutzt das Neon AI Gateway und
+ * prüft das Neon-Auth-JWT des Aufrufers. `neon deploy` schreibt ihre öffentliche
+ * URL als `NEON_FUNCTION_GAMEMASTER_BASE_URL` in `.env.local`.
+ *
+ * Der Browser ruft die Function direkt auf (Bearer-JWT), nicht über den
+ * Next.js-Server – so hängt kein App-Host-Limit dazwischen.
+ */
+export const GAME_MASTER_URL =
+  process.env.NEON_FUNCTION_GAMEMASTER_BASE_URL?.replace(/\/+$/, "") ?? null;
+
+/** AI Gateway ist auf der App-Seite nur für Statusanzeigen von Interesse. */
+export const aiGatewayConfigured = Boolean(
+  process.env.NEON_AI_GATEWAY_BASE_URL && process.env.NEON_AI_GATEWAY_TOKEN,
+);
+
+export const gameMasterEnabled = Boolean(GAME_MASTER_URL);
+
+export type NarrationKind = "intro" | "night" | "recap";
+
+export const NARRATION_LABELS: Record<NarrationKind, string> = {
+  intro: "Rollen-Intro",
+  night: "Nacht einläuten",
+  recap: "Lage zusammenfassen",
+};
+```
+
+## Datei: `src/lib/storage.ts`
+
+```tsx
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+
+/**
+ * Neon Object Storage (S3-kompatibel, branch-scoped).
+ *
+ * `neon deploy` schreibt die AWS-Standardvariablen in `.env.local`, daher findet
+ * der AWS-SDK den Endpunkt, die Region und die Zugangsdaten von selbst:
+ *
+ *   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, AWS_REGION
+ *
+ * Nötig ist nur `forcePathStyle: true` – Neon spricht ausschließlich
+ * Path-Style-Adressierung. Ist nichts konfiguriert, bleibt der Bucket aus und
+ * Profilbilder werden wie bisher als Data-URL in Postgres gespeichert.
+ */
+export const BUCKET = process.env.NEON_STORAGE_BUCKET?.trim() || "assets";
+
+export const storageEnabled = Boolean(
+  process.env.AWS_ACCESS_KEY_ID &&
+    process.env.AWS_SECRET_ACCESS_KEY &&
+    process.env.AWS_ENDPOINT_URL_S3,
+);
+
+let client: S3Client | null = null;
+
+function s3(): S3Client | null {
+  if (!storageEnabled) return null;
+  client ??= new S3Client({ forcePathStyle: true });
+  return client;
+}
+
+export type StoredObject = {
+  bytes: Uint8Array;
+  contentType: string;
+};
+
+export async function putObject(
+  key: string,
+  bytes: Uint8Array,
+  contentType: string,
+): Promise<void> {
+  const s3Client = s3();
+  if (!s3Client) throw new Error("Object Storage ist nicht konfiguriert");
+  await s3Client.send(
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      Body: bytes,
+      ContentType: contentType,
+      // Avatare sind unveränderlich (jede Änderung schreibt einen neuen Key).
+      CacheControl: "public, max-age=604800, immutable",
+    }),
+  );
+}
+
+export async function getObject(key: string): Promise<StoredObject | null> {
+  const s3Client = s3();
+  if (!s3Client) return null;
+  try {
+    const result = await s3Client.send(
+      new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+    );
+    const bytes = await result.Body?.transformToByteArray();
+    if (!bytes) return null;
+    return {
+      bytes,
+      contentType: result.ContentType ?? "application/octet-stream",
+    };
+  } catch (error) {
+    console.warn(`[storage] Objekt ${key} konnte nicht geladen werden`, error);
+    return null;
+  }
+}
+
+/** Alte Bildversion aufräumen – Fehler dürfen den Upload nicht scheitern lassen. */
+export async function deleteObject(key: string): Promise<void> {
+  const s3Client = s3();
+  if (!s3Client) return;
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+  } catch (error) {
+    console.warn(`[storage] Objekt ${key} konnte nicht gelöscht werden`, error);
+  }
+}
+```
+
+## Datei: `src/lib/auth/server.ts`
+
+```tsx
+import { createNeonAuth } from "@neondatabase/auth/next/server";
+
+/**
+ * Neon Auth (Managed Better Auth) – Server-Seite.
+ *
+ * `NEON_AUTH_BASE_URL` kommt aus dem Neon-Branch (`neon deploy` schreibt sie in
+ * `.env.local`); `NEON_AUTH_COOKIE_SECRET` ist App-Konfiguration und wird NICHT
+ * von Neon injiziert:
+ *
+ *   echo "NEON_AUTH_COOKIE_SECRET=$(openssl rand -base64 32)" >> .env.local
+ *
+ * Ohne diese Variablen (z. B. lokale Entwicklung mit PGlite) bleibt der Login
+ * deaktiviert und die App läuft wie bisher anonym weiter – die API-Routen
+ * prüfen dann keine Session.
+ */
+const baseUrl = process.env.NEON_AUTH_BASE_URL?.trim();
+const cookieSecret = process.env.NEON_AUTH_COOKIE_SECRET?.trim();
+
+function createAuth() {
+  if (!baseUrl || !cookieSecret) return null;
+  if (cookieSecret.length < 32) {
+    console.error(
+      "[auth] NEON_AUTH_COOKIE_SECRET ist zu kurz (mindestens 32 Zeichen) – " +
+        "Login bleibt deaktiviert. Erzeugen mit: openssl rand -base64 32",
+    );
+    return null;
+  }
+  try {
+    return createNeonAuth({
+      baseUrl,
+      cookies: { secret: cookieSecret },
+    });
+  } catch (error) {
+    console.error("[auth] Neon Auth konnte nicht initialisiert werden", error);
+    return null;
+  }
+}
+
+/** Ist der Login in dieser Umgebung konfiguriert? */
+export const authEnabled = Boolean(baseUrl && cookieSecret && cookieSecret.length >= 32);
+
+export const auth = createAuth();
+
+export type SessionUser = {
+  id: string;
+  email?: string | null;
+  name?: string | null;
+};
+
+/**
+ * Aktuelle Session (oder `null`). Wichtig: Nicht `{ user }` aus dem Ergebnis
+ * destrukturieren – der Nutzer steckt in `data.user`.
+ */
+export async function getSessionUser(): Promise<SessionUser | null> {
+  if (!auth) return null;
+  try {
+    const { data } = await auth.getSession();
+    const user = data?.user;
+    if (!user?.id) return null;
+    return {
+      id: user.id,
+      email: user.email ?? null,
+      name: user.name ?? null,
+    };
+  } catch (error) {
+    // Auth-Server nicht erreichbar o. Ä. → gilt als „nicht angemeldet“.
+    console.warn("[auth] getSession fehlgeschlagen", error);
+    return null;
+  }
+}
+```
+
+## Datei: `src/lib/auth/guard.ts`
+
+```tsx
+import type { NextResponse } from "next/server";
+
+import { json } from "@/lib/api";
+import { authEnabled, getSessionUser } from "@/lib/auth/server";
+
+/**
+ * Ergebnis der Zugriffsprüfung für API-Routen.
+ *
+ * - Neon Auth konfiguriert → ohne gültige Session gibt es 401 (die Route bricht
+ *   mit `guard.response` ab).
+ * - Neon Auth NICHT konfiguriert (lokale Entwicklung, PGlite) → `userId: null`,
+ *   die App verhält sich wie früher (anonyme Lobby).
+ */
+export type Guard =
+  | { ok: true; userId: string | null }
+  | { ok: false; response: NextResponse };
+
+export async function requireUser(): Promise<Guard> {
+  if (!authEnabled) return { ok: true, userId: null };
+
+  const user = await getSessionUser();
+  if (!user) {
+    return {
+      ok: false,
+      response: json({ ok: false, reason: "unauthorized" }, 401),
+    };
+  }
+  return { ok: true, userId: user.id };
+}
+
+/** Status für Health-Check und Client-Konfiguration. */
+export async function authStatus(): Promise<{ enabled: boolean; signedIn: boolean }> {
+  if (!authEnabled) return { enabled: false, signedIn: false };
+  const user = await getSessionUser();
+  return { enabled: true, signedIn: Boolean(user) };
+}
+```
+
+## Datei: `src/lib/auth/client.ts`
+
+```tsx
+"use client";
+
+import { createAuthClient } from "@neondatabase/auth/next";
+
+/**
+ * Browser-Client für Neon Auth. `createAuthClient()` bekommt bewusst KEINE
+ * Argumente: Der Client spricht mit der same-origin Route `/api/auth/*`, die
+ * unser Route-Handler (`src/app/api/auth/[...path]/route.ts`) an den
+ * Managed-Auth-Server des Branches weiterreicht. Dadurch braucht der Browser
+ * weder die Auth-URL noch Secrets.
+ */
+export const authClient = createAuthClient();
+```
+
 ## Datei: `src/app/layout.tsx`
 
 ```tsx
@@ -2153,68 +2673,99 @@ export default function HomePage() {
 ## Datei: `src/app/api/health/route.ts`
 
 ```tsx
-import { sql } from "drizzle-orm";
-
-import { dbStatus, getDb, noteDbFailure, noteDbSuccess } from "@/db";
-import { json, route } from "@/lib/api";
-import { authEnabled } from "@/lib/auth/server";
-import { aiGatewayConfigured, gameMasterEnabled } from "@/lib/game-master";
-import { BUCKET, storageEnabled } from "@/lib/storage";
+import { json } from "@/lib/api";
+import { installCrashGuards, readHealth, startHealthCheck } from "@/lib/health";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Health-Check (Render: `healthCheckPath: /api/health`). Prüft die Datenbank
- * wirklich an und zeigt an, welche Variante aktiv ist (`provider: "neon"` =
- * Neon-Datenbank aus DATABASE_URL, `"postgres"` = sonstige externe Datenbank,
- * z. B. automatisch von Render provisioniert, `"pglite"` = eingebettet).
+ * Health-Check (Render: `healthCheckPath: /api/health`).
  *
- * Bewusst IMMER HTTP 200, solange der Server selbst lebt: Render würde die
- * Instanz bei einem 503 sonst als „kaputt“ behandeln und neu starten – auch
- * dann, wenn die Datenbank nur kurz aufwacht (Neon Scale-to-Zero) oder die
- * Seite längst wieder funktioniert. Der eigentliche Zustand steht im Body
- * (`ok`, `status.lastError`, …); eine fehlgeschlagene Prüfung löst zusätzlich
- * den automatischen Neuaufbau der Verbindung aus (siehe src/db/index.ts).
+ * Antwortet **immer sofort** aus dem letzten bekannten Zustand und immer mit
+ * HTTP 200, solange der Server selbst lebt – die Datenbank wird im Hintergrund
+ * geprüft (siehe src/lib/health.ts). Hintergrund: Render bricht die Prüfung
+ * nach 5 s ab; ein auf die Datenbank wartender Health-Check hat die Instanz
+ * zuvor bei jeder langsamen Datenbank in eine Neustart-Schleife geschickt und
+ * die Seite damit dauerhaft mit 502 aus dem Netz genommen (nachgemessen: über
+ * 30 s Antwortzeit bei nicht erreichbarer Datenbank, während die Startseite in
+ * 17 ms antwortet).
+ *
+ * Der eigentliche Zustand steht weiterhin im Body:
+ * - `ok: true`  – Datenbank antwortet (`check.checkedAt` = Zeitpunkt der Prüfung)
+ * - `ok: false` – Datenbank (noch) nicht erreichbar; der Fehlertext steht in
+ *   `status.lastError`. Die Seite bleibt dabei aufrufbar, nur Lobbys gehen
+ *   kurzzeitig nicht.
+ * - `starting: true` – die allererste Prüfung läuft noch.
+ *
+ * Welche Datenbank aktiv ist, zeigt `provider` (`"neon"` = Neon-Datenbank aus
+ * `DATABASE_URL`, `"postgres"` = sonstige externe Datenbank, z. B. automatisch
+ * von Render provisioniert, `"pglite"` = eingebettet).
  */
-export const GET = route("health", async () => {
-  const started = Date.now();
-  const services = () => ({
-    postgres: dbStatus().mode,
-    provider: dbStatus().provider,
-    auth: authEnabled,
-    objectStorage: storageEnabled ? `bucket:${BUCKET}` : false,
-    aiGateway: aiGatewayConfigured,
-    functions: gameMasterEnabled,
-  });
+export async function GET(): Promise<Response> {
   try {
-    const db = await getDb();
-    await db.execute(sql`select 1`);
-    noteDbSuccess();
-    return json({
-      ok: true,
-      db: dbStatus().mode,
-      provider: dbStatus().provider,
-      status: dbStatus(),
-      // Zeigt, welche Neon-Dienste verdrahtet sind (Neon Postgres, Auth,
-      // Object Storage, AI Gateway, Functions).
-      services: services(),
-      latencyMs: Date.now() - started,
-      uptimeSec: Math.round(process.uptime()),
-    });
+    // Der Monitor startet beim Serverstart (src/instrumentation.ts). Falls der
+    // Hook dort nicht lief (z. B. older Build/Dev), wird er hier nachgeholt.
+    installCrashGuards();
+    startHealthCheck();
+    return json(readHealth());
   } catch (error) {
-    noteDbFailure(error);
-    console.error("[api] health check failed", error);
-    return json({
-      ok: false,
-      db: dbStatus().mode,
-      provider: dbStatus().provider,
-      status: dbStatus(),
-      services: services(),
-      latencyMs: Date.now() - started,
-      uptimeSec: Math.round(process.uptime()),
-    });
+    // Selbst ein unerwarteter Fehler darf hier nie zu etwas anderem als 200
+    // führen – sonst startet Render die Instanz neu.
+    console.error("[api] health route failed", error);
+    return json(readHealth());
   }
+}
+```
+
+## Datei: `src/app/api/config/route.ts`
+
+```tsx
+import { json, route } from "@/lib/api";
+import { authStatus } from "@/lib/auth/guard";
+import { GAME_MASTER_URL, gameMasterEnabled } from "@/lib/game-master";
+
+export const dynamic = "force-dynamic";
+
+/**
+ * Laufzeit-Konfiguration für den Browser: Ist der Login aktiv und ist der
+ * AI Game Master (Neon Function) erreichbar? Secrets bleiben hier draußen –
+ * die Function-URL ist ohnehin öffentlich, das JWT holt sich der Client selbst
+ * aus der Neon-Auth-Session.
+ */
+export const GET = route("config", async () => {
+  const auth = await authStatus();
+  return json({
+    ok: true,
+    auth,
+    gameMaster: { enabled: gameMasterEnabled, url: GAME_MASTER_URL },
+  });
 });
+```
+
+## Datei: `src/app/api/auth/[...path]/route.ts`
+
+```tsx
+import { auth } from "@/lib/auth/server";
+import { json } from "@/lib/api";
+
+export const dynamic = "force-dynamic";
+
+/**
+ * Proxy für Neon Auth: `/api/auth/*` → Managed-Auth-Server des Branches.
+ * Der Browser-Client (`createAuthClient()`) spricht ausschließlich mit dieser
+ * same-origin Route (Sign-in, Sign-up, Session, Sign-out, JWT).
+ */
+const handler = auth?.handler();
+
+async function notConfigured(): Promise<Response> {
+  return json({ ok: false, reason: "auth_disabled" }, 503);
+}
+
+export const GET = handler?.GET ?? notConfigured;
+export const POST = handler?.POST ?? notConfigured;
+export const PUT = handler?.PUT ?? notConfigured;
+export const DELETE = handler?.DELETE ?? notConfigured;
+export const PATCH = handler?.PATCH ?? notConfigured;
 ```
 
 ## Datei: `src/app/api/lobby/create/route.ts`
@@ -4548,6 +5099,256 @@ export function GlassCard({
 }
 ```
 
+## Datei: `src/components/auth/auth-gate.tsx`
+
+```tsx
+"use client";
+
+import { useEffect, useState, type ReactNode } from "react";
+
+import { SignInScreen } from "@/components/auth/sign-in-screen";
+import { authClient } from "@/lib/auth/client";
+
+type AuthConfig = { enabled: boolean; signedIn: boolean };
+
+/** Wie lange `/api/config` auf sich warten darf, bevor aufgegeben wird. */
+const CONFIG_TIMEOUT_MS = 8_000;
+/**
+ * Zeitfenster, nach dem die Login-Schranke **in jedem Fall** öffnet.
+ * Sonst bliebe die Seite auf „Laden…“ stehen, wenn der Server (oder der
+ * Auth-Dienst dahinter) einmal nicht antwortet – die Seite wäre zwar online,
+ * aber für den Besucher „kaputt“.
+ */
+const GATE_TIMEOUT_MS = 10_000;
+
+function Loading({ text }: { text: string }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-[#0b1220] text-sm font-semibold uppercase tracking-[0.3em] text-white/40">
+      {text}
+    </div>
+  );
+}
+
+/**
+ * Login-Schranke um die App.
+ *
+ * - Kein Neon Auth konfiguriert (lokale Entwicklung/PGlite) → App sofort.
+ * - Neon Auth konfiguriert → ohne Session erscheint die Anmeldung; die
+ *   API-Routen prüfen die Session zusätzlich serverseitig (401).
+ * - Antwortet `/api/config` (oder die Session-Prüfung) nicht rechtzeitig, wird
+ *   nicht ewig gewartet, sondern geöffnet (bzw. die Anmeldung gezeigt). Die
+ *   Seite ist damit auch bei einem hängenden Auth-Server erreichbar.
+ */
+export function AuthGate({ children }: { children: ReactNode }) {
+  const [config, setConfig] = useState<AuthConfig | null>(null);
+  const [timedOut, setTimedOut] = useState(false);
+  const { data: session, isPending, refetch } = authClient.useSession();
+
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CONFIG_TIMEOUT_MS);
+
+    fetch("/api/config", { cache: "no-store", signal: controller.signal })
+      .then((response) => response.json())
+      .then((body: { auth?: AuthConfig }) => {
+        if (!cancelled) {
+          setConfig({ enabled: Boolean(body.auth?.enabled), signedIn: Boolean(body.auth?.signedIn) });
+        }
+      })
+      .catch(() => {
+        // Konfiguration nicht lesbar (Server startet gerade, Zeitlimit, …) →
+        // App nicht blockieren.
+        if (!cancelled) setConfig({ enabled: false, signedIn: false });
+      })
+      .finally(() => clearTimeout(timer));
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, []);
+
+  // Notausstieg: niemals endlos im Ladezustand bleiben.
+  useEffect(() => {
+    const timer = setTimeout(() => setTimedOut(true), GATE_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, []);
+
+  if (config === null) {
+    if (!timedOut) return <Loading text="Laden…" />;
+    // Konfiguration unbekannt → lieber die App zeigen als gar nichts.
+    return <>{children}</>;
+  }
+
+  if (!config.enabled) return <>{children}</>;
+
+  if (isPending && !session) {
+    // Die Session-Prüfung hängt (Auth-Server nicht erreichbar) → Anmeldung
+    // zeigen statt weiter zu warten; dort kann es erneut versucht werden.
+    if (timedOut) return <SignInScreen onDone={() => void refetch()} />;
+    return <Loading text="Session wird geprüft…" />;
+  }
+
+  if (!session?.user) {
+    return <SignInScreen onDone={() => void refetch()} />;
+  }
+
+  return <>{children}</>;
+}
+```
+
+## Datei: `src/components/auth/sign-in-screen.tsx`
+
+```tsx
+"use client";
+
+import { useState } from "react";
+
+import { SkyBackground } from "@/components/werwolf/sky-background";
+import { GlassCard } from "@/components/werwolf/glass-card";
+import { authClient } from "@/lib/auth/client";
+
+type Mode = "signIn" | "signUp";
+
+/**
+ * Anmeldung über Neon Auth (Managed Better Auth). Der Client spricht mit der
+ * same-origin Route `/api/auth/*`; E-Mails (Verifizierung, Passwort-Reset)
+ * verschickt Neon Auth selbst.
+ */
+export function SignInScreen({ onDone }: { onDone?: () => void }) {
+  const [mode, setMode] = useState<Mode>("signIn");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const result =
+        mode === "signIn"
+          ? await authClient.signIn.email({ email, password })
+          : await authClient.signUp.email({ email, password, name: name || email });
+
+      if (result.error) {
+        setError(result.error.message ?? "Anmeldung fehlgeschlagen.");
+        return;
+      }
+      setNotice(
+        mode === "signUp"
+          ? "Konto erstellt – falls eine Bestätigungsmail kommt, bitte den Code eingeben."
+          : null,
+      );
+      onDone?.();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unbekannter Fehler.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputClass =
+    "w-full rounded-[1rem] border border-white/20 bg-white/5 px-4 py-3 text-base font-semibold text-white placeholder-white/35 outline-none transition-colors focus:border-white/45 focus:bg-white/10";
+
+  return (
+    <div className="relative min-h-screen w-full overflow-hidden bg-[#0b1220] text-white">
+      <SkyBackground isActive />
+      <div className="relative z-10 flex min-h-screen items-center justify-center px-4 py-10">
+        <GlassCard className="w-full max-w-[26rem] p-6 sm:p-8">
+          <p className="text-xs font-black uppercase tracking-[0.32em] text-white/50">
+            Werwolf Lobby
+          </p>
+          <h1 className="mt-2 text-[2rem] font-black uppercase leading-none tracking-tight sm:text-[2.4rem]">
+            {mode === "signIn" ? "Anmelden" : "Konto erstellen"}
+          </h1>
+          <p className="mt-3 text-sm font-semibold text-white/55">
+            {mode === "signIn"
+              ? "Melde dich an, um eine Lobby zu erstellen oder beizutreten."
+              : "Erstelle ein Konto, um mitspielen zu können."}
+          </p>
+
+          <form onSubmit={submit} className="mt-6 flex flex-col gap-3">
+            {mode === "signUp" && (
+              <input
+                className={inputClass}
+                type="text"
+                autoComplete="nickname"
+                placeholder="Spielname"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+              />
+            )}
+            <input
+              className={inputClass}
+              type="email"
+              autoComplete="email"
+              placeholder="E-Mail"
+              required
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+            />
+            <input
+              className={inputClass}
+              type="password"
+              autoComplete={mode === "signIn" ? "current-password" : "new-password"}
+              placeholder="Passwort"
+              required
+              minLength={8}
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+
+            {error && (
+              <p
+                role="alert"
+                className="rounded-[1rem] border border-red-400/40 bg-red-500/15 px-3 py-2 text-sm font-semibold text-red-100"
+              >
+                {error}
+              </p>
+            )}
+            {notice && (
+              <p className="rounded-[1rem] border border-emerald-400/40 bg-emerald-500/15 px-3 py-2 text-sm font-semibold text-emerald-100">
+                {notice}
+              </p>
+            )}
+
+            <button
+              type="submit"
+              disabled={busy}
+              className="mt-1 rounded-[1.2rem] border border-white/30 bg-white/15 px-5 py-3 text-[1.05rem] font-black uppercase tracking-[0.16em] text-white transition-all duration-200 hover:-translate-y-0.5 hover:bg-white hover:text-black disabled:animate-pulse disabled:opacity-60"
+            >
+              {busy ? "Bitte warten…" : mode === "signIn" ? "Anmelden" : "Registrieren"}
+            </button>
+          </form>
+
+          <button
+            onClick={() => {
+              setMode(mode === "signIn" ? "signUp" : "signIn");
+              setError(null);
+              setNotice(null);
+            }}
+            className="mt-4 w-full text-center text-sm font-bold uppercase tracking-[0.18em] text-white/60 transition-colors hover:text-white"
+          >
+            {mode === "signIn"
+              ? "Noch kein Konto? Registrieren"
+              : "Schon registriert? Anmelden"}
+          </button>
+        </GlassCard>
+      </div>
+    </div>
+  );
+}
+```
+
 ## Datei: `scripts/build-readme.mjs`
 
 ````js
@@ -4577,13 +5378,21 @@ const TEXT_FILES = [
   "src/db/migrate.ts",
   "src/db/schema.ts",
   "src/lib/api.ts",
+  "src/lib/health.ts",
   "src/lib/game.ts",
   "src/lib/image.ts",
   "src/lib/lobby-service.ts",
+  "src/lib/game-master.ts",
+  "src/lib/storage.ts",
+  "src/lib/auth/server.ts",
+  "src/lib/auth/guard.ts",
+  "src/lib/auth/client.ts",
   "src/app/layout.tsx",
   "src/app/page.tsx",
   "src/app/globals.css",
   "src/app/api/health/route.ts",
+  "src/app/api/config/route.ts",
+  "src/app/api/auth/[...path]/route.ts",
   "src/app/api/lobby/create/route.ts",
   "src/app/api/lobby/join/route.ts",
   "src/app/api/lobby/state/route.ts",
@@ -4597,6 +5406,8 @@ const TEXT_FILES = [
   "src/components/werwolf/walking-cat.tsx",
   "src/components/werwolf/role-icon.tsx",
   "src/components/werwolf/glass-card.tsx",
+  "src/components/auth/auth-gate.tsx",
+  "src/components/auth/sign-in-screen.tsx",
   "scripts/build-readme.mjs",
 ];
 
