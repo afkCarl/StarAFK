@@ -19,6 +19,7 @@ const TEXT_FILES = [
   "drizzle.config.json",
   "postcss.config.mjs",
   "src/db/index.ts",
+  "src/db/migrate.ts",
   "src/db/schema.ts",
   "src/lib/game.ts",
   "src/lib/lobby-service.ts",
@@ -31,6 +32,7 @@ const TEXT_FILES = [
   "src/app/api/lobby/state/route.ts",
   "src/app/api/lobby/profile/route.ts",
   "src/app/api/lobby/roles/route.ts",
+  "src/app/api/lobby/start/route.ts",
   "src/app/api/lobby/leave/route.ts",
   "src/components/werwolf/werwolf-app.tsx",
   "src/components/werwolf/sky-background.tsx",
@@ -94,9 +96,12 @@ sections.push(`# Werwolf Lobby — Vollständiger Quellcode
 > 1. Leeres Next.js-Projekt anlegen (oder Dateien einfach in einen Ordner schreiben).
 > 2. ALLE Textdateien exakt wie hier abgedruckt anlegen.
 > 3. Alle Binärdateien von dieser Website herunterladen (Liste unten).
-> 4. \`.env\` mit \`DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/app_db\` anlegen.
-> 5. \`npm install\` → \`npx drizzle-kit push\` → \`npm run build\` → \`npm run start\`.
-> 6. Fertig — die App läuft 1:1 identisch.
+> 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig, die App läuft
+>    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne \`DATABASE_URL\` wird
+>    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in \`.data/\` angelegt.
+> 5. Optional: \`.env\` mit \`DATABASE_URL=postgresql://…\` für eine externe
+>    PostgreSQL-Datenbank — die Tabellen werden ebenfalls automatisch angelegt
+>    (kein \`drizzle-kit push\` nötig).
 
 ## Projektübersicht
 
@@ -115,7 +120,8 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
   Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: \`?code=ABCDEF\` öffnet das Beitreten-Feld vorausgefüllt.
 - **Realtime**: REST-Polling (1,2 s) + Heartbeat-Cleanup (15 s), automatische
-  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM.
+  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM. „Spiel starten"
+  (Host) synchronisiert den Spielstart in Echtzeit an alle Spieler.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 

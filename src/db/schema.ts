@@ -15,6 +15,7 @@ export const lobbies = pgTable("lobbies", {
   code: varchar("code", { length: 6 }).primaryKey(),
   mode: text("mode").notNull().default("WERWOLF"),
   roleCounts: jsonb("role_counts").$type<RoleCounts>().notNull(),
+  gameStarted: boolean("game_started").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

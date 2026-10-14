@@ -1,0 +1,23 @@
+# Render Blueprint für https://render.com
+#
+# Einziger Service: die Next.js-App mit Backend (API-Routen) und eingebetteter
+# PostgreSQL-Datenbank (PGlite) im Ordner `.data/` – KEINE weitere Einrichtung
+# nötig. Optional kann eine externe Datenbank genutzt werden, indem in den
+# Render-Environment-Einstellungen DATABASE_URL gesetzt wird (siehe README.md).
+
+services:
+  - type: web
+    name: starafk
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Optional: externe PostgreSQL-Verbindung (z. B. Neon, Supabase,
+      # Render PostgreSQL). Ohne diesen Eintrag läuft die eingebettete
+      # PGlite-Datenbank – völlig ohne Konfiguration.
+      # - key: DATABASE_URL
+      #   sync: false

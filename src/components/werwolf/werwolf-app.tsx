@@ -82,6 +82,9 @@ export default function WerwolfApp() {
   });
   const [roleCounts, setRoleCounts] = useState<Record<string, number>>(defaultCounts);
   const [cardModalOpen, setCardModalOpen] = useState(false);
+  const [gameStarted, setGameStarted] = useState(false);
+  const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // Deterministische Initialwerte; localStorage wird nach dem Mount geladen,
   // damit Server-Render und Hydration identisch sind (Multi-Tab-sicher).
@@ -156,6 +159,7 @@ export default function WerwolfApp() {
     setLobbyCode(state.code);
     setPlayers(state.players);
     setRoleCounts(state.roleCounts);
+    setGameStarted(Boolean(state.gameStarted));
     setSelfId((current) => {
       if (current) {
         const self = state.players.find((p) => p.id === current);
@@ -184,6 +188,9 @@ export default function WerwolfApp() {
           setScreen("menu");
           setSelfId(null);
           setPlayers([]);
+          setActionError(
+            "Die Lobby ist nicht mehr verfügbar – sie wurde geschlossen oder du wurdest entfernt.",
+          );
           return;
         }
         const data = await res.json();
@@ -309,12 +316,14 @@ export default function WerwolfApp() {
     host: boolean,
     id: string,
     counts: Record<string, number>,
+    started: boolean,
   ) => {
     setSelfId(id);
     setLobbyCode(code);
     setIsHost(host);
     setPlayers(lobbyPlayers);
     setRoleCounts(counts);
+    setGameStarted(started);
     setScreen("menuLeaving");
     leaveTimerRef.current = setTimeout(() => {
       setScreen("lobbyEntering");
@@ -323,47 +332,64 @@ export default function WerwolfApp() {
   };
 
   const handleCreate = () => {
-    if (screen !== "menu" || modeLocked) return;
+    if (screen !== "menu" || modeLocked || busy) return;
     if (mode.title !== "WERWOLF") return;
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
     setJoinPanel("closed");
     setJoinCode("");
     setCopied(false);
     setRoleModalOpen(false);
+    setActionError(null);
+    setBusy("create");
     fetch("/api/lobby/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: mode.title, profile }),
     })
-      .then((res) => res.json())
-      .then((data) => {
-        if (data?.ok) {
-          enterLobby(
-            data.lobby.code,
-            data.lobby.players,
-            true,
-            data.selfId,
-            data.lobby.roleCounts,
-          );
-        }
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error("create failed");
+        enterLobby(
+          data.lobby.code,
+          data.lobby.players,
+          true,
+          data.selfId,
+          data.lobby.roleCounts,
+          Boolean(data.lobby.gameStarted),
+        );
       })
-      .catch(() => {});
+      .catch(() => {
+        setActionError(
+          "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+        );
+      })
+      .finally(() => setBusy(null));
   };
 
   const handleJoin = () => {
-    if (screen !== "menu" || modeLocked) return;
-    if (joinCode.length !== 6) return;
+    if (screen !== "menu" || modeLocked || busy) return;
+    if (joinCode.length !== 6) {
+      setActionError("Bitte gib einen 6-stelligen Lobbycode ein (A–Z).");
+      return;
+    }
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
     setCopied(false);
     setRoleModalOpen(false);
+    setActionError(null);
+    setBusy("join");
     fetch("/api/lobby/join", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code: joinCode, profile }),
     })
-      .then((res) => res.json())
-      .then((data) => {
-        if (!data?.ok) return;
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) {
+          if (data?.reason === "full") {
+            throw new Error("full");
+          }
+          throw new Error("not_found");
+        }
         const self = (data.lobby.players as LobbyPlayer[]).find(
           (p) => p.id === data.selfId,
         );
@@ -375,9 +401,45 @@ export default function WerwolfApp() {
           self?.isHost || false,
           data.selfId,
           data.lobby.roleCounts,
+          Boolean(data.lobby.gameStarted),
         );
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        const message =
+          error instanceof Error && error.message === "full"
+            ? "Die Lobby ist leider voll (max. 12 Spieler)."
+            : error instanceof Error && error.message === "not_found"
+              ? "Lobby mit diesem Code wurde nicht gefunden."
+              : "Beitreten fehlgeschlagen – der Server ist gerade nicht erreichbar.";
+        setActionError(message);
+      })
+      .finally(() => setBusy(null));
+  };
+
+  const handleStartGame = (started: boolean) => {
+    const code = lobbyCodeRef.current;
+    const pid = selfIdRef.current;
+    if (!code || !pid || busy) return;
+    setActionError(null);
+    setBusy("start");
+    fetch("/api/lobby/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, playerId: pid, started }),
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error("start failed");
+        setGameStarted(started);
+      })
+      .catch(() => {
+        setActionError(
+          started
+            ? "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+            : "Das Spiel konnte nicht zurückgesetzt werden.",
+        );
+      })
+      .finally(() => setBusy(null));
   };
 
   const changeRoleCount = (roleName: string, delta: number) => {
@@ -492,6 +554,24 @@ export default function WerwolfApp() {
     >
       <SkyBackground isActive={isDark} />
 
+      {actionError && (
+        <div
+          className="fixed inset-x-0 bottom-4 z-[60] flex justify-center px-4"
+          role="alert"
+        >
+          <div className="flex max-w-[min(36rem,92vw)] items-start gap-3 rounded-[1.2rem] border border-red-400/40 bg-red-950/90 px-4 py-3 text-sm font-semibold text-red-100 shadow-2xl backdrop-blur-md">
+            <span className="leading-relaxed">{actionError}</span>
+            <button
+              onClick={() => setActionError(null)}
+              aria-label="Fehlermeldung schließen"
+              className="mt-0.5 shrink-0 text-red-200/70 transition-colors hover:text-red-100"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+      )}
+
       {inMenu && (
         <>
           <div
@@ -568,13 +648,14 @@ export default function WerwolfApp() {
           >
             <button
               onClick={handleCreate}
+              disabled={busy === "create"}
               className={`w-fit text-left text-[1.75rem] font-bold uppercase transition-all duration-200 sm:text-[2.1rem] ${
                 mode.title === "WERWOLF"
                   ? "hover:translate-x-3 hover:text-neutral-400"
                   : "cursor-not-allowed opacity-30"
-              }`}
+              } ${busy === "create" ? "animate-pulse opacity-70" : ""}`}
             >
-              Lobby erstellen
+              {busy === "create" ? "Erstelle Lobby…" : "Lobby erstellen"}
             </button>
             <div className="flex w-fit flex-col">
               <button onClick={toggleJoinPanel} className={menuButtons}>
@@ -606,9 +687,10 @@ export default function WerwolfApp() {
                   />
                   <button
                     onClick={handleJoin}
-                    className="ml-4 shrink-0 text-[1.4rem] font-bold uppercase transition-all hover:text-neutral-400 sm:text-[1.6rem]"
+                    disabled={busy === "join"}
+                    className="ml-4 shrink-0 text-[1.4rem] font-bold uppercase transition-all hover:text-neutral-400 disabled:animate-pulse disabled:opacity-60 sm:text-[1.6rem]"
                   >
-                    Beitreten
+                    {busy === "join" ? "Trete bei…" : "Beitreten"}
                   </button>
                 </div>
               )}
@@ -983,12 +1065,37 @@ export default function WerwolfApp() {
                   </p>
                 </GlassCard>
                 {isHost ? (
-                  <button className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black">
-                    Spiel starten
-                  </button>
+                  gameStarted ? (
+                    <div className="flex flex-col gap-2">
+                      <div className="rounded-[1.5rem] border border-green-400/40 bg-green-400/15 px-5 py-4 text-center text-[1.25rem] font-black uppercase tracking-[0.16em] text-green-200">
+                        Spiel läuft
+                      </div>
+                      <button
+                        onClick={() => handleStartGame(false)}
+                        disabled={busy === "start"}
+                        className="rounded-[1rem] border border-white/20 bg-white/5 px-4 py-2 text-xs font-bold uppercase tracking-[0.18em] text-white/60 transition-all duration-200 hover:bg-white/10 hover:text-white disabled:animate-pulse disabled:opacity-50"
+                      >
+                        Zurück zur Lobby
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => handleStartGame(true)}
+                      disabled={busy === "start"}
+                      className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:animate-pulse disabled:opacity-50"
+                    >
+                      {busy === "start" ? "Startet…" : "Spiel starten"}
+                    </button>
+                  )
                 ) : (
-                  <div className="rounded-[1.5rem] border border-white/10 bg-white/5 px-5 py-4 text-center text-sm font-bold uppercase tracking-[0.16em] text-white/40">
-                    Warte auf Host…
+                  <div
+                    className={`rounded-[1.5rem] border px-5 py-4 text-center text-sm font-bold uppercase tracking-[0.16em] ${
+                      gameStarted
+                        ? "border-green-400/40 bg-green-400/15 text-green-200"
+                        : "border-white/10 bg-white/5 text-white/40"
+                    }`}
+                  >
+                    {gameStarted ? "Das Spiel läuft!" : "Warte auf Host…"}
                   </div>
                 )}
               </aside>

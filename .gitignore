@@ -28,3 +28,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Lokale Datenbank (PGlite, automatisch angelegt)
+.data/
+
+# TypeScript
+*.tsbuildinfo

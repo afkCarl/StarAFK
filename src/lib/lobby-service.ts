@@ -13,6 +13,10 @@ import {
 
 const STALE_MS = 15_000;
 const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/** Maximale Spielerzahl pro Lobby. */
+export const MAX_PLAYERS = 12;
+/** Lobbys, die älter als ein Tag sind, werden automatisch aufgeräumt. */
+const LOBBY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export function sanitizeProfile(input: unknown): PlayerProfile {
   const raw = (typeof input === "object" && input !== null ? input : {}) as Record<
@@ -73,7 +77,7 @@ function toLobbyPlayer(row: PlayerRow): LobbyPlayer {
 }
 
 async function listPlayers(code: string): Promise<PlayerRow[]> {
-  const db = getDb();
+  const db = await getDb();
   return db
     .select()
     .from(players)
@@ -81,12 +85,23 @@ async function listPlayers(code: string): Promise<PlayerRow[]> {
     .orderBy(asc(players.createdAt));
 }
 
+/** Entfernt verwaiste Lobbys, die älter als ein Tag sind (inkl. Spieler per Cascade). */
+async function purgeOldLobbies(): Promise<void> {
+  const db = await getDb();
+  await db
+    .delete(lobbies)
+    .where(lt(lobbies.createdAt, new Date(Date.now() - LOBBY_MAX_AGE_MS)));
+}
+
 export async function createLobby(
   mode: string,
   profileInput: unknown,
 ): Promise<{ selfId: string; lobby: LobbyState }> {
-  const db = getDb();
+  const db = await getDb();
   const profile = sanitizeProfile(profileInput);
+
+  // Nebenbei alte/verwaiste Lobbys aufräumen.
+  await purgeOldLobbies();
 
   let code = generateCode();
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -107,20 +122,34 @@ export async function createLobby(
 
   return {
     selfId: self.id,
-    lobby: { code, players: [toLobbyPlayer(self)], roleCounts },
+    lobby: {
+      code,
+      players: [toLobbyPlayer(self)],
+      roleCounts,
+      gameStarted: false,
+    },
   };
 }
+
+export type JoinOutcome =
+  | { ok: true; selfId: string; lobby: LobbyState }
+  | { ok: false; reason: "not_found" | "full" };
 
 export async function joinLobby(
   codeInput: string,
   profileInput: unknown,
-): Promise<{ selfId: string; lobby: LobbyState } | null> {
+): Promise<JoinOutcome> {
   const code = (codeInput || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 6);
-  if (code.length !== 6) return null;
+  if (code.length !== 6) return { ok: false, reason: "not_found" };
 
-  const db = getDb();
+  const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
-  if (!lobby) return null;
+  if (!lobby) return { ok: false, reason: "not_found" };
+
+  const existingPlayers = await listPlayers(code);
+  if (existingPlayers.length >= MAX_PLAYERS) {
+    return { ok: false, reason: "full" };
+  }
 
   const profile = sanitizeProfile(profileInput);
   const [self] = await db
@@ -130,17 +159,19 @@ export async function joinLobby(
 
   const rows = await listPlayers(code);
   return {
+    ok: true,
     selfId: self.id,
     lobby: {
       code,
       players: rows.map(toLobbyPlayer),
       roleCounts: lobby.roleCounts,
+      gameStarted: lobby.gameStarted,
     },
   };
 }
 
 export async function touchPlayer(code: string, playerId: string): Promise<void> {
-  const db = getDb();
+  const db = await getDb();
   await db
     .update(players)
     .set({ lastSeen: new Date() })
@@ -155,7 +186,7 @@ export async function getLobbyState(
   const code = (codeInput || "").toUpperCase().slice(0, 6);
   if (code.length !== 6) return null;
 
-  const db = getDb();
+  const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
   if (!lobby) return null;
 
@@ -189,7 +220,41 @@ export async function getLobbyState(
     code,
     players: rows.map(toLobbyPlayer),
     roleCounts: lobby.roleCounts,
+    gameStarted: lobby.gameStarted,
   };
+}
+
+/**
+ * Startet (oder beendet) das Spiel für alle Spieler der Lobby.
+ * Nur der Host darf den Status ändern.
+ */
+export async function setGameStarted(
+  codeInput: string,
+  playerId: string,
+  started: boolean,
+): Promise<boolean> {
+  const code = (codeInput || "").toUpperCase().slice(0, 6);
+  if (code.length !== 6) return false;
+
+  const db = await getDb();
+  const [host] = await db
+    .select({ id: players.id })
+    .from(players)
+    .where(
+      and(
+        eq(players.id, playerId),
+        eq(players.lobbyCode, code),
+        eq(players.isHost, true),
+      ),
+    );
+  if (!host) return false;
+
+  await db
+    .update(lobbies)
+    .set({ gameStarted: started })
+    .where(eq(lobbies.code, code));
+  await touchPlayer(code, playerId);
+  return true;
 }
 
 export async function updateProfile(
@@ -197,7 +262,7 @@ export async function updateProfile(
   playerId: string,
   profileInput: unknown,
 ): Promise<boolean> {
-  const db = getDb();
+  const db = await getDb();
   const profile = sanitizeProfile(profileInput);
   const updated = await db
     .update(players)
@@ -212,7 +277,7 @@ export async function updateRoleCounts(
   playerId: string,
   roleCountsInput: unknown,
 ): Promise<boolean> {
-  const db = getDb();
+  const db = await getDb();
   const [host] = await db
     .select({ id: players.id })
     .from(players)
@@ -234,7 +299,7 @@ export async function updateRoleCounts(
 }
 
 export async function removePlayer(code: string, playerId: string): Promise<void> {
-  const db = getDb();
+  const db = await getDb();
   await db
     .delete(players)
     .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
