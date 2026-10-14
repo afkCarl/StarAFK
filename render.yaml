@@ -1,9 +1,17 @@
 # Render Blueprint für https://render.com
 #
-# Einziger Service: die Next.js-App mit Backend (API-Routen) und eingebetteter
-# PostgreSQL-Datenbank (PGlite) im Ordner `.data/` – KEINE weitere Einrichtung
-# nötig. Optional kann eine externe Datenbank genutzt werden, indem in den
-# Render-Environment-Einstellungen DATABASE_URL gesetzt wird (siehe README.md).
+# Einziger nötiger Service: die Next.js-App mit Backend (API-Routen) und
+# Datenbank. Standardmäßig läuft die eingebettete PostgreSQL-Datenbank (PGlite)
+# im Ordner `.data/` – KEINE Einrichtung nötig.
+#
+# WICHTIG für dauerhafte Lobbys auf Render:
+# Das Dateisystem von Render-Instanzen ist flüchtig (bei Free-Instanzen sogar
+# ohne Persistent Disk). Bei jedem Deploy/Neustart ist die eingebettete
+# Datenbank daher leer. Entweder
+#   a) unten den Datenbank-Block einkommentieren (Render PostgreSQL), oder
+#   b) einfach DATABASE_URL in den Environment-Einstellungen setzen
+#      (z. B. kostenlos bei Neon, https://neon.tech – Anleitung in README.md).
+# Mit gesetzter DATABASE_URL überleben Lobbys jeden Neustart.
 
 services:
   - type: web
@@ -13,11 +21,26 @@ services:
     buildCommand: npm ci && npm run build
     startCommand: npm run start
     healthCheckPath: /api/health
+    autoDeploy: true
     envVars:
       - key: NODE_VERSION
         value: "22"
-      # Optional: externe PostgreSQL-Verbindung (z. B. Neon, Supabase,
-      # Render PostgreSQL). Ohne diesen Eintrag läuft die eingebettete
-      # PGlite-Datenbank – völlig ohne Konfiguration.
+      # --- Variante a: Render PostgreSQL mitverwenden (einkommentieren) ------
       # - key: DATABASE_URL
-      #   sync: false
+      #   fromDatabase:
+      #     name: starafk-db
+      #     property: connectionString
+      # --- Variante b: eigene Datenbank (z. B. Neon) -------------------------
+      # - key: DATABASE_URL
+      #   sync: false        # Wert wird im Render-Dashboard eingetragen
+      # Optional: SSL erzwingen/deaktivieren, wenn die Automatik nicht greift
+      # - key: DATABASE_SSL
+      #   value: "true"
+
+# --- Variante a: Render PostgreSQL (einkommentieren, dann oben DATABASE_URL) --
+# Hinweis: Der kostenlose Postgres-Plan von Render verfällt nach 30 Tagen.
+# databases:
+#   - name: starafk-db
+#     plan: free
+#     databaseName: starafk
+#     user: starafk

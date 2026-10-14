@@ -30,7 +30,15 @@ export const players = pgTable("players", {
   color: text("color").notNull(),
   fadeIntensity: integer("fade_intensity").notNull().default(50),
   frame: text("frame").notNull().default("none"),
+  /**
+   * Profilbild als Data-URL. ACHTUNG: Diese Spalte wird absichtlich NICHT in
+   * den Lobby-Zustand geladen – Bilder sind groß (bis ~200 KB) und würden jede
+   * Statusabfrage im Sekundentakt aufblähen. Ausgeliefert werden sie separat
+   * über `GET /api/lobby/avatar?pid=…&v=…` (mit langem Browser-Cache).
+   */
   image: text("image"),
+  /** Zeitpunkt des letzten Bildwechsels – dient als Cache-Version in der Avatar-URL. */
+  imageUpdatedAt: timestamp("image_updated_at", { withTimezone: true }),
   isHost: boolean("is_host").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()

@@ -1,20 +1,17 @@
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { updateProfile } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const ok = await updateProfile(
-      String(body?.code ?? ""),
-      String(body?.playerId ?? ""),
-      body?.profile,
-    );
-    return NextResponse.json({ ok });
-  } catch (error) {
-    console.error("lobby:updateProfile failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:profile", async (request) => {
+  const body = await readJson(request);
+  const ok = await updateProfile(
+    String(body.code ?? ""),
+    String(body.playerId ?? ""),
+    body.profile,
+  );
+  if (!ok) {
+    return json({ ok: false, reason: "not_member" }, 409);
   }
-}
+  return json({ ok: true });
+});

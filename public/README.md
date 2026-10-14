@@ -15,9 +15,12 @@
 > 4. `npm install` → `npm run build` → `npm run start` — fertig, die App läuft
 >    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne `DATABASE_URL` wird
 >    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in `.data/` angelegt.
-> 5. Optional: `.env` mit `DATABASE_URL=postgresql://…` für eine externe
->    PostgreSQL-Datenbank — die Tabellen werden ebenfalls automatisch angelegt
->    (kein `drizzle-kit push` nötig).
+> 5. Optional (empfohlen auf Render): `.env` bzw. Umgebungsvariable
+>    `DATABASE_URL=postgresql://…` für eine externe PostgreSQL-Datenbank — die
+>    Tabellen werden ebenfalls automatisch angelegt (kein `drizzle-kit push`).
+>    Ohne `DATABASE_URL` läuft die App eingebettet (PGlite); auf Render-Free-
+>    Instanzen ist das Dateisystem flüchtig, Lobbys sind dann nach einem
+>    Neustart weg (die Lobby wird automatisch mit gleichem Code neu geöffnet).
 
 ## Projektübersicht
 
@@ -35,9 +38,17 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **15 Rollen** (Teams gut/böse/neutral) mit Beschreibung, Gewinnkondition und
   Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: `?code=ABCDEF` öffnet das Beitreten-Feld vorausgefüllt.
-- **Realtime**: REST-Polling (1,2 s) + Heartbeat-Cleanup (15 s), automatische
-  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM. „Spiel starten"
-  (Host) synchronisiert den Spielstart in Echtzeit an alle Spieler.
+- **Realtime**: REST-Polling (1,2 s sichtbar / 20 s im Hintergrund-Tab),
+  Lebenszeichen-Fenster 120 s, automatischer **Reconnect/Resume** (gleiche
+  Spieler-ID, Host-Rolle bleibt), automatische Host-Nachfolge, Lobbys/Spieler in
+  PostgreSQL via Drizzle ORM. „Spiel starten" (Host) synchronisiert den
+  Spielstart in Echtzeit an alle Spieler.
+- **Profilbilder**: im Browser auf max. 256 px verkleinert, liegen in der
+  Datenbank und werden über `GET /api/lobby/avatar?pid=…&v=…` mit langem
+  Browser-Cache ausgeliefert (winziges Polling statt Megabyte-Payloads).
+- **Robuste Datenbank**: Verbindung baut sich bei Fehlern automatisch neu auf
+  (`src/db/index.ts`), PGlite fällt bei Problemen mit dem Datenordner in den
+  Speicher-Modus zurück; `/api/health` zeigt Modus, Speicherart und Fehlerzähler.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 
@@ -59,10 +70,14 @@ next.config.ts
 tsconfig.json
 drizzle.config.json
 postcss.config.mjs
+render.yaml
+src/instrumentation.ts
 src/db/index.ts
 src/db/migrate.ts
 src/db/schema.ts
+src/lib/api.ts
 src/lib/game.ts
+src/lib/image.ts
 src/lib/lobby-service.ts
 src/app/layout.tsx
 src/app/page.tsx
@@ -75,6 +90,7 @@ src/app/api/lobby/profile/route.ts
 src/app/api/lobby/roles/route.ts
 src/app/api/lobby/start/route.ts
 src/app/api/lobby/leave/route.ts
+src/app/api/lobby/avatar/route.ts
 src/components/werwolf/werwolf-app.tsx
 src/components/werwolf/sky-background.tsx
 src/components/werwolf/walking-cat.tsx
@@ -244,6 +260,84 @@ const postcssConfig = {
 export default postcssConfig;
 ```
 
+## Datei: `render.yaml`
+
+```
+# Render Blueprint für https://render.com
+#
+# Einziger nötiger Service: die Next.js-App mit Backend (API-Routen) und
+# Datenbank. Standardmäßig läuft die eingebettete PostgreSQL-Datenbank (PGlite)
+# im Ordner `.data/` – KEINE Einrichtung nötig.
+#
+# WICHTIG für dauerhafte Lobbys auf Render:
+# Das Dateisystem von Render-Instanzen ist flüchtig (bei Free-Instanzen sogar
+# ohne Persistent Disk). Bei jedem Deploy/Neustart ist die eingebettete
+# Datenbank daher leer. Entweder
+#   a) unten den Datenbank-Block einkommentieren (Render PostgreSQL), oder
+#   b) einfach DATABASE_URL in den Environment-Einstellungen setzen
+#      (z. B. kostenlos bei Neon, https://neon.tech – Anleitung in README.md).
+# Mit gesetzter DATABASE_URL überleben Lobbys jeden Neustart.
+
+services:
+  - type: web
+    name: starafk
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # --- Variante a: Render PostgreSQL mitverwenden (einkommentieren) ------
+      # - key: DATABASE_URL
+      #   fromDatabase:
+      #     name: starafk-db
+      #     property: connectionString
+      # --- Variante b: eigene Datenbank (z. B. Neon) -------------------------
+      # - key: DATABASE_URL
+      #   sync: false        # Wert wird im Render-Dashboard eingetragen
+      # Optional: SSL erzwingen/deaktivieren, wenn die Automatik nicht greift
+      # - key: DATABASE_SSL
+      #   value: "true"
+
+# --- Variante a: Render PostgreSQL (einkommentieren, dann oben DATABASE_URL) --
+# Hinweis: Der kostenlose Postgres-Plan von Render verfällt nach 30 Tagen.
+# databases:
+#   - name: starafk-db
+#     plan: free
+#     databaseName: starafk
+#     user: starafk
+```
+
+## Datei: `src/instrumentation.ts`
+
+```tsx
+/**
+ * Läuft einmal beim Start des Servers (Next.js Instrumentation-Hook).
+ *
+ * Hier wird die Datenbank absichtlich schon im Hintergrund geöffnet: das
+ * Anlegen/Öffnen der eingebetteten PostgreSQL-Datenbank (PGlite) dauert beim
+ * allerersten Zugriff ein paar Sekunden. Ohne diesen Vorlauf müsste der erste
+ * „Lobby erstellen"-Klick darauf warten (auf Render-Free-Instanzen spürbar).
+ */
+export async function register(): Promise<void> {
+  if (process.env.NEXT_RUNTIME !== "nodejs") return;
+  try {
+    const { getDb, dbStatus } = await import("@/db");
+    await getDb();
+    console.log(
+      `[start] Datenbank bereit (${dbStatus().mode}/${dbStatus().storage}).`,
+    );
+  } catch (error) {
+    // Nicht abbrechen: Die API-Routen bauen die Verbindung bei Bedarf selbst
+    // auf (und heilen sich dabei selbst).
+    console.error("[start] Datenbank-Vorlauf fehlgeschlagen", error);
+  }
+}
+```
+
 ## Datei: `src/db/index.ts`
 
 ```tsx
@@ -253,59 +347,208 @@ import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle as drizzleNodePg } from "drizzle-orm/node-postgres";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
-import { Pool } from "pg";
+import { Pool, type PoolConfig } from "pg";
 
 import { ensureSchema } from "@/db/migrate";
 
 type Database = ReturnType<typeof drizzleNodePg>;
 
 export type DbMode = "postgres" | "pglite";
+export type DbStorage = "external" | "file" | "memory" | "none";
 
-const globalForDb = globalThis as typeof globalThis & {
-  __arenaNextJsPostgresqlPool?: Pool;
-  __arenaNextJsDatabase?: Database;
-  __arenaPgliteDatabase?: Database;
-  __arenaPgliteInit?: Promise<Database>;
-  __arenaSchemaReady?: WeakSet<object>;
-};
+interface DbGlobals {
+  pool?: Pool;
+  db?: Database;
+  pglite?: PGlite;
+  pgliteInit?: Promise<Database>;
+  pgliteStorage: DbStorage;
+  schemaInit?: WeakMap<object, Promise<void>>;
+  failures: number;
+  resets: number;
+  ready: boolean;
+  lastError?: string;
+}
+
+function globals(): DbGlobals {
+  const g = globalThis as typeof globalThis & { __starafkDb?: DbGlobals };
+  g.__starafkDb ??= {
+    pgliteStorage: "none",
+    failures: 0,
+    resets: 0,
+    ready: false,
+  };
+  return g.__starafkDb;
+}
 
 /**
  * Welche Datenbank-Variante gerade aktiv ist:
- * - `postgres`: externe PostgreSQL-Instanz aus `DATABASE_URL`
- * - `pglite`: eingebettetes PostgreSQL (PGlite) im Datensatz-Ordner –
+ * - `postgres`: externe PostgreSQL-Instanz aus `DATABASE_URL` (empfohlen für Render)
+ * - `pglite`: eingebettetes PostgreSQL (PGlite) im Ordner `.data/` –
  *   null Konfiguration nötig, ideal für einen einfachen Start.
  */
 export function getDbMode(): DbMode {
   return process.env.DATABASE_URL ? "postgres" : "pglite";
 }
 
+export interface DbStatus {
+  mode: DbMode;
+  storage: DbStorage;
+  /** Letzte Datenbank-Aktion war erfolgreich (Schema angelegt, Abfrage ok). */
+  ready: boolean;
+  /** Fehler in Folge (0 = alles gut). */
+  failures: number;
+  /** Wie oft die Verbindung bereits automatisch neu aufgebaut wurde. */
+  resets: number;
+  lastError?: string;
+}
+
+export function dbStatus(): DbStatus {
+  const g = globals();
+  return {
+    mode: getDbMode(),
+    storage: getDbMode() === "postgres" ? "external" : g.pgliteStorage,
+    ready: g.ready,
+    failures: g.failures,
+    resets: g.resets,
+    ...(g.lastError ? { lastError: g.lastError } : {}),
+  };
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message.slice(0, 300);
+  return String(error).slice(0, 300);
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} hat nach ${ms} ms nicht geantwortet`)),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 function pgliteDataDir(): string {
-  return (
-    process.env.PGLITE_DIR ?? path.join(process.cwd(), ".data", "pglite")
-  );
+  return process.env.PGLITE_DIR ?? path.join(process.cwd(), ".data", "pglite");
+}
+
+async function createPglite(
+  dir: string | null,
+): Promise<{ client: PGlite; db: Database }> {
+  if (dir) mkdirSync(dir, { recursive: true });
+  const client = dir ? new PGlite(dir) : new PGlite();
+  await withTimeout(client.waitReady, 30_000, "PGlite-Start");
+  return { client, db: drizzlePglite(client) as unknown as Database };
+}
+
+async function initPglite(): Promise<Database> {
+  const g = globals();
+  const dir = pgliteDataDir();
+  let client: PGlite;
+  let db: Database;
+  try {
+    ({ client, db } = await createPglite(dir));
+    g.pgliteStorage = "file";
+  } catch (error) {
+    console.warn(
+      `[db] PGlite konnte ${dir} nicht öffnen (z. B. read-only Dateisystem) – ` +
+        `weiter im Speicher-Modus. Lobbys überleben dann keinen Neustart, ` +
+        `für dauerhafte Lobbys DATABASE_URL setzen.`,
+      error,
+    );
+    ({ client, db } = await createPglite(null));
+    g.pgliteStorage = "memory";
+  }
+  g.pglite = client;
+  g.db = db;
+  return db;
 }
 
 function getPgliteDatabase(): Promise<Database> {
+  const g = globals();
   // Singleton pro Prozess – wichtig für Next.js Dev-Hot-Reload und
   // parallele erste Anfragen.
-  globalForDb.__arenaPgliteInit ??= (async () => {
-    const dataDir = pgliteDataDir();
-    // PGlite legt den Zielordner nicht rekursiv an – Elternordner sicherstellen.
-    mkdirSync(dataDir, { recursive: true });
-    const client = new PGlite(dataDir);
-    await client.waitReady;
-    const db = drizzlePglite(client) as unknown as Database;
-    globalForDb.__arenaPgliteDatabase = db;
-    return db;
-  })();
-  return globalForDb.__arenaPgliteInit;
+  g.pgliteInit ??= initPglite().catch((error: unknown) => {
+    // Entscheidend: einen fehlgeschlagenen Start NICHT dauerhaft cachen.
+    // Sonst liefert jede weitere Anfrage bis zum nächsten Neustart 500er.
+    g.pgliteInit = undefined;
+    throw error;
+  });
+  return g.pgliteInit;
+}
+
+function sslFor(connectionString: string): PoolConfig["ssl"] {
+  const explicit = (process.env.DATABASE_SSL ?? "").toLowerCase();
+  if (explicit === "false" || explicit === "disable") return undefined;
+  if (explicit === "true" || explicit === "require") {
+    return { rejectUnauthorized: false };
+  }
+
+  let host = "";
+  try {
+    host = new URL(connectionString).hostname;
+  } catch {
+    /* Verbindungs-String ohne URL-Form – unten ohne TLS versuchen. */
+  }
+  if (!host || host === "localhost" || host === "127.0.0.1" || host === "::1") {
+    return undefined;
+  }
+  if (/sslmode=(require|prefer|verify-ca|verify-full)/i.test(connectionString)) {
+    return { rejectUnauthorized: false };
+  }
+  // Gängige Managed-Anbieter verlangen TLS ohne öffentliches CA-Zertifikat.
+  if (
+    /(\.neon\.tech|\.supabase\.(co|com|net)|\.render\.com|\.railway\.app|\.aivencloud\.com|\.timescale\.com|\.fly\.io)$/i.test(
+      host,
+    )
+  ) {
+    return { rejectUnauthorized: false };
+  }
+  return undefined;
+}
+
+function poolOptions(connectionString: string): PoolConfig {
+  const configured = Number(process.env.DATABASE_POOL_MAX ?? 4);
+  return {
+    connectionString,
+    max: Number.isFinite(configured) && configured > 0 ? configured : 4,
+    // Bewusst kürzer als das Zeitlimit der API-Aufrufe im Browser (15 s) –
+    // so antwortet die API mit einem klaren Fehler statt ins Leere zu laufen.
+    connectionTimeoutMillis: 8_000,
+    idleTimeoutMillis: 30_000,
+    allowExitOnIdle: true,
+    keepAlive: true,
+    ssl: sslFor(connectionString),
+  };
 }
 
 async function initSchema(db: Database): Promise<void> {
-  globalForDb.__arenaSchemaReady ??= new WeakSet<object>();
-  if (globalForDb.__arenaSchemaReady.has(db)) return;
-  await ensureSchema(db);
-  globalForDb.__arenaSchemaReady.add(db);
+  const g = globals();
+  g.schemaInit ??= new WeakMap<object, Promise<void>>();
+  let pending = g.schemaInit.get(db);
+  if (!pending) {
+    pending = ensureSchema(db);
+    g.schemaInit.set(db, pending);
+  }
+  try {
+    await pending;
+    g.ready = true;
+  } catch (error) {
+    // Nächster Aufruf versucht es erneut (statt dauerhaft zu scheitern).
+    g.schemaInit.delete(db);
+    g.ready = false;
+    throw error;
+  }
 }
 
 /**
@@ -315,22 +558,80 @@ async function initSchema(db: Database): Promise<void> {
  * Route-Module ohne Runtime-Secrets importiert.
  */
 export async function getDb(): Promise<Database> {
+  const g = globals();
   const databaseUrl = process.env.DATABASE_URL;
 
   let db: Database;
   if (databaseUrl) {
-    const pool =
-      globalForDb.__arenaNextJsPostgresqlPool ??
-      (globalForDb.__arenaNextJsPostgresqlPool = new Pool({
-        connectionString: databaseUrl,
-      }));
-    db = globalForDb.__arenaNextJsDatabase ??= drizzleNodePg(pool);
+    if (!g.db) {
+      const pool = new Pool(poolOptions(databaseUrl));
+      // Ohne diesen Handler kann ein Fehler einer idle-Verbindung den ganzen
+      // Node-Prozess beenden (und damit alle Lobbys "verschwinden lassen").
+      pool.on("error", (error) => {
+        console.error("[db] Fehler auf einer idle-Pool-Verbindung", error);
+        noteDbFailure(error);
+      });
+      g.pool = pool;
+      g.db = drizzleNodePg(pool);
+    }
+    db = g.db;
   } else {
     db = await getPgliteDatabase();
   }
 
   await initSchema(db);
   return db;
+}
+
+/** Verbindung verwerfen – die nächste Anfrage startet frisch. */
+export async function resetDb(): Promise<void> {
+  const g = globals();
+  const pglite = g.pglite;
+  const pool = g.pool;
+  g.pglite = undefined;
+  g.pgliteInit = undefined;
+  g.pgliteStorage = "none";
+  g.db = undefined;
+  g.pool = undefined;
+  g.schemaInit = undefined;
+  g.resets += 1;
+  g.ready = false;
+
+  if (pglite) {
+    await withTimeout(pglite.close(), 3_000, "PGlite-close").catch(() => {});
+  }
+  if (pool) {
+    await withTimeout(pool.end(), 3_000, "Pool-close").catch(() => {});
+  }
+}
+
+/**
+ * Wird von den API-Routen aufgerufen, wenn eine Anfrage fehlschlägt.
+ * Nach mehreren Fehlern in Folge wird die Verbindung automatisch neu
+ * aufgebaut – z. B. wenn eine PGlite-Instanz im WASM-Speicher gestorben ist.
+ */
+export function noteDbFailure(error?: unknown): void {
+  const g = globals();
+  g.failures += 1;
+  g.ready = false;
+  if (error !== undefined) g.lastError = errorMessage(error);
+  if (g.failures === 3 || g.failures % 10 === 0) {
+    console.error(
+      `[db] ${g.failures} Fehler in Folge (${g.lastError ?? "unbekannt"}) – ` +
+        `Verbindung wird automatisch neu aufgebaut.`,
+    );
+    void resetDb();
+  }
+}
+
+/** Erfolgreiche Anfrage – Fehlerzähler zurücksetzen. */
+export function noteDbSuccess(): void {
+  const g = globals();
+  g.ready = true;
+  if (g.failures !== 0) {
+    g.failures = 0;
+    g.lastError = undefined;
+  }
 }
 ```
 
@@ -340,7 +641,7 @@ export async function getDb(): Promise<Database> {
 import { sql, type SQLWrapper } from "drizzle-orm";
 
 /**
- * Idempente Schema-Initialisierung. Wird beim ersten Datenbank-Zugriff
+ * Idempotente Schema-Initialisierung. Wird beim ersten Datenbank-Zugriff
  * automatisch ausgeführt – dadurch braucht es KEIN `drizzle-kit push` und
  * keine manuellen Migrationsschritte (egal ob eingebettete PGlite-Datenbank
  * oder externe PostgreSQL-Instanz via DATABASE_URL).
@@ -361,13 +662,23 @@ const SCHEMA_STATEMENTS: string[] = [
     fade_intensity integer NOT NULL DEFAULT 50,
     frame text NOT NULL DEFAULT 'none',
     image text,
+    image_updated_at timestamptz,
     is_host boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(),
     last_seen timestamptz NOT NULL DEFAULT now()
   )`,
   `CREATE INDEX IF NOT EXISTS players_lobby_code_idx ON players (lobby_code)`,
-  // Upgrades für Tabellen aus älteren Ständen (ohne game_started-Spalte):
+  `CREATE INDEX IF NOT EXISTS players_last_seen_idx ON players (last_seen)`,
+  `CREATE INDEX IF NOT EXISTS lobbies_created_at_idx ON lobbies (created_at)`,
+  // Upgrades für Tabellen aus älteren Ständen:
   `ALTER TABLE lobbies ADD COLUMN IF NOT EXISTS game_started boolean NOT NULL DEFAULT false`,
+  `ALTER TABLE players ADD COLUMN IF NOT EXISTS image_updated_at timestamptz`,
+  // Alte Profilbilder (aus Ständen ohne image_updated_at) bekommen eine
+  // Cache-Version, damit ihre Avatar-URLs stabil bleiben.
+  `UPDATE players SET image_updated_at = created_at
+     WHERE image IS NOT NULL AND image_updated_at IS NULL`,
+  // „Leichen“ vergangener Sessions nicht ewig mitschleppen.
+  `DELETE FROM players WHERE last_seen < now() - interval '7 days'`,
 ];
 
 type Executable = {
@@ -416,7 +727,15 @@ export const players = pgTable("players", {
   color: text("color").notNull(),
   fadeIntensity: integer("fade_intensity").notNull().default(50),
   frame: text("frame").notNull().default("none"),
+  /**
+   * Profilbild als Data-URL. ACHTUNG: Diese Spalte wird absichtlich NICHT in
+   * den Lobby-Zustand geladen – Bilder sind groß (bis ~200 KB) und würden jede
+   * Statusabfrage im Sekundentakt aufblähen. Ausgeliefert werden sie separat
+   * über `GET /api/lobby/avatar?pid=…&v=…` (mit langem Browser-Cache).
+   */
   image: text("image"),
+  /** Zeitpunkt des letzten Bildwechsels – dient als Cache-Version in der Avatar-URL. */
+  imageUpdatedAt: timestamp("image_updated_at", { withTimezone: true }),
   isHost: boolean("is_host").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
@@ -428,6 +747,62 @@ export const players = pgTable("players", {
 
 export type LobbyRow = typeof lobbies.$inferSelect;
 export type PlayerRow = typeof players.$inferSelect;
+```
+
+## Datei: `src/lib/api.ts`
+
+```tsx
+import { NextResponse } from "next/server";
+
+import { noteDbFailure, noteDbSuccess } from "@/db";
+
+/** Antworten der Lobby-API dürfen nie gecacht werden (Live-Zustand!). */
+export const NO_STORE_HEADERS = {
+  "Cache-Control": "no-store, max-age=0",
+} as const;
+
+export function json(
+  body: unknown,
+  status = 200,
+  headers?: Record<string, string>,
+): NextResponse {
+  return NextResponse.json(body, {
+    status,
+    headers: { ...NO_STORE_HEADERS, ...headers },
+  });
+}
+
+export async function readJson(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const body: unknown = await request.json();
+    return typeof body === "object" && body !== null
+      ? (body as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+type RouteHandler = (request: Request) => Promise<Response>;
+
+/**
+ * Einheitlicher Rahmen für alle API-Routen: loggt Fehler, meldet sie der
+ * selbstheilenden Datenbank-Verbindung (siehe src/db/index.ts) und antwortet
+ * im Fehlerfall mit einem klaren JSON statt mit einer HTML-Fehlerseite.
+ */
+export function route(label: string, handler: RouteHandler): RouteHandler {
+  return async (request: Request) => {
+    try {
+      const response = await handler(request);
+      if (response.status < 500) noteDbSuccess();
+      return response;
+    } catch (error) {
+      noteDbFailure(error);
+      console.error(`[api] ${label} failed`, error);
+      return json({ ok: false, reason: "server" }, 500);
+    }
+  };
+}
 ```
 
 ## Datei: `src/lib/game.ts`
@@ -541,13 +916,56 @@ export interface LobbyState {
 }
 ```
 
+## Datei: `src/lib/image.ts`
+
+```tsx
+/**
+ * Profilbilder kommen als Data-URL vom Browser (nach clientseitigem
+ * Verkleinern) und werden als solche gespeichert. Wichtig: Sie werden NIE in
+ * den Lobby-Zustand geladen, sondern über `GET /api/lobby/avatar` ausgeliefert.
+ */
+export const MAX_IMAGE_CHARS = 400_000;
+
+const DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)$/;
+
+export type ImageParseResult =
+  | { ok: true; image: string | null }
+  | { ok: false; reason: "too_large" | "unsupported" };
+
+/** `null`/leer = Bild entfernen, gültige Data-URL = Bild setzen. */
+export function parseImageInput(input: unknown): ImageParseResult {
+  if (input === null || input === undefined || input === "") {
+    return { ok: true, image: null };
+  }
+  if (typeof input !== "string") return { ok: false, reason: "unsupported" };
+  if (input.length > MAX_IMAGE_CHARS) return { ok: false, reason: "too_large" };
+  if (!DATA_URL_RE.test(input)) return { ok: false, reason: "unsupported" };
+  return { ok: true, image: input };
+}
+
+export function decodeImage(
+  dataUrl: string,
+): { mime: string; bytes: Uint8Array<ArrayBuffer> } | null {
+  const match = DATA_URL_RE.exec(dataUrl);
+  if (!match) return null;
+  const mime = `image/${match[1] === "jpg" ? "jpeg" : match[1]}`;
+  try {
+    const buffer = Buffer.from(match[2], "base64");
+    if (buffer.length === 0) return null;
+    return { mime, bytes: new Uint8Array(buffer) };
+  } catch {
+    return null;
+  }
+}
+```
+
 ## Datei: `src/lib/lobby-service.ts`
 
 ```tsx
 import { and, asc, eq, lt } from "drizzle-orm";
 
 import { getDb } from "@/db";
-import { lobbies, players, type PlayerRow } from "@/db/schema";
+import { lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
   defaultRoleCounts,
@@ -556,37 +974,105 @@ import {
   type PlayerProfile,
   ROLES,
 } from "@/lib/game";
+import { parseImageInput } from "@/lib/image";
 
-const STALE_MS = 15_000;
+/**
+ * Nach dieser Zeit ohne Lebenszeichen gilt ein Spieler als getrennt.
+ * Bewusst großzügig: Browser drosseln Timer im Hintergrund-Tab auf ~1/min und
+ * Render-Free-Instanzen antworten manchmal erst nach Sekunden.
+ */
+const STALE_MS = Number(process.env.LOBBY_STALE_MS ?? 120_000);
+/** Häufiger als das hier muss `last_seen` nicht geschrieben werden. */
+const TOUCH_INTERVAL_MS = 20_000;
+/** Aufräumen (stale Spieler) höchstens alle X ms pro Prozess. */
+const CLEANUP_INTERVAL_MS = 10_000;
+/** Alte Lobbys aufräumen höchstens alle X ms. */
+const PURGE_INTERVAL_MS = 5 * 60_000;
+/** Lobbys, die älter als ein Tag sind, werden automatisch gelöscht. */
+const LOBBY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** Leere Lobbys erst nach dieser Gnadenfrist löschen (Reconnect-Schutz). */
+const EMPTY_LOBBY_GRACE_MS = 10 * 60_000;
 const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/** Spieler-IDs sind UUIDs (Postgres `gen_random_uuid()`). */
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 /** Maximale Spielerzahl pro Lobby. */
 export const MAX_PLAYERS = 12;
-/** Lobbys, die älter als ein Tag sind, werden automatisch aufgeräumt. */
-const LOBBY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+let lastCleanupAt = 0;
+let lastPurgeAt = 0;
+
+/** Profilfelder, die für den Lobby-Zustand gebraucht werden (ohne Bild!). */
+const playerColumns = {
+  id: players.id,
+  name: players.name,
+  color: players.color,
+  fadeIntensity: players.fadeIntensity,
+  frame: players.frame,
+  isHost: players.isHost,
+  createdAt: players.createdAt,
+  lastSeen: players.lastSeen,
+  imageUpdatedAt: players.imageUpdatedAt,
+};
+
+type PlayerSummary = {
+  id: string;
+  name: string;
+  color: string;
+  fadeIntensity: number;
+  frame: string;
+  isHost: boolean;
+  createdAt: Date;
+  lastSeen: Date;
+  imageUpdatedAt: Date | null;
+};
+
+/** Profilbild-URL (klein, cachebar) – Bilddaten selbst liegen unter derselben Route. */
+export function avatarUrl(playerId: string, version: Date | number): string {
+  const v = version instanceof Date ? version.getTime() : version;
+  return `/api/lobby/avatar?pid=${encodeURIComponent(playerId)}&v=${v}`;
+}
 
 export function sanitizeProfile(input: unknown): PlayerProfile {
+  const patch = sanitizeProfilePatch(input);
+  return {
+    name: patch.name ?? "Player",
+    color: patch.color ?? DEFAULT_COLOR,
+    fadeIntensity: patch.fadeIntensity ?? 50,
+    frame: patch.frame ?? "none",
+    image: patch.image ?? null,
+  };
+}
+
+/**
+ * Wie `sanitizeProfile`, aber ohne Standardwerte: Es werden nur Felder
+ * zurückgegeben, die tatsächlich mitgeschickt wurden. So kann ein Reconnect
+ * (`resume`) das Profil nicht überschreiben.
+ */
+export function sanitizeProfilePatch(input: unknown): Partial<PlayerProfile> {
   const raw = (typeof input === "object" && input !== null ? input : {}) as Record<
     string,
     unknown
   >;
-  const name =
-    typeof raw.name === "string" && raw.name.trim()
-      ? raw.name.trim().slice(0, 12)
-      : "Player";
-  const color =
-    typeof raw.color === "string" && /^#[0-9a-fA-F]{6}$/.test(raw.color)
-      ? raw.color
-      : DEFAULT_COLOR;
-  const fadeIntensity =
-    typeof raw.fadeIntensity === "number" && Number.isFinite(raw.fadeIntensity)
-      ? Math.max(0, Math.min(100, Math.round(raw.fadeIntensity)))
-      : 50;
-  const frame = typeof raw.frame === "string" ? raw.frame.slice(0, 24) : "none";
-  const image =
-    typeof raw.image === "string" && raw.image.startsWith("data:image/")
-      ? raw.image.slice(0, 400_000)
-      : null;
-  return { name, color, fadeIntensity, frame, image };
+  const patch: Partial<PlayerProfile> = {};
+
+  if (typeof raw.name === "string" && raw.name.trim()) {
+    patch.name = raw.name.trim().slice(0, 12);
+  }
+  if (typeof raw.color === "string" && /^#[0-9a-fA-F]{6}$/.test(raw.color)) {
+    patch.color = raw.color;
+  }
+  if (typeof raw.fadeIntensity === "number" && Number.isFinite(raw.fadeIntensity)) {
+    patch.fadeIntensity = Math.max(0, Math.min(100, Math.round(raw.fadeIntensity)));
+  }
+  if (typeof raw.frame === "string") {
+    patch.frame = raw.frame.slice(0, 24);
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, "image")) {
+    const parsed = parseImageInput(raw.image);
+    if (parsed.ok) patch.image = parsed.image;
+  }
+  return patch;
 }
 
 function sanitizeRoleCounts(input: unknown): Record<string, number> {
@@ -602,6 +1088,13 @@ function sanitizeRoleCounts(input: unknown): Record<string, number> {
   return counts;
 }
 
+export function normalizeCode(input: unknown): string {
+  return String(input ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "")
+    .slice(0, 6);
+}
+
 function generateCode(): string {
   let code = "";
   for (let i = 0; i < 6; i += 1) {
@@ -610,87 +1103,244 @@ function generateCode(): string {
   return code;
 }
 
-function toLobbyPlayer(row: PlayerRow): LobbyPlayer {
+function toLobbyPlayer(row: PlayerSummary): LobbyPlayer {
   return {
     id: row.id,
     name: row.name,
     color: row.color,
     fadeIntensity: row.fadeIntensity,
     frame: row.frame,
-    image: row.image,
     isHost: row.isHost,
+    image: row.imageUpdatedAt ? avatarUrl(row.id, row.imageUpdatedAt) : null,
   };
 }
 
-async function listPlayers(code: string): Promise<PlayerRow[]> {
+function toState(
+  code: string,
+  rows: PlayerSummary[],
+  roleCounts: Record<string, number>,
+  gameStarted: boolean,
+): LobbyState {
+  return {
+    code,
+    players: rows.map(toLobbyPlayer),
+    roleCounts,
+    gameStarted,
+  };
+}
+
+async function listPlayers(code: string): Promise<PlayerSummary[]> {
   const db = await getDb();
   return db
-    .select()
+    .select(playerColumns)
     .from(players)
     .where(eq(players.lobbyCode, code))
     .orderBy(asc(players.createdAt));
 }
 
-/** Entfernt verwaiste Lobbys, die älter als ein Tag sind (inkl. Spieler per Cascade). */
+/** Entfernt verwaiste Lobbys, die älter als ein Tag sind (Spieler via Cascade). */
 async function purgeOldLobbies(): Promise<void> {
+  if (Date.now() - lastPurgeAt < PURGE_INTERVAL_MS) return;
+  lastPurgeAt = Date.now();
   const db = await getDb();
   await db
     .delete(lobbies)
     .where(lt(lobbies.createdAt, new Date(Date.now() - LOBBY_MAX_AGE_MS)));
 }
 
+/** Entfernt Spieler, die sich lange nicht gemeldet haben (getrennte Tabs). */
+async function cleanupStalePlayers(code: string): Promise<void> {
+  if (Date.now() - lastCleanupAt < CLEANUP_INTERVAL_MS) return;
+  lastCleanupAt = Date.now();
+  const db = await getDb();
+  await db
+    .delete(players)
+    .where(
+      and(
+        eq(players.lobbyCode, code),
+        lt(players.lastSeen, new Date(Date.now() - STALE_MS)),
+      ),
+    );
+}
+
+async function touchPlayer(code: string, playerId: string): Promise<void> {
+  const db = await getDb();
+  await db
+    .update(players)
+    .set({ lastSeen: new Date() })
+    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+}
+
+export type CreateOptions = {
+  /** Wunschcode – für die Wiederherstellung einer Lobby nach einem Neustart. */
+  code?: string;
+  /** Bevorzugte Spieler-ID, damit ein Reconnect dieselbe Identität behält. */
+  playerId?: string;
+};
+
+export type CreateOutcome =
+  | { ok: true; selfId: string; lobby: LobbyState; reused: boolean }
+  | { ok: false; reason: "full" };
+
+/**
+ * Lobby anlegen. Mit `options.code` wird – falls der Code noch frei ist –
+ * genau dieser Code verwendet (Wiederherstellung nach einem Neustart der
+ * Instanz); existiert er bereits, tritt der Spieler einfach dieser Lobby bei.
+ */
 export async function createLobby(
   mode: string,
   profileInput: unknown,
-): Promise<{ selfId: string; lobby: LobbyState }> {
+  options: CreateOptions = {},
+): Promise<CreateOutcome> {
   const db = await getDb();
-  const profile = sanitizeProfile(profileInput);
 
   // Nebenbei alte/verwaiste Lobbys aufräumen.
   await purgeOldLobbies();
 
-  let code = generateCode();
+  const preferred = normalizeCode(options.code ?? "");
+  const wantedId =
+    typeof options.playerId === "string" && UUID_RE.test(options.playerId)
+      ? options.playerId
+      : null;
+  const roleCounts = defaultRoleCounts();
+
+  let code = preferred.length === 6 ? preferred : generateCode();
+  let created = false;
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    const existing = await db
-      .select({ code: lobbies.code })
-      .from(lobbies)
-      .where(eq(lobbies.code, code));
-    if (existing.length === 0) break;
+    const inserted = await db
+      .insert(lobbies)
+      .values({ code, mode: mode || "WERWOLF", roleCounts })
+      .onConflictDoNothing()
+      .returning({ code: lobbies.code });
+    if (inserted.length > 0) {
+      created = true;
+      break;
+    }
+    // Wunschcode belegt → bestehende Lobby übernehmen (kein Fehler).
+    if (attempt === 0 && preferred.length === 6) break;
     code = generateCode();
   }
 
-  const roleCounts = defaultRoleCounts();
-  await db.insert(lobbies).values({ code, mode: mode || "WERWOLF", roleCounts });
-  const [self] = await db
-    .insert(players)
-    .values({ lobbyCode: code, ...profile, isHost: true })
-    .returning();
+  const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
+  if (!lobby) throw new Error("Lobby konnte nicht angelegt werden");
 
+  if (wantedId) {
+    const [existing] = await db
+      .select({ id: players.id })
+      .from(players)
+      .where(and(eq(players.id, wantedId), eq(players.lobbyCode, code)));
+    if (existing) {
+      await applyProfilePatch(code, wantedId, sanitizeProfilePatch(profileInput));
+      const rows = await listPlayers(code);
+      return {
+        ok: true,
+        selfId: wantedId,
+        lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+        reused: true,
+      };
+    }
+  }
+
+  const existingPlayers = await listPlayers(code);
+  if (existingPlayers.length >= MAX_PLAYERS) {
+    return { ok: false, reason: "full" };
+  }
+
+  const profile = sanitizeProfile(profileInput);
+  const base = {
+    lobbyCode: code,
+    ...profile,
+    imageUpdatedAt: profile.image ? new Date() : null,
+    isHost: !existingPlayers.some((row) => row.isHost),
+  };
+
+  let self: PlayerSummary | undefined;
+  if (wantedId) {
+    [self] = await db
+      .insert(players)
+      .values({ id: wantedId, ...base })
+      .onConflictDoNothing()
+      .returning(playerColumns);
+  }
+  if (!self) {
+    [self] = await db.insert(players).values(base).returning(playerColumns);
+  }
+
+  const rows = await listPlayers(code);
   return {
+    ok: true,
     selfId: self.id,
-    lobby: {
-      code,
-      players: [toLobbyPlayer(self)],
-      roleCounts,
-      gameStarted: false,
-    },
+    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    reused: !created,
   };
 }
 
 export type JoinOutcome =
-  | { ok: true; selfId: string; lobby: LobbyState }
+  | { ok: true; selfId: string; lobby: LobbyState; resumed: boolean }
   | { ok: false; reason: "not_found" | "full" };
 
+/**
+ * Beitreten – oder mit `playerId` wieder **beitreten (resume)**, nachdem der
+ * Tab im Hintergrund war oder der Server kurz weg war. Die Spieler-ID bleibt
+ * dabei gleich, die Rolle als Host geht nicht verloren.
+ */
 export async function joinLobby(
   codeInput: string,
   profileInput: unknown,
+  options: { playerId?: string } = {},
 ): Promise<JoinOutcome> {
-  const code = (codeInput || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 6);
+  const code = normalizeCode(codeInput);
   if (code.length !== 6) return { ok: false, reason: "not_found" };
 
   const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
   if (!lobby) return { ok: false, reason: "not_found" };
+
+  const patch = sanitizeProfilePatch(profileInput);
+  const resumeId = options.playerId;
+
+  if (resumeId) {
+    const [existing] = await db
+      .select({ id: players.id })
+      .from(players)
+      .where(and(eq(players.id, resumeId), eq(players.lobbyCode, code)));
+    if (existing) {
+      await applyProfilePatch(code, resumeId, patch);
+      const rows = await listPlayers(code);
+      const state = toState(code, rows, lobby.roleCounts, lobby.gameStarted);
+      return { ok: true, selfId: resumeId, lobby: state, resumed: true };
+    }
+
+    // Der Tab hat sich beim Verlassen abgemeldet (z. B. Neuladen) – hier kommt
+    // er sofort wieder. Wir legen dieselbe ID neu an, damit die Sitzung des
+    // Browsers gültig bleibt; die Host-Rolle gibt es zurück, wenn sie frei ist.
+    if (UUID_RE.test(resumeId)) {
+      const current = await listPlayers(code);
+      if (current.length < MAX_PLAYERS) {
+        const profile = sanitizeProfile(profileInput);
+        const [recreated] = await db
+          .insert(players)
+          .values({
+            id: resumeId,
+            lobbyCode: code,
+            ...profile,
+            imageUpdatedAt: profile.image ? new Date() : null,
+            isHost: !current.some((row) => row.isHost),
+          })
+          .onConflictDoNothing()
+          .returning(playerColumns);
+        if (recreated) {
+          const rows = await listPlayers(code);
+          return {
+            ok: true,
+            selfId: recreated.id,
+            lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+            resumed: true,
+          };
+        }
+      }
+    }
+  }
 
   const existingPlayers = await listPlayers(code);
   if (existingPlayers.length >= MAX_PLAYERS) {
@@ -700,52 +1350,84 @@ export async function joinLobby(
   const profile = sanitizeProfile(profileInput);
   const [self] = await db
     .insert(players)
-    .values({ lobbyCode: code, ...profile, isHost: false })
-    .returning();
+    .values({
+      lobbyCode: code,
+      ...profile,
+      imageUpdatedAt: profile.image ? new Date() : null,
+      isHost: false,
+    })
+    .returning(playerColumns);
 
   const rows = await listPlayers(code);
   return {
     ok: true,
     selfId: self.id,
-    lobby: {
-      code,
-      players: rows.map(toLobbyPlayer),
-      roleCounts: lobby.roleCounts,
-      gameStarted: lobby.gameStarted,
-    },
+    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    resumed: false,
   };
 }
 
-export async function touchPlayer(code: string, playerId: string): Promise<void> {
+/** Wendet nur die mitgeschickten Felder an (Bild nur, wenn es sich ändert). */
+async function applyProfilePatch(
+  code: string,
+  playerId: string,
+  patch: Partial<PlayerProfile>,
+): Promise<void> {
   const db = await getDb();
+  const values: Record<string, unknown> = { lastSeen: new Date() };
+  if (patch.name !== undefined) values.name = patch.name;
+  if (patch.color !== undefined) values.color = patch.color;
+  if (patch.fadeIntensity !== undefined) values.fadeIntensity = patch.fadeIntensity;
+  if (patch.frame !== undefined) values.frame = patch.frame;
+  if (patch.image !== undefined) {
+    values.image = patch.image;
+    values.imageUpdatedAt = patch.image ? new Date() : null;
+  }
   await db
     .update(players)
-    .set({ lastSeen: new Date() })
+    .set(values)
     .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
 }
 
-/** Removes stale players, promotes a new host when needed, returns fresh state. */
+export type StateOutcome =
+  | { status: "ok"; state: LobbyState }
+  | { status: "not_found" }
+  /** Lobby existiert, dieser Spieler ist (noch) nicht drin → Client darf erneut beitreten. */
+  | { status: "not_member" };
+
+/**
+ * Liefert den Zustand und hält den Spieler am Leben. Räumt getrennte Spieler
+ * auf, ohne die Lobby sofort zu löschen (Reconnect-Schutz) und überträgt die
+ * Host-Rolle, wenn der Host weg ist.
+ */
 export async function getLobbyState(
   codeInput: string,
   playerId?: string,
-): Promise<LobbyState | "gone" | "kicked" | null> {
-  const code = (codeInput || "").toUpperCase().slice(0, 6);
-  if (code.length !== 6) return null;
+): Promise<StateOutcome> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6) return { status: "not_found" };
 
   const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
-  if (!lobby) return null;
+  if (!lobby) return { status: "not_found" };
 
-  const cutoff = new Date(Date.now() - STALE_MS);
-  await db
-    .delete(players)
-    .where(and(eq(players.lobbyCode, code), lt(players.lastSeen, cutoff)));
-
+  await cleanupStalePlayers(code);
   let rows = await listPlayers(code);
 
   if (rows.length === 0) {
-    await db.delete(lobbies).where(eq(lobbies.code, code));
-    return "gone";
+    const age = Date.now() - lobby.createdAt.getTime();
+    if (age > EMPTY_LOBBY_GRACE_MS) {
+      await db.delete(lobbies).where(eq(lobbies.code, code));
+      return { status: "not_found" };
+    }
+    // Leer (alle getrennt), aber noch innerhalb der Gnadenfrist: Der Spieler
+    // darf per Resume zurückkommen, die Lobby bleibt bestehen.
+    return playerId
+      ? { status: "not_member" }
+      : {
+          status: "ok",
+          state: toState(code, [], lobby.roleCounts, lobby.gameStarted),
+        };
   }
 
   if (!rows.some((row) => row.isHost)) {
@@ -758,15 +1440,15 @@ export async function getLobbyState(
 
   if (playerId) {
     const self = rows.find((row) => row.id === playerId);
-    if (!self) return "kicked";
-    await touchPlayer(code, playerId);
+    if (!self) return { status: "not_member" };
+    if (Date.now() - self.lastSeen.getTime() > TOUCH_INTERVAL_MS) {
+      await touchPlayer(code, playerId);
+    }
   }
 
   return {
-    code,
-    players: rows.map(toLobbyPlayer),
-    roleCounts: lobby.roleCounts,
-    gameStarted: lobby.gameStarted,
+    status: "ok",
+    state: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
   };
 }
 
@@ -779,7 +1461,7 @@ export async function setGameStarted(
   playerId: string,
   started: boolean,
 ): Promise<boolean> {
-  const code = (codeInput || "").toUpperCase().slice(0, 6);
+  const code = normalizeCode(codeInput);
   if (code.length !== 6) return false;
 
   const db = await getDb();
@@ -803,26 +1485,97 @@ export async function setGameStarted(
   return true;
 }
 
+/** Profil aktualisieren (Name, Farbe, Verlauf, Rahmen – Bild separat). */
 export async function updateProfile(
   code: string,
   playerId: string,
   profileInput: unknown,
 ): Promise<boolean> {
+  const patch = sanitizeProfilePatch(profileInput);
+  if (patch.image !== undefined) {
+    // Bilder laufen absichtlich über /api/lobby/avatar (eigener Endpunkt,
+    // eigene Größenprüfung) – hier ignorieren, damit das Sekunden-Polling
+    // nicht durch große Payloads ausgebremst wird.
+    delete patch.image;
+  }
   const db = await getDb();
-  const profile = sanitizeProfile(profileInput);
+  const values: Record<string, unknown> = { ...patch, lastSeen: new Date() };
   const updated = await db
     .update(players)
-    .set({ ...profile, lastSeen: new Date() })
+    .set(values)
     .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)))
     .returning({ id: players.id });
   return updated.length > 0;
 }
 
+export type AvatarOutcome =
+  | { ok: true; url: string | null }
+  | { ok: false; reason: "not_member" | "unsupported" | "too_large" };
+
+/** Profilbild setzen oder entfernen (nur wenn es sich wirklich ändert). */
+export async function updateAvatar(
+  codeInput: string,
+  playerId: string,
+  imageInput: unknown,
+): Promise<AvatarOutcome> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6) return { ok: false, reason: "not_member" };
+
+  const parsed = parseImageInput(imageInput);
+  if (!parsed.ok) return { ok: false, reason: parsed.reason };
+
+  const db = await getDb();
+  const [current] = await db
+    .select({ image: players.image, imageUpdatedAt: players.imageUpdatedAt })
+    .from(players)
+    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+  if (!current) return { ok: false, reason: "not_member" };
+
+  if (current.image === parsed.image) {
+    // Unverändert: nur Lebenszeichen aktualisieren, keine 200 KB schreiben.
+    await touchPlayer(code, playerId);
+    return {
+      ok: true,
+      url: parsed.image && current.imageUpdatedAt
+        ? avatarUrl(playerId, current.imageUpdatedAt)
+        : null,
+    };
+  }
+
+  const version = new Date();
+  await db
+    .update(players)
+    .set({
+      image: parsed.image,
+      imageUpdatedAt: parsed.image ? version : null,
+      lastSeen: version,
+    })
+    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+
+  return { ok: true, url: parsed.image ? avatarUrl(playerId, version) : null };
+}
+
+/** Profilbild eines Spielers (Rohdaten für `GET /api/lobby/avatar`). */
+export async function getAvatar(
+  playerId: string,
+): Promise<{ image: string } | null> {
+  if (!playerId) return null;
+  const db = await getDb();
+  const [row] = await db
+    .select({ image: players.image })
+    .from(players)
+    .where(eq(players.id, playerId));
+  return row?.image ? { image: row.image } : null;
+}
+
 export async function updateRoleCounts(
-  code: string,
+  codeInput: string,
   playerId: string,
   roleCountsInput: unknown,
 ): Promise<boolean> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6) return false;
+
   const db = await getDb();
   const [host] = await db
     .select({ id: players.id })
@@ -844,7 +1597,13 @@ export async function updateRoleCounts(
   return true;
 }
 
-export async function removePlayer(code: string, playerId: string): Promise<void> {
+export async function removePlayer(
+  codeInput: string,
+  playerId: string,
+): Promise<void> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6 || !playerId) return;
+
   const db = await getDb();
   await db
     .delete(players)
@@ -988,196 +1747,271 @@ export default function HomePage() {
 ```tsx
 import { sql } from "drizzle-orm";
 
-import { getDb, getDbMode } from "@/db";
+import { dbStatus, getDb, noteDbFailure, noteDbSuccess } from "@/db";
+import { json, route } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+/**
+ * Health-Check (Render: `healthCheckPath: /api/health`). Prüft die Datenbank
+ * wirklich an und zeigt an, welche Variante aktiv ist (`postgres` = externe
+ * Datenbank aus DATABASE_URL, `pglite` = eingebettet). Fehlgeschlagene
+ * Prüfungen lösen den automatischen Neuaufbau der Verbindung aus
+ * (siehe src/db/index.ts).
+ */
+export const GET = route("health", async () => {
+  const started = Date.now();
   try {
-    await (await getDb()).execute(sql`select 1`);
-    return Response.json({ ok: true, db: getDbMode() });
+    const db = await getDb();
+    await db.execute(sql`select 1`);
+    noteDbSuccess();
+    return json({
+      ok: true,
+      db: dbStatus().mode,
+      status: dbStatus(),
+      latencyMs: Date.now() - started,
+      uptimeSec: Math.round(process.uptime()),
+    });
   } catch (error) {
-    console.error("health check failed", error);
-    return Response.json(
-      { ok: false, db: getDbMode() },
-      { status: 500 },
+    noteDbFailure(error);
+    console.error("[api] health check failed", error);
+    return json(
+      {
+        ok: false,
+        db: dbStatus().mode,
+        status: dbStatus(),
+        latencyMs: Date.now() - started,
+      },
+      503,
     );
   }
-}
+});
 ```
 
 ## Datei: `src/app/api/lobby/create/route.ts`
 
 ```tsx
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { createLobby } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const result = await createLobby(String(body?.mode ?? "WERWOLF"), body?.profile);
-    return NextResponse.json({ ok: true, selfId: result.selfId, lobby: result.lobby });
-  } catch (error) {
-    console.error("lobby:create failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:create", async (request) => {
+  const body = await readJson(request);
+  // `code` + `playerId` (optional): Wiederherstellung – z. B. wenn die
+  // Render-Free-Instanz neu gestartet ist und die Lobby verloren ging, kann
+  // der Host sie mit DEMSELBEN Code wieder aufmachen und seine Freunde landen
+  // automatisch wieder drin.
+  const result = await createLobby(String(body.mode ?? "WERWOLF"), body.profile, {
+    code: typeof body.code === "string" ? body.code : undefined,
+    playerId: typeof body.playerId === "string" ? body.playerId : undefined,
+  });
+
+  if (!result.ok) {
+    return json({ ok: false, reason: result.reason }, 409);
   }
-}
+  return json({
+    ok: true,
+    selfId: result.selfId,
+    reused: result.reused,
+    lobby: result.lobby,
+  });
+});
 ```
 
 ## Datei: `src/app/api/lobby/join/route.ts`
 
 ```tsx
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { joinLobby } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const result = await joinLobby(String(body?.code ?? ""), body?.profile);
-    if (!result.ok) {
-      return NextResponse.json(
-        { ok: false, reason: result.reason },
-        { status: result.reason === "full" ? 409 : 404 },
-      );
-    }
-    return NextResponse.json({ ok: true, selfId: result.selfId, lobby: result.lobby });
-  } catch (error) {
-    console.error("lobby:join failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:join", async (request) => {
+  const body = await readJson(request);
+  // `playerId` (optional): Reconnect – derselbe Spieler kommt in dieselbe
+  // Lobby zurück (z. B. nachdem der Tab im Hintergrund war oder die
+  // Render-Instanz kurz neu gestartet ist). Host-Rolle bleibt erhalten.
+  const result = await joinLobby(String(body.code ?? ""), body.profile, {
+    playerId: typeof body.playerId === "string" ? body.playerId : undefined,
+  });
+
+  if (!result.ok) {
+    return json(
+      { ok: false, reason: result.reason },
+      result.reason === "full" ? 409 : 404,
+    );
   }
-}
+  return json({
+    ok: true,
+    selfId: result.selfId,
+    resumed: result.resumed,
+    lobby: result.lobby,
+  });
+});
 ```
 
 ## Datei: `src/app/api/lobby/state/route.ts`
 
 ```tsx
-import { NextResponse } from "next/server";
-
+import { json, route } from "@/lib/api";
 import { getLobbyState } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function GET(request: Request) {
-  try {
-    const url = new URL(request.url);
-    const code = url.searchParams.get("code") ?? "";
-    const pid = url.searchParams.get("pid") ?? undefined;
+export const GET = route("lobby:state", async (request) => {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code") ?? "";
+  const pid = url.searchParams.get("pid") ?? undefined;
 
-    const state = await getLobbyState(code, pid);
-    if (state === null || state === "gone") {
-      return NextResponse.json({ ok: false, reason: "not_found" }, { status: 404 });
-    }
-    if (state === "kicked") {
-      return NextResponse.json({ ok: false, reason: "kicked" }, { status: 409 });
-    }
-    return NextResponse.json({ ok: true, state });
-  } catch (error) {
-    console.error("lobby:state failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+  const outcome = await getLobbyState(code, pid);
+  if (outcome.status === "not_found") {
+    return json({ ok: false, reason: "not_found" }, 404);
   }
-}
+  if (outcome.status === "not_member") {
+    return json({ ok: false, reason: "not_member" }, 409);
+  }
+  return json({ ok: true, state: outcome.state });
+});
 ```
 
 ## Datei: `src/app/api/lobby/profile/route.ts`
 
 ```tsx
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { updateProfile } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const ok = await updateProfile(
-      String(body?.code ?? ""),
-      String(body?.playerId ?? ""),
-      body?.profile,
-    );
-    return NextResponse.json({ ok });
-  } catch (error) {
-    console.error("lobby:updateProfile failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:profile", async (request) => {
+  const body = await readJson(request);
+  const ok = await updateProfile(
+    String(body.code ?? ""),
+    String(body.playerId ?? ""),
+    body.profile,
+  );
+  if (!ok) {
+    return json({ ok: false, reason: "not_member" }, 409);
   }
-}
+  return json({ ok: true });
+});
 ```
 
 ## Datei: `src/app/api/lobby/roles/route.ts`
 
 ```tsx
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { updateRoleCounts } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const ok = await updateRoleCounts(
-      String(body?.code ?? ""),
-      String(body?.playerId ?? ""),
-      body?.roleCounts,
-    );
-    return NextResponse.json({ ok });
-  } catch (error) {
-    console.error("lobby:updateRoles failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:roles", async (request) => {
+  const body = await readJson(request);
+  const ok = await updateRoleCounts(
+    String(body.code ?? ""),
+    String(body.playerId ?? ""),
+    body.roleCounts,
+  );
+  if (!ok) {
+    return json({ ok: false, reason: "not_host" }, 403);
   }
-}
+  return json({ ok: true });
+});
 ```
 
 ## Datei: `src/app/api/lobby/start/route.ts`
 
 ```tsx
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { setGameStarted } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const ok = await setGameStarted(
-      String(body?.code ?? ""),
-      String(body?.playerId ?? ""),
-      body?.started !== false,
-    );
-    return NextResponse.json({ ok });
-  } catch (error) {
-    console.error("lobby:start failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:start", async (request) => {
+  const body = await readJson(request);
+  const ok = await setGameStarted(
+    String(body.code ?? ""),
+    String(body.playerId ?? ""),
+    body.started !== false,
+  );
+  if (!ok) {
+    return json({ ok: false, reason: "not_host" }, 403);
   }
-}
+  return json({ ok: true });
+});
 ```
 
 ## Datei: `src/app/api/lobby/leave/route.ts`
 
 ```tsx
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { removePlayer } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    await removePlayer(String(body?.code ?? ""), String(body?.playerId ?? ""));
-    return NextResponse.json({ ok: true });
-  } catch (error) {
-    console.error("lobby:leave failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:leave", async (request) => {
+  const body = await readJson(request);
+  await removePlayer(String(body.code ?? ""), String(body.playerId ?? ""));
+  return json({ ok: true });
+});
+```
+
+## Datei: `src/app/api/lobby/avatar/route.ts`
+
+```tsx
+import { json, readJson, route } from "@/lib/api";
+import { decodeImage } from "@/lib/image";
+import { getAvatar, updateAvatar } from "@/lib/lobby-service";
+
+export const dynamic = "force-dynamic";
+
+const UUID_RE = /^[0-9a-fA-F-]{36}$/;
+
+/**
+ * Profilbild eines Spielers (Rohdaten). Die URL enthält eine Versionsnummer
+ * (`v=…`), darf also lange im Browser-Cache liegen – dadurch muss das Bild
+ * genau EINMAL geladen werden und nicht bei jeder Statusabfrage erneut.
+ */
+export const GET = route("lobby:avatar:get", async (request) => {
+  const pid = new URL(request.url).searchParams.get("pid") ?? "";
+  if (!UUID_RE.test(pid)) {
+    return new Response("bad request", { status: 400 });
   }
-}
+
+  const found = await getAvatar(pid);
+  const decoded = found ? decodeImage(found.image) : null;
+  if (!decoded) {
+    return new Response("not found", {
+      status: 404,
+      headers: { "Cache-Control": "no-store, max-age=0" },
+    });
+  }
+
+  return new Response(decoded.bytes, {
+    headers: {
+      "Content-Type": decoded.mime,
+      "Content-Length": String(decoded.bytes.byteLength),
+      "Cache-Control": "public, max-age=604800, immutable",
+    },
+  });
+});
+
+/** Profilbild hochladen oder entfernen (`image: null`). */
+export const POST = route("lobby:avatar", async (request) => {
+  const body = await readJson(request);
+  const result = await updateAvatar(
+    String(body.code ?? ""),
+    String(body.playerId ?? ""),
+    body.image,
+  );
+  if (!result.ok) {
+    return json(
+      { ok: false, reason: result.reason },
+      result.reason === "not_member" ? 409 : 400,
+    );
+  }
+  return json({ ok: true, url: result.url });
+});
 ```
 
 ## Datei: `src/components/werwolf/werwolf-app.tsx`
@@ -1230,6 +2064,30 @@ type Screen = "menu" | "menuLeaving" | "lobbyEntering" | "lobby";
 type SlidePhase = "idle" | "start" | "go";
 type JoinPanel = "closed" | "opening" | "open" | "closing";
 type Direction = "left" | "right";
+type ConnectionState = "ok" | "reconnecting";
+
+/** Laufende Sitzung (Lobbycode + eigene Spieler-ID) – übersteht ein Neuladen. */
+const SESSION_KEY = "werwolf-lobby-session";
+/** Poll-Intervalle: aktiv sichtbar / Tab im Hintergrund (Browser drosseln dort). */
+const POLL_ACTIVE_MS = 1_200;
+const POLL_HIDDEN_MS = 20_000;
+/** Nach so vielen Fehlversuchen in Folge gilt die Lobby als verloren. */
+const MAX_POLL_FAILURES = 8;
+/** Profilbilder werden im Browser verkleinert, damit sie schnell übertragen werden. */
+const AVATAR_MAX_SIZE = 256;
+const AVATAR_MAX_CHARS = 380_000;
+
+type ApiResult<T> =
+  | { ok: true; status: number; data: T }
+  | { ok: false; status: number; reason: string };
+
+interface LobbyResponse {
+  ok: boolean;
+  selfId: string;
+  lobby: LobbyState;
+  resumed?: boolean;
+  reason?: string;
+}
 
 function loadStoredProfile<K extends keyof PlayerProfile>(
   key: K,
@@ -1240,6 +2098,157 @@ function loadStoredProfile<K extends keyof PlayerProfile>(
     return stored[key] ?? fallback;
   } catch {
     return fallback;
+  }
+}
+
+function saveSession(code: string, playerId: string): void {
+  try {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify({ code, playerId }));
+  } catch {
+    /* Privater Modus o. Ä. – Sitzung geht dann beim Neuladen verloren. */
+  }
+}
+
+function loadSession(): { code: string; playerId: string } | null {
+  try {
+    const parsed: unknown = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const { code, playerId } = parsed as { code?: unknown; playerId?: unknown };
+    if (typeof code !== "string" || typeof playerId !== "string") return null;
+    if (code.length !== 6 || playerId.length < 8) return null;
+    return { code, playerId };
+  } catch {
+    return null;
+  }
+}
+
+function clearSession(): void {
+  try {
+    sessionStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* egal */
+  }
+}
+
+/**
+ * Schlanker API-Aufruf mit Zeitlimit. Wichtig für Render-Free-Instanzen:
+ * Ohne Zeitlimit hängt die Oberfläche bei einem eingeschlafenen Server ewig,
+ * statt eine verständliche Meldung zu zeigen.
+ */
+async function apiRequest<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 15_000,
+): Promise<ApiResult<T>> {
+  try {
+    // `AbortSignal.timeout` gibt es in älteren Safari-Versionen nicht – dann
+    // läuft die Anfrage eben ohne Zeitlimit weiter (der Server antwortet
+    // dank eigener Limits trotzdem schnell).
+    const signal =
+      typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(timeoutMs)
+        : undefined;
+    const response = await fetch(path, {
+      ...init,
+      cache: "no-store",
+      headers: {
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...((init?.headers as Record<string, string> | undefined) ?? {}),
+      },
+      ...(signal ? { signal } : {}),
+    });
+    const parsed: unknown = await response.json().catch(() => null);
+    const data = (typeof parsed === "object" && parsed !== null ? parsed : {}) as T & {
+      reason?: string;
+    };
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        reason: data.reason ?? (response.status >= 500 ? "server" : "error"),
+      };
+    }
+    return { ok: true, status: response.status, data };
+  } catch (error) {
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+    return { ok: false, status: 0, reason: timedOut ? "timeout" : "network" };
+  }
+}
+
+/** Netzwerk-/Serverhänger dürfen wiederholt werden – Fehlentscheidungen nicht. */
+function isTransient(reason: string): boolean {
+  return (
+    reason === "network" ||
+    reason === "timeout" ||
+    reason === "server" ||
+    reason === "db"
+  );
+}
+
+/**
+ * Auf Render braucht die erste Anfrage nach dem Einschlafen deutlich länger
+ * (oder läuft in einen 502, während der Server noch startet). Deshalb werden
+ * vorübergehende Fehler automatisch wiederholt – der Spieler merkt nur, dass
+ * es ein paar Sekunden dauert.
+ */
+async function withTransientRetry<T>(
+  run: () => Promise<ApiResult<T>>,
+  attempts = 3,
+  delayMs = 2_500,
+): Promise<ApiResult<T>> {
+  let last: ApiResult<T> | null = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    last = await run();
+    if (last.ok || !isTransient(last.reason)) return last;
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return last as ApiResult<T>;
+}
+
+export async function shrinkAvatar(file: File): Promise<string | null> {
+  const original = await new Promise<string | null>((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () =>
+      resolve(typeof reader.result === "string" ? reader.result : null);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+  if (!original) return null;
+
+  try {
+    const image = await new Promise<HTMLImageElement | null>((resolve) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => resolve(null);
+      element.src = original;
+    });
+    if (!image) return original.length <= AVATAR_MAX_CHARS ? original : null;
+
+    const scale = Math.min(
+      1,
+      AVATAR_MAX_SIZE / Math.max(image.width || 1, image.height || 1),
+    );
+    const width = Math.max(1, Math.round((image.width || 1) * scale));
+    const height = Math.max(1, Math.round((image.height || 1) * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) return original.length <= AVATAR_MAX_CHARS ? original : null;
+    // Weißer Hintergrund: PNG-Transparenz wird sonst beim JPEG schwarz.
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+
+    for (const quality of [0.85, 0.7, 0.55]) {
+      const shrunk = canvas.toDataURL("image/jpeg", quality);
+      if (shrunk.length <= AVATAR_MAX_CHARS) return shrunk;
+    }
+    return original.length <= AVATAR_MAX_CHARS ? original : null;
+  } catch {
+    return original.length <= AVATAR_MAX_CHARS ? original : null;
   }
 }
 
@@ -1270,6 +2279,9 @@ export default function WerwolfApp() {
   const [gameStarted, setGameStarted] = useState(false);
   const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [slowHint, setSlowHint] = useState<string | null>(null);
+  const [connection, setConnection] = useState<ConnectionState>("ok");
+  const [profileLoaded, setProfileLoaded] = useState(false);
 
   // Deterministische Initialwerte; localStorage wird nach dem Mount geladen,
   // damit Server-Render und Hydration identisch sind (Multi-Tab-sicher).
@@ -1289,6 +2301,12 @@ export default function WerwolfApp() {
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lobbyCodeRef = useRef("");
   const selfIdRef = useRef<string | null>(null);
+  const pollFailuresRef = useRef(0);
+  const resumeRef = useRef<Promise<boolean> | null>(null);
+  const isHostRef = useRef(true);
+  const modeRef = useRef(MODES[0]);
+  const profileRef = useRef<PlayerProfile | null>(null);
+  const lastAvatarRef = useRef<string | null>(null);
 
   lobbyCodeRef.current = lobbyCode;
   selfIdRef.current = selfId;
@@ -1300,6 +2318,15 @@ export default function WerwolfApp() {
     setFadeIntensity(loadStoredProfile("fadeIntensity", 50));
     setFrame(loadStoredProfile("frame", "none"));
     setImage(loadStoredProfile("image", null));
+    setProfileLoaded(true);
+  }, []);
+
+  // Server beim Laden der Seite „aufwecken“. Render-Free-Instanzen schlafen
+  // nach Inaktivität ein – der erste Aufruf dauert dann ~30 s. Wenn das
+  // parallel zum Ausfüllen der Spielerkarte passiert, fühlt sich danach
+  // „Lobby erstellen" sofort an.
+  useEffect(() => {
+    void apiRequest("/api/health", undefined, 60_000);
   }, []);
 
   // Einladungslinks (?code=ABCDEF) öffnen das Beitreten-Feld vorausgefüllt —
@@ -1339,6 +2366,7 @@ export default function WerwolfApp() {
     }),
     [name, color, fadeIntensity, frame, image],
   );
+  profileRef.current = profile;
 
   const applyState = (state: LobbyState) => {
     setLobbyCode(state.code);
@@ -1354,66 +2382,269 @@ export default function WerwolfApp() {
     });
   };
 
-  // Poll lobby state while inside a lobby (replaces the original socket push).
+  // Lobby-Zustand pollen – mit automatischem Reconnect. Ein einzelner Fehler
+  // (Free-Instanz wacht gerade auf, Tab war im Hintergrund, kurzer Hänger)
+  // wirft niemanden mehr aus der Lobby: erst wird still wieder beigetreten,
+  // erst nach vielen Fehlern in Folge gibt es eine Meldung.
   useEffect(() => {
     if (screen !== "lobby" && screen !== "lobbyEntering") return;
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-    const poll = async () => {
-      const code = lobbyCodeRef.current;
-      const pid = selfIdRef.current;
-      if (!code || !pid) return;
-      try {
-        const res = await fetch(
-          `/api/lobby/state?code=${encodeURIComponent(code)}&pid=${encodeURIComponent(pid)}`,
-          { cache: "no-store" },
-        );
-        if (cancelled) return;
-        if (!res.ok) {
-          setScreen("menu");
-          setSelfId(null);
-          setPlayers([]);
-          setActionError(
-            "Die Lobby ist nicht mehr verfügbar – sie wurde geschlossen oder du wurdest entfernt.",
-          );
-          return;
-        }
-        const data = await res.json();
-        if (!cancelled && data?.ok) applyState(data.state as LobbyState);
-      } catch {
-        /* keep polling */
-      }
+    const nextDelay = () => (document.hidden ? POLL_HIDDEN_MS : POLL_ACTIVE_MS);
+
+    const schedule = (ms: number) => {
+      if (cancelled) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => void run(), ms);
     };
 
-    poll();
-    const interval = setInterval(poll, 1200);
+    const leaveLobbyWithMessage = (message: string) => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      clearSession();
+      pollFailuresRef.current = 0;
+      setConnection("ok");
+      setScreen("menu");
+      setSelfId(null);
+      setLobbyCode("");
+      setPlayers([]);
+      setActionError(message);
+    };
+
+    // Reconnect: derselbe Spieler kommt mit derselben ID zurück – die
+    // Host-Rolle bleibt dabei erhalten.
+    const resume = (code: string, pid: string): Promise<boolean> => {
+      if (resumeRef.current) return resumeRef.current;
+      const attempt = (async () => {
+        const res = await apiRequest<LobbyResponse>(
+          "/api/lobby/join",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              code,
+              playerId: pid,
+              profile: profileRef.current,
+            }),
+          },
+          20_000,
+        );
+        if (cancelled || !res.ok || !res.data.ok) return false;
+        applyState(res.data.lobby);
+        setSelfId(res.data.selfId);
+        setConnection("ok");
+        return true;
+      })().finally(() => {
+        resumeRef.current = null;
+      });
+      resumeRef.current = attempt;
+      return attempt;
+    };
+
+    // Lobby ist verschwunden (z. B. Render-Instanz neu gestartet). Der Host
+    // öffnet sie mit demselben Code neu – die Freunde landen über ihr
+    // Resume-Polling automatisch wieder drin.
+    const recreate = async (code: string, pid: string): Promise<boolean> => {
+      const res = await apiRequest<LobbyResponse>(
+        "/api/lobby/create",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            mode: modeRef.current.title,
+            code,
+            playerId: pid,
+            profile: profileRef.current,
+          }),
+        },
+        25_000,
+      );
+      if (cancelled || !res.ok || !res.data.ok) return false;
+      applyState(res.data.lobby);
+      setSelfId(res.data.selfId);
+      saveSession(res.data.lobby.code, res.data.selfId);
+      setConnection("ok");
+      return true;
+    };
+
+    const run = async () => {
+      const code = lobbyCodeRef.current;
+      const pid = selfIdRef.current;
+      if (!code || !pid) {
+        schedule(nextDelay());
+        return;
+      }
+
+      const res = await apiRequest<{
+        ok: boolean;
+        state?: LobbyState;
+        reason?: string;
+      }>(
+        `/api/lobby/state?code=${encodeURIComponent(code)}&pid=${encodeURIComponent(pid)}`,
+        undefined,
+        15_000,
+      );
+      if (cancelled) return;
+
+      if (res.ok && res.data.ok && res.data.state) {
+        pollFailuresRef.current = 0;
+        setConnection("ok");
+        applyState(res.data.state);
+        schedule(nextDelay());
+        return;
+      }
+
+      const reason = res.ok ? "server" : res.reason;
+      if (reason === "not_member" || reason === "not_found") {
+        const back = await resume(code, pid);
+        if (cancelled) return;
+        if (back) {
+          pollFailuresRef.current = 0;
+          schedule(nextDelay());
+          return;
+        }
+        if (reason === "not_found" && isHostRef.current) {
+          const recovered = await recreate(code, pid);
+          if (cancelled) return;
+          if (recovered) {
+            pollFailuresRef.current = 0;
+            schedule(nextDelay());
+            return;
+          }
+        }
+      }
+
+      pollFailuresRef.current += 1;
+      setConnection("reconnecting");
+      if (pollFailuresRef.current >= MAX_POLL_FAILURES) {
+        leaveLobbyWithMessage(
+          "Die Verbindung zur Lobby ist verloren gegangen (Server oder Datenbank nicht erreichbar). Bitte erstelle eine neue Lobby oder tritt dem Code erneut bei.",
+        );
+        return;
+      }
+      schedule(Math.min(6_000, 800 * pollFailuresRef.current));
+    };
+
+    void run();
+
+    // Zurück im Tab: sofort aktualisieren statt bis zum nächsten Intervall warten.
+    const onVisibility = () => {
+      if (document.hidden) return;
+      pollFailuresRef.current = 0;
+      setConnection("ok");
+      void run();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
 
-  // Push profile changes (debounced) while inside a lobby.
+  // Profiländerungen (Name, Farbe, Rahmen) gebündelt übertragen – absichtlich
+  // OHNE Bild: das läuft über /api/lobby/avatar, damit die Payload pro
+  // Tastendruck klein bleibt.
   useEffect(() => {
-    if (screen === "lobby" || screen === "lobbyEntering") {
-      const timeout = setTimeout(() => {
-        const code = lobbyCodeRef.current;
-        const pid = selfIdRef.current;
-        if (!code || !pid) return;
-        fetch("/api/lobby/profile", {
+    if (screen !== "lobby" && screen !== "lobbyEntering") return;
+    const timeout = setTimeout(() => {
+      const code = lobbyCodeRef.current;
+      const pid = selfIdRef.current;
+      if (!code || !pid) return;
+      void apiRequest(
+        "/api/lobby/profile",
+        {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code, playerId: pid, profile }),
-        }).catch(() => {});
-      }, 150);
-      return () => clearTimeout(timeout);
-    }
+          body: JSON.stringify({
+            code,
+            playerId: pid,
+            profile: {
+              name: profile.name,
+              color: profile.color,
+              fadeIntensity: profile.fadeIntensity,
+              frame: profile.frame,
+            },
+          }),
+        },
+        12_000,
+      );
+    }, 250);
+    return () => clearTimeout(timeout);
   }, [profile, screen]);
 
-  // Leave the lobby when the tab is closed.
+  // Neues Profilbild übertragen – nur wenn es sich wirklich geändert hat.
   useEffect(() => {
-    const handler = () => {
+    if (screen !== "lobby" && screen !== "lobbyEntering") return;
+    const code = lobbyCodeRef.current;
+    const pid = selfIdRef.current;
+    if (!code || !pid || lastAvatarRef.current === image) return;
+    const timeout = setTimeout(() => {
+      void apiRequest<{ ok: boolean; url: string | null }>(
+        "/api/lobby/avatar",
+        { method: "POST", body: JSON.stringify({ code, playerId: pid, image }) },
+        30_000,
+      ).then((res) => {
+        if (res.ok && res.data.ok) {
+          lastAvatarRef.current = image;
+        } else if (!res.ok && res.reason !== "not_member") {
+          setActionError(
+            "Profilbild konnte nicht gespeichert werden. Bitte versuche es erneut.",
+          );
+        }
+      });
+    }, 400);
+    return () => clearTimeout(timeout);
+  }, [image, screen]);
+
+  // Sitzung wiederherstellen: Nach einem Neuladen (Handy-Tab, versehentliches
+  // Aktualisieren) landet man automatisch wieder in derselben Lobby.
+  useEffect(() => {
+    if (!profileLoaded) return;
+    const session = loadSession();
+    if (!session || lobbyCodeRef.current || selfIdRef.current) return;
+    let cancelled = false;
+    void (async () => {
+      const res = await apiRequest<LobbyResponse>(
+        "/api/lobby/join",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            code: session.code,
+            playerId: session.playerId,
+            profile: profileRef.current,
+          }),
+        },
+        25_000,
+      );
+      if (cancelled) return;
+      if (res.ok && res.data.ok) {
+        const self = res.data.lobby.players.find((p) => p.id === res.data.selfId);
+        lastAvatarRef.current = profileRef.current?.image ?? null;
+        saveSession(res.data.lobby.code, res.data.selfId);
+        enterLobby(
+          res.data.lobby.code,
+          res.data.lobby.players,
+          self?.isHost ?? false,
+          res.data.selfId,
+          res.data.lobby.roleCounts,
+          Boolean(res.data.lobby.gameStarted),
+        );
+      } else {
+        clearSession();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileLoaded]);
+
+  // Beim Schließen des Tabs abmelden. Die Lobby selbst bleibt bestehen –
+  // ein versehentliches Neuladen kann so wieder in dieselbe Runde finden.
+  useEffect(() => {
+    const handler = (event: PageTransitionEvent) => {
+      if (event.persisted) return; // nur bfcache – Seite lebt weiter
       const code = lobbyCodeRef.current;
       const pid = selfIdRef.current;
       if (!code || !pid) return;
@@ -1439,14 +2670,23 @@ export default function WerwolfApp() {
 
   const handleImageUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = () => setImage(String(reader.result));
-      reader.readAsDataURL(file);
+    event.target.value = "";
+    if (!file) return;
+    // Im Browser verkleinern (max. 256 px, JPEG) – dadurch sind Profilbilder
+    // nur wenige Kilobyte groß und die Lobby bleibt schnell.
+    const shrunk = await shrinkAvatar(file);
+    if (!shrunk) {
+      setActionError(
+        "Dieses Bild konnte nicht verarbeitet werden. Bitte versuche ein anderes (JPG/PNG).",
+      );
+      return;
     }
+    setImage(shrunk);
   };
 
   const mode = MODES[modeIndex];
+  modeRef.current = mode;
+  isHostRef.current = isHost;
   const prevMode = prevModeIndex !== null ? MODES[prevModeIndex] : null;
   const modeLabel = mode.title === "WERWOLF" ? "Werwolf (Standard)" : mode.title;
   const modeShort = mode.title === "WERWOLF" ? "WW" : mode.title.slice(0, 2);
@@ -1509,6 +2749,13 @@ export default function WerwolfApp() {
     setPlayers(lobbyPlayers);
     setRoleCounts(counts);
     setGameStarted(started);
+    setConnection("ok");
+    setActionError(null);
+    pollFailuresRef.current = 0;
+    // Sitzung merken (übersteht ein Neuladen) und das Profilbild als bereits
+    // übertragen markieren.
+    saveSession(code, id);
+    lastAvatarRef.current = profileRef.current?.image ?? null;
     setScreen("menuLeaving");
     leaveTimerRef.current = setTimeout(() => {
       setScreen("lobbyEntering");
@@ -1516,7 +2763,22 @@ export default function WerwolfApp() {
     }, 440);
   };
 
-  const handleCreate = () => {
+  /** Langsame Free-Instanzen: nach ein paar Sekunden einen Hinweis zeigen. */
+  const withSlowHint = async <T,>(
+    message: string,
+    run: () => Promise<T>,
+  ): Promise<T> => {
+    setSlowHint(null);
+    const timer = setTimeout(() => setSlowHint(message), 3_500);
+    try {
+      return await run();
+    } finally {
+      clearTimeout(timer);
+      setSlowHint(null);
+    }
+  };
+
+  const handleCreate = async () => {
     if (screen !== "menu" || modeLocked || busy) return;
     if (mode.title !== "WERWOLF") return;
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
@@ -1526,32 +2788,48 @@ export default function WerwolfApp() {
     setRoleModalOpen(false);
     setActionError(null);
     setBusy("create");
-    fetch("/api/lobby/create", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: mode.title, profile }),
-    })
-      .then(async (res) => {
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data?.ok) throw new Error("create failed");
-        enterLobby(
-          data.lobby.code,
-          data.lobby.players,
-          true,
-          data.selfId,
-          data.lobby.roleCounts,
-          Boolean(data.lobby.gameStarted),
-        );
-      })
-      .catch(() => {
-        setActionError(
-          "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
-        );
-      })
-      .finally(() => setBusy(null));
+    try {
+      const res = await withSlowHint(
+        "Der Server startet gerade (Free-Instanz) – das dauert beim ersten Mal bis zu 30 Sekunden …",
+        () =>
+          withTransientRetry(() =>
+            apiRequest<LobbyResponse>(
+              "/api/lobby/create",
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  mode: mode.title,
+                  profile: profileRef.current,
+                }),
+              },
+              35_000,
+            ),
+          ),
+      );
+      if (!res.ok || !res.data.ok) {
+        throw new Error(res.ok ? "server" : res.reason);
+      }
+      enterLobby(
+        res.data.lobby.code,
+        res.data.lobby.players,
+        true,
+        res.data.selfId,
+        res.data.lobby.roleCounts,
+        Boolean(res.data.lobby.gameStarted),
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "server";
+      setActionError(
+        isTransient(reason)
+          ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
+          : "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+      );
+    } finally {
+      setBusy(null);
+    }
   };
 
-  const handleJoin = () => {
+  const handleJoin = async () => {
     if (screen !== "menu" || modeLocked || busy) return;
     if (joinCode.length !== 6) {
       setActionError("Bitte gib einen 6-stelligen Lobbycode ein (A–Z).");
@@ -1562,72 +2840,115 @@ export default function WerwolfApp() {
     setRoleModalOpen(false);
     setActionError(null);
     setBusy("join");
-    fetch("/api/lobby/join", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: joinCode, profile }),
-    })
-      .then(async (res) => {
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data?.ok) {
-          if (data?.reason === "full") {
-            throw new Error("full");
-          }
-          throw new Error("not_found");
-        }
-        const self = (data.lobby.players as LobbyPlayer[]).find(
-          (p) => p.id === data.selfId,
-        );
-        setJoinPanel("closed");
-        setJoinCode("");
-        enterLobby(
-          data.lobby.code,
-          data.lobby.players,
-          self?.isHost || false,
-          data.selfId,
-          data.lobby.roleCounts,
-          Boolean(data.lobby.gameStarted),
-        );
-      })
-      .catch((error: unknown) => {
-        const message =
-          error instanceof Error && error.message === "full"
-            ? "Die Lobby ist leider voll (max. 12 Spieler)."
-            : error instanceof Error && error.message === "not_found"
-              ? "Lobby mit diesem Code wurde nicht gefunden."
-              : "Beitreten fehlgeschlagen – der Server ist gerade nicht erreichbar.";
-        setActionError(message);
-      })
-      .finally(() => setBusy(null));
+    try {
+      const res = await withSlowHint(
+        "Der Server startet gerade (Free-Instanz) – das dauert beim ersten Mal bis zu 30 Sekunden …",
+        () =>
+          withTransientRetry(() =>
+            apiRequest<LobbyResponse>(
+              "/api/lobby/join",
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  code: joinCode,
+                  profile: profileRef.current,
+                }),
+              },
+              35_000,
+            ),
+          ),
+      );
+      if (!res.ok || !res.data.ok) {
+        throw new Error(res.ok ? "server" : res.reason);
+      }
+      const self = res.data.lobby.players.find((p) => p.id === res.data.selfId);
+      setJoinPanel("closed");
+      setJoinCode("");
+      enterLobby(
+        res.data.lobby.code,
+        res.data.lobby.players,
+        self?.isHost || false,
+        res.data.selfId,
+        res.data.lobby.roleCounts,
+        Boolean(res.data.lobby.gameStarted),
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "server";
+      setActionError(
+        reason === "full"
+          ? "Die Lobby ist leider voll (max. 12 Spieler)."
+          : reason === "not_found"
+            ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
+            : isTransient(reason)
+              ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
+              : "Beitreten fehlgeschlagen – bitte versuche es erneut.",
+      );
+    } finally {
+      setBusy(null);
+    }
   };
 
-  const handleStartGame = (started: boolean) => {
+  const handleStartGame = async (started: boolean) => {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid || busy) return;
     setActionError(null);
     setBusy("start");
-    fetch("/api/lobby/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, playerId: pid, started }),
-    })
-      .then(async (res) => {
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data?.ok) throw new Error("start failed");
-        setGameStarted(started);
-      })
-      .catch(() => {
-        setActionError(
-          started
-            ? "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
-            : "Das Spiel konnte nicht zurückgesetzt werden.",
-        );
-      })
-      .finally(() => setBusy(null));
+    try {
+      const res = await apiRequest(
+        "/api/lobby/start",
+        {
+          method: "POST",
+          body: JSON.stringify({ code, playerId: pid, started }),
+        },
+        15_000,
+      );
+      if (!res.ok) throw new Error(res.reason);
+      setGameStarted(started);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "server";
+      setActionError(
+        started
+          ? isTransient(reason)
+            ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
+            : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+          : "Das Spiel konnte nicht zurückgesetzt werden.",
+      );
+    } finally {
+      setBusy(null);
+    }
   };
 
-  const changeRoleCount = (roleName: string, delta: number) => {
+  /** Lobby bewusst verlassen (Button) – ganz normal zurück ins Menü. */
+  const handleLeaveLobby = () => {
+    const code = lobbyCodeRef.current;
+    const pid = selfIdRef.current;
+    clearSession();
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current);
+    enterTimerRef.current = null;
+    leaveTimerRef.current = null;
+    setScreen("menu");
+    setSelfId(null);
+    setLobbyCode("");
+    setPlayers([]);
+    setConnection("ok");
+    pollFailuresRef.current = 0;
+    lastAvatarRef.current = null;
+    if (code && pid) {
+      const body = new Blob([JSON.stringify({ code, playerId: pid })], {
+        type: "application/json",
+      });
+      if (!navigator.sendBeacon?.("/api/lobby/leave", body)) {
+        void apiRequest("/api/lobby/leave", {
+          method: "POST",
+          body: JSON.stringify({ code, playerId: pid }),
+        });
+      }
+    }
+  };
+
+  const changeRoleCount = async (roleName: string, delta: number) => {
     if (!isHost) return;
     const next = {
       ...roleCounts,
@@ -1637,11 +2958,19 @@ export default function WerwolfApp() {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid) return;
-    fetch("/api/lobby/roles", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, playerId: pid, roleCounts: next }),
-    }).catch(() => {});
+    const res = await apiRequest(
+      "/api/lobby/roles",
+      { method: "POST", body: JSON.stringify({ code, playerId: pid, roleCounts: next }) },
+      12_000,
+    );
+    if (!res.ok && isTransient(res.reason)) {
+      // Einmal nachfassen – kurze Hänger der Free-Instanz sind normal.
+      await apiRequest(
+        "/api/lobby/roles",
+        { method: "POST", body: JSON.stringify({ code, playerId: pid, roleCounts: next }) },
+        12_000,
+      );
+    }
   };
 
   // --- animation helpers -------------------------------------------------
@@ -1753,6 +3082,18 @@ export default function WerwolfApp() {
             >
               <X size={16} />
             </button>
+          </div>
+        </div>
+      )}
+
+      {slowHint && (
+        <div
+          className="fixed inset-x-0 bottom-4 z-[60] flex justify-center px-4"
+          role="status"
+        >
+          <div className="flex max-w-[min(36rem,92vw)] items-center gap-3 rounded-[1.2rem] border border-sky-400/40 bg-sky-950/90 px-4 py-3 text-sm font-semibold text-sky-100 shadow-2xl backdrop-blur-md">
+            <span className="h-3 w-3 shrink-0 animate-pulse rounded-full bg-sky-300" />
+            <span className="leading-relaxed">{slowHint}</span>
           </div>
         </div>
       )}
@@ -2113,6 +3454,38 @@ export default function WerwolfApp() {
                   <p className="mt-3 font-mono text-[clamp(2.3rem,6vw,4.8rem)] font-black uppercase tracking-[0.28em] text-white">
                     {lobbyCode}
                   </p>
+                  <div className="mt-4 flex flex-wrap items-center gap-3">
+                    <span
+                      className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] ${
+                        connection === "ok"
+                          ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
+                          : "border-amber-400/50 bg-amber-400/15 text-amber-100"
+                      }`}
+                      title={
+                        connection === "ok"
+                          ? "Lobby wird live synchronisiert"
+                          : "Kurzer Hänger – die Verbindung wird automatisch wiederhergestellt"
+                      }
+                    >
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          connection === "ok"
+                            ? "bg-emerald-400"
+                            : "animate-pulse bg-amber-300"
+                        }`}
+                      />
+                      {connection === "ok"
+                        ? "Live verbunden"
+                        : "Verbindung wird wiederhergestellt …"}
+                    </span>
+                    <button
+                      onClick={handleLeaveLobby}
+                      className="flex items-center gap-2 rounded-full border border-white/25 bg-white/5 px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] text-white/70 transition-all duration-200 hover:border-red-400/50 hover:bg-red-500/15 hover:text-red-100"
+                    >
+                      <X size={13} />
+                      Lobby verlassen
+                    </button>
+                  </div>
                   <button
                     onClick={copyCode}
                     className="absolute right-4 top-4 flex items-center gap-2 rounded-[1rem] border border-white/30 bg-white/10 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/20 sm:right-5 sm:top-5"
@@ -2686,10 +4059,14 @@ const TEXT_FILES = [
   "tsconfig.json",
   "drizzle.config.json",
   "postcss.config.mjs",
+  "render.yaml",
+  "src/instrumentation.ts",
   "src/db/index.ts",
   "src/db/migrate.ts",
   "src/db/schema.ts",
+  "src/lib/api.ts",
   "src/lib/game.ts",
+  "src/lib/image.ts",
   "src/lib/lobby-service.ts",
   "src/app/layout.tsx",
   "src/app/page.tsx",
@@ -2702,6 +4079,7 @@ const TEXT_FILES = [
   "src/app/api/lobby/roles/route.ts",
   "src/app/api/lobby/start/route.ts",
   "src/app/api/lobby/leave/route.ts",
+  "src/app/api/lobby/avatar/route.ts",
   "src/components/werwolf/werwolf-app.tsx",
   "src/components/werwolf/sky-background.tsx",
   "src/components/werwolf/walking-cat.tsx",
@@ -2767,9 +4145,12 @@ sections.push(`# Werwolf Lobby — Vollständiger Quellcode
 > 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig, die App läuft
 >    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne \`DATABASE_URL\` wird
 >    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in \`.data/\` angelegt.
-> 5. Optional: \`.env\` mit \`DATABASE_URL=postgresql://…\` für eine externe
->    PostgreSQL-Datenbank — die Tabellen werden ebenfalls automatisch angelegt
->    (kein \`drizzle-kit push\` nötig).
+> 5. Optional (empfohlen auf Render): \`.env\` bzw. Umgebungsvariable
+>    \`DATABASE_URL=postgresql://…\` für eine externe PostgreSQL-Datenbank — die
+>    Tabellen werden ebenfalls automatisch angelegt (kein \`drizzle-kit push\`).
+>    Ohne \`DATABASE_URL\` läuft die App eingebettet (PGlite); auf Render-Free-
+>    Instanzen ist das Dateisystem flüchtig, Lobbys sind dann nach einem
+>    Neustart weg (die Lobby wird automatisch mit gleichem Code neu geöffnet).
 
 ## Projektübersicht
 
@@ -2787,9 +4168,17 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **15 Rollen** (Teams gut/böse/neutral) mit Beschreibung, Gewinnkondition und
   Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: \`?code=ABCDEF\` öffnet das Beitreten-Feld vorausgefüllt.
-- **Realtime**: REST-Polling (1,2 s) + Heartbeat-Cleanup (15 s), automatische
-  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM. „Spiel starten"
-  (Host) synchronisiert den Spielstart in Echtzeit an alle Spieler.
+- **Realtime**: REST-Polling (1,2 s sichtbar / 20 s im Hintergrund-Tab),
+  Lebenszeichen-Fenster 120 s, automatischer **Reconnect/Resume** (gleiche
+  Spieler-ID, Host-Rolle bleibt), automatische Host-Nachfolge, Lobbys/Spieler in
+  PostgreSQL via Drizzle ORM. „Spiel starten" (Host) synchronisiert den
+  Spielstart in Echtzeit an alle Spieler.
+- **Profilbilder**: im Browser auf max. 256 px verkleinert, liegen in der
+  Datenbank und werden über \`GET /api/lobby/avatar?pid=…&v=…\` mit langem
+  Browser-Cache ausgeliefert (winziges Polling statt Megabyte-Payloads).
+- **Robuste Datenbank**: Verbindung baut sich bei Fehlern automatisch neu auf
+  (\`src/db/index.ts\`), PGlite fällt bei Problemen mit dem Datenordner in den
+  Speicher-Modus zurück; \`/api/health\` zeigt Modus, Speicherart und Fehlerzähler.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 

@@ -1,7 +1,7 @@
 import { and, asc, eq, lt } from "drizzle-orm";
 
 import { getDb } from "@/db";
-import { lobbies, players, type PlayerRow } from "@/db/schema";
+import { lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
   defaultRoleCounts,
@@ -10,37 +10,105 @@ import {
   type PlayerProfile,
   ROLES,
 } from "@/lib/game";
+import { parseImageInput } from "@/lib/image";
 
-const STALE_MS = 15_000;
+/**
+ * Nach dieser Zeit ohne Lebenszeichen gilt ein Spieler als getrennt.
+ * Bewusst großzügig: Browser drosseln Timer im Hintergrund-Tab auf ~1/min und
+ * Render-Free-Instanzen antworten manchmal erst nach Sekunden.
+ */
+const STALE_MS = Number(process.env.LOBBY_STALE_MS ?? 120_000);
+/** Häufiger als das hier muss `last_seen` nicht geschrieben werden. */
+const TOUCH_INTERVAL_MS = 20_000;
+/** Aufräumen (stale Spieler) höchstens alle X ms pro Prozess. */
+const CLEANUP_INTERVAL_MS = 10_000;
+/** Alte Lobbys aufräumen höchstens alle X ms. */
+const PURGE_INTERVAL_MS = 5 * 60_000;
+/** Lobbys, die älter als ein Tag sind, werden automatisch gelöscht. */
+const LOBBY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** Leere Lobbys erst nach dieser Gnadenfrist löschen (Reconnect-Schutz). */
+const EMPTY_LOBBY_GRACE_MS = 10 * 60_000;
 const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/** Spieler-IDs sind UUIDs (Postgres `gen_random_uuid()`). */
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 /** Maximale Spielerzahl pro Lobby. */
 export const MAX_PLAYERS = 12;
-/** Lobbys, die älter als ein Tag sind, werden automatisch aufgeräumt. */
-const LOBBY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+let lastCleanupAt = 0;
+let lastPurgeAt = 0;
+
+/** Profilfelder, die für den Lobby-Zustand gebraucht werden (ohne Bild!). */
+const playerColumns = {
+  id: players.id,
+  name: players.name,
+  color: players.color,
+  fadeIntensity: players.fadeIntensity,
+  frame: players.frame,
+  isHost: players.isHost,
+  createdAt: players.createdAt,
+  lastSeen: players.lastSeen,
+  imageUpdatedAt: players.imageUpdatedAt,
+};
+
+type PlayerSummary = {
+  id: string;
+  name: string;
+  color: string;
+  fadeIntensity: number;
+  frame: string;
+  isHost: boolean;
+  createdAt: Date;
+  lastSeen: Date;
+  imageUpdatedAt: Date | null;
+};
+
+/** Profilbild-URL (klein, cachebar) – Bilddaten selbst liegen unter derselben Route. */
+export function avatarUrl(playerId: string, version: Date | number): string {
+  const v = version instanceof Date ? version.getTime() : version;
+  return `/api/lobby/avatar?pid=${encodeURIComponent(playerId)}&v=${v}`;
+}
 
 export function sanitizeProfile(input: unknown): PlayerProfile {
+  const patch = sanitizeProfilePatch(input);
+  return {
+    name: patch.name ?? "Player",
+    color: patch.color ?? DEFAULT_COLOR,
+    fadeIntensity: patch.fadeIntensity ?? 50,
+    frame: patch.frame ?? "none",
+    image: patch.image ?? null,
+  };
+}
+
+/**
+ * Wie `sanitizeProfile`, aber ohne Standardwerte: Es werden nur Felder
+ * zurückgegeben, die tatsächlich mitgeschickt wurden. So kann ein Reconnect
+ * (`resume`) das Profil nicht überschreiben.
+ */
+export function sanitizeProfilePatch(input: unknown): Partial<PlayerProfile> {
   const raw = (typeof input === "object" && input !== null ? input : {}) as Record<
     string,
     unknown
   >;
-  const name =
-    typeof raw.name === "string" && raw.name.trim()
-      ? raw.name.trim().slice(0, 12)
-      : "Player";
-  const color =
-    typeof raw.color === "string" && /^#[0-9a-fA-F]{6}$/.test(raw.color)
-      ? raw.color
-      : DEFAULT_COLOR;
-  const fadeIntensity =
-    typeof raw.fadeIntensity === "number" && Number.isFinite(raw.fadeIntensity)
-      ? Math.max(0, Math.min(100, Math.round(raw.fadeIntensity)))
-      : 50;
-  const frame = typeof raw.frame === "string" ? raw.frame.slice(0, 24) : "none";
-  const image =
-    typeof raw.image === "string" && raw.image.startsWith("data:image/")
-      ? raw.image.slice(0, 400_000)
-      : null;
-  return { name, color, fadeIntensity, frame, image };
+  const patch: Partial<PlayerProfile> = {};
+
+  if (typeof raw.name === "string" && raw.name.trim()) {
+    patch.name = raw.name.trim().slice(0, 12);
+  }
+  if (typeof raw.color === "string" && /^#[0-9a-fA-F]{6}$/.test(raw.color)) {
+    patch.color = raw.color;
+  }
+  if (typeof raw.fadeIntensity === "number" && Number.isFinite(raw.fadeIntensity)) {
+    patch.fadeIntensity = Math.max(0, Math.min(100, Math.round(raw.fadeIntensity)));
+  }
+  if (typeof raw.frame === "string") {
+    patch.frame = raw.frame.slice(0, 24);
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, "image")) {
+    const parsed = parseImageInput(raw.image);
+    if (parsed.ok) patch.image = parsed.image;
+  }
+  return patch;
 }
 
 function sanitizeRoleCounts(input: unknown): Record<string, number> {
@@ -56,6 +124,13 @@ function sanitizeRoleCounts(input: unknown): Record<string, number> {
   return counts;
 }
 
+export function normalizeCode(input: unknown): string {
+  return String(input ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "")
+    .slice(0, 6);
+}
+
 function generateCode(): string {
   let code = "";
   for (let i = 0; i < 6; i += 1) {
@@ -64,87 +139,244 @@ function generateCode(): string {
   return code;
 }
 
-function toLobbyPlayer(row: PlayerRow): LobbyPlayer {
+function toLobbyPlayer(row: PlayerSummary): LobbyPlayer {
   return {
     id: row.id,
     name: row.name,
     color: row.color,
     fadeIntensity: row.fadeIntensity,
     frame: row.frame,
-    image: row.image,
     isHost: row.isHost,
+    image: row.imageUpdatedAt ? avatarUrl(row.id, row.imageUpdatedAt) : null,
   };
 }
 
-async function listPlayers(code: string): Promise<PlayerRow[]> {
+function toState(
+  code: string,
+  rows: PlayerSummary[],
+  roleCounts: Record<string, number>,
+  gameStarted: boolean,
+): LobbyState {
+  return {
+    code,
+    players: rows.map(toLobbyPlayer),
+    roleCounts,
+    gameStarted,
+  };
+}
+
+async function listPlayers(code: string): Promise<PlayerSummary[]> {
   const db = await getDb();
   return db
-    .select()
+    .select(playerColumns)
     .from(players)
     .where(eq(players.lobbyCode, code))
     .orderBy(asc(players.createdAt));
 }
 
-/** Entfernt verwaiste Lobbys, die älter als ein Tag sind (inkl. Spieler per Cascade). */
+/** Entfernt verwaiste Lobbys, die älter als ein Tag sind (Spieler via Cascade). */
 async function purgeOldLobbies(): Promise<void> {
+  if (Date.now() - lastPurgeAt < PURGE_INTERVAL_MS) return;
+  lastPurgeAt = Date.now();
   const db = await getDb();
   await db
     .delete(lobbies)
     .where(lt(lobbies.createdAt, new Date(Date.now() - LOBBY_MAX_AGE_MS)));
 }
 
+/** Entfernt Spieler, die sich lange nicht gemeldet haben (getrennte Tabs). */
+async function cleanupStalePlayers(code: string): Promise<void> {
+  if (Date.now() - lastCleanupAt < CLEANUP_INTERVAL_MS) return;
+  lastCleanupAt = Date.now();
+  const db = await getDb();
+  await db
+    .delete(players)
+    .where(
+      and(
+        eq(players.lobbyCode, code),
+        lt(players.lastSeen, new Date(Date.now() - STALE_MS)),
+      ),
+    );
+}
+
+async function touchPlayer(code: string, playerId: string): Promise<void> {
+  const db = await getDb();
+  await db
+    .update(players)
+    .set({ lastSeen: new Date() })
+    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+}
+
+export type CreateOptions = {
+  /** Wunschcode – für die Wiederherstellung einer Lobby nach einem Neustart. */
+  code?: string;
+  /** Bevorzugte Spieler-ID, damit ein Reconnect dieselbe Identität behält. */
+  playerId?: string;
+};
+
+export type CreateOutcome =
+  | { ok: true; selfId: string; lobby: LobbyState; reused: boolean }
+  | { ok: false; reason: "full" };
+
+/**
+ * Lobby anlegen. Mit `options.code` wird – falls der Code noch frei ist –
+ * genau dieser Code verwendet (Wiederherstellung nach einem Neustart der
+ * Instanz); existiert er bereits, tritt der Spieler einfach dieser Lobby bei.
+ */
 export async function createLobby(
   mode: string,
   profileInput: unknown,
-): Promise<{ selfId: string; lobby: LobbyState }> {
+  options: CreateOptions = {},
+): Promise<CreateOutcome> {
   const db = await getDb();
-  const profile = sanitizeProfile(profileInput);
 
   // Nebenbei alte/verwaiste Lobbys aufräumen.
   await purgeOldLobbies();
 
-  let code = generateCode();
+  const preferred = normalizeCode(options.code ?? "");
+  const wantedId =
+    typeof options.playerId === "string" && UUID_RE.test(options.playerId)
+      ? options.playerId
+      : null;
+  const roleCounts = defaultRoleCounts();
+
+  let code = preferred.length === 6 ? preferred : generateCode();
+  let created = false;
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    const existing = await db
-      .select({ code: lobbies.code })
-      .from(lobbies)
-      .where(eq(lobbies.code, code));
-    if (existing.length === 0) break;
+    const inserted = await db
+      .insert(lobbies)
+      .values({ code, mode: mode || "WERWOLF", roleCounts })
+      .onConflictDoNothing()
+      .returning({ code: lobbies.code });
+    if (inserted.length > 0) {
+      created = true;
+      break;
+    }
+    // Wunschcode belegt → bestehende Lobby übernehmen (kein Fehler).
+    if (attempt === 0 && preferred.length === 6) break;
     code = generateCode();
   }
 
-  const roleCounts = defaultRoleCounts();
-  await db.insert(lobbies).values({ code, mode: mode || "WERWOLF", roleCounts });
-  const [self] = await db
-    .insert(players)
-    .values({ lobbyCode: code, ...profile, isHost: true })
-    .returning();
+  const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
+  if (!lobby) throw new Error("Lobby konnte nicht angelegt werden");
 
+  if (wantedId) {
+    const [existing] = await db
+      .select({ id: players.id })
+      .from(players)
+      .where(and(eq(players.id, wantedId), eq(players.lobbyCode, code)));
+    if (existing) {
+      await applyProfilePatch(code, wantedId, sanitizeProfilePatch(profileInput));
+      const rows = await listPlayers(code);
+      return {
+        ok: true,
+        selfId: wantedId,
+        lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+        reused: true,
+      };
+    }
+  }
+
+  const existingPlayers = await listPlayers(code);
+  if (existingPlayers.length >= MAX_PLAYERS) {
+    return { ok: false, reason: "full" };
+  }
+
+  const profile = sanitizeProfile(profileInput);
+  const base = {
+    lobbyCode: code,
+    ...profile,
+    imageUpdatedAt: profile.image ? new Date() : null,
+    isHost: !existingPlayers.some((row) => row.isHost),
+  };
+
+  let self: PlayerSummary | undefined;
+  if (wantedId) {
+    [self] = await db
+      .insert(players)
+      .values({ id: wantedId, ...base })
+      .onConflictDoNothing()
+      .returning(playerColumns);
+  }
+  if (!self) {
+    [self] = await db.insert(players).values(base).returning(playerColumns);
+  }
+
+  const rows = await listPlayers(code);
   return {
+    ok: true,
     selfId: self.id,
-    lobby: {
-      code,
-      players: [toLobbyPlayer(self)],
-      roleCounts,
-      gameStarted: false,
-    },
+    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    reused: !created,
   };
 }
 
 export type JoinOutcome =
-  | { ok: true; selfId: string; lobby: LobbyState }
+  | { ok: true; selfId: string; lobby: LobbyState; resumed: boolean }
   | { ok: false; reason: "not_found" | "full" };
 
+/**
+ * Beitreten – oder mit `playerId` wieder **beitreten (resume)**, nachdem der
+ * Tab im Hintergrund war oder der Server kurz weg war. Die Spieler-ID bleibt
+ * dabei gleich, die Rolle als Host geht nicht verloren.
+ */
 export async function joinLobby(
   codeInput: string,
   profileInput: unknown,
+  options: { playerId?: string } = {},
 ): Promise<JoinOutcome> {
-  const code = (codeInput || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 6);
+  const code = normalizeCode(codeInput);
   if (code.length !== 6) return { ok: false, reason: "not_found" };
 
   const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
   if (!lobby) return { ok: false, reason: "not_found" };
+
+  const patch = sanitizeProfilePatch(profileInput);
+  const resumeId = options.playerId;
+
+  if (resumeId) {
+    const [existing] = await db
+      .select({ id: players.id })
+      .from(players)
+      .where(and(eq(players.id, resumeId), eq(players.lobbyCode, code)));
+    if (existing) {
+      await applyProfilePatch(code, resumeId, patch);
+      const rows = await listPlayers(code);
+      const state = toState(code, rows, lobby.roleCounts, lobby.gameStarted);
+      return { ok: true, selfId: resumeId, lobby: state, resumed: true };
+    }
+
+    // Der Tab hat sich beim Verlassen abgemeldet (z. B. Neuladen) – hier kommt
+    // er sofort wieder. Wir legen dieselbe ID neu an, damit die Sitzung des
+    // Browsers gültig bleibt; die Host-Rolle gibt es zurück, wenn sie frei ist.
+    if (UUID_RE.test(resumeId)) {
+      const current = await listPlayers(code);
+      if (current.length < MAX_PLAYERS) {
+        const profile = sanitizeProfile(profileInput);
+        const [recreated] = await db
+          .insert(players)
+          .values({
+            id: resumeId,
+            lobbyCode: code,
+            ...profile,
+            imageUpdatedAt: profile.image ? new Date() : null,
+            isHost: !current.some((row) => row.isHost),
+          })
+          .onConflictDoNothing()
+          .returning(playerColumns);
+        if (recreated) {
+          const rows = await listPlayers(code);
+          return {
+            ok: true,
+            selfId: recreated.id,
+            lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+            resumed: true,
+          };
+        }
+      }
+    }
+  }
 
   const existingPlayers = await listPlayers(code);
   if (existingPlayers.length >= MAX_PLAYERS) {
@@ -154,52 +386,84 @@ export async function joinLobby(
   const profile = sanitizeProfile(profileInput);
   const [self] = await db
     .insert(players)
-    .values({ lobbyCode: code, ...profile, isHost: false })
-    .returning();
+    .values({
+      lobbyCode: code,
+      ...profile,
+      imageUpdatedAt: profile.image ? new Date() : null,
+      isHost: false,
+    })
+    .returning(playerColumns);
 
   const rows = await listPlayers(code);
   return {
     ok: true,
     selfId: self.id,
-    lobby: {
-      code,
-      players: rows.map(toLobbyPlayer),
-      roleCounts: lobby.roleCounts,
-      gameStarted: lobby.gameStarted,
-    },
+    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    resumed: false,
   };
 }
 
-export async function touchPlayer(code: string, playerId: string): Promise<void> {
+/** Wendet nur die mitgeschickten Felder an (Bild nur, wenn es sich ändert). */
+async function applyProfilePatch(
+  code: string,
+  playerId: string,
+  patch: Partial<PlayerProfile>,
+): Promise<void> {
   const db = await getDb();
+  const values: Record<string, unknown> = { lastSeen: new Date() };
+  if (patch.name !== undefined) values.name = patch.name;
+  if (patch.color !== undefined) values.color = patch.color;
+  if (patch.fadeIntensity !== undefined) values.fadeIntensity = patch.fadeIntensity;
+  if (patch.frame !== undefined) values.frame = patch.frame;
+  if (patch.image !== undefined) {
+    values.image = patch.image;
+    values.imageUpdatedAt = patch.image ? new Date() : null;
+  }
   await db
     .update(players)
-    .set({ lastSeen: new Date() })
+    .set(values)
     .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
 }
 
-/** Removes stale players, promotes a new host when needed, returns fresh state. */
+export type StateOutcome =
+  | { status: "ok"; state: LobbyState }
+  | { status: "not_found" }
+  /** Lobby existiert, dieser Spieler ist (noch) nicht drin → Client darf erneut beitreten. */
+  | { status: "not_member" };
+
+/**
+ * Liefert den Zustand und hält den Spieler am Leben. Räumt getrennte Spieler
+ * auf, ohne die Lobby sofort zu löschen (Reconnect-Schutz) und überträgt die
+ * Host-Rolle, wenn der Host weg ist.
+ */
 export async function getLobbyState(
   codeInput: string,
   playerId?: string,
-): Promise<LobbyState | "gone" | "kicked" | null> {
-  const code = (codeInput || "").toUpperCase().slice(0, 6);
-  if (code.length !== 6) return null;
+): Promise<StateOutcome> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6) return { status: "not_found" };
 
   const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
-  if (!lobby) return null;
+  if (!lobby) return { status: "not_found" };
 
-  const cutoff = new Date(Date.now() - STALE_MS);
-  await db
-    .delete(players)
-    .where(and(eq(players.lobbyCode, code), lt(players.lastSeen, cutoff)));
-
+  await cleanupStalePlayers(code);
   let rows = await listPlayers(code);
 
   if (rows.length === 0) {
-    await db.delete(lobbies).where(eq(lobbies.code, code));
-    return "gone";
+    const age = Date.now() - lobby.createdAt.getTime();
+    if (age > EMPTY_LOBBY_GRACE_MS) {
+      await db.delete(lobbies).where(eq(lobbies.code, code));
+      return { status: "not_found" };
+    }
+    // Leer (alle getrennt), aber noch innerhalb der Gnadenfrist: Der Spieler
+    // darf per Resume zurückkommen, die Lobby bleibt bestehen.
+    return playerId
+      ? { status: "not_member" }
+      : {
+          status: "ok",
+          state: toState(code, [], lobby.roleCounts, lobby.gameStarted),
+        };
   }
 
   if (!rows.some((row) => row.isHost)) {
@@ -212,15 +476,15 @@ export async function getLobbyState(
 
   if (playerId) {
     const self = rows.find((row) => row.id === playerId);
-    if (!self) return "kicked";
-    await touchPlayer(code, playerId);
+    if (!self) return { status: "not_member" };
+    if (Date.now() - self.lastSeen.getTime() > TOUCH_INTERVAL_MS) {
+      await touchPlayer(code, playerId);
+    }
   }
 
   return {
-    code,
-    players: rows.map(toLobbyPlayer),
-    roleCounts: lobby.roleCounts,
-    gameStarted: lobby.gameStarted,
+    status: "ok",
+    state: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
   };
 }
 
@@ -233,7 +497,7 @@ export async function setGameStarted(
   playerId: string,
   started: boolean,
 ): Promise<boolean> {
-  const code = (codeInput || "").toUpperCase().slice(0, 6);
+  const code = normalizeCode(codeInput);
   if (code.length !== 6) return false;
 
   const db = await getDb();
@@ -257,26 +521,97 @@ export async function setGameStarted(
   return true;
 }
 
+/** Profil aktualisieren (Name, Farbe, Verlauf, Rahmen – Bild separat). */
 export async function updateProfile(
   code: string,
   playerId: string,
   profileInput: unknown,
 ): Promise<boolean> {
+  const patch = sanitizeProfilePatch(profileInput);
+  if (patch.image !== undefined) {
+    // Bilder laufen absichtlich über /api/lobby/avatar (eigener Endpunkt,
+    // eigene Größenprüfung) – hier ignorieren, damit das Sekunden-Polling
+    // nicht durch große Payloads ausgebremst wird.
+    delete patch.image;
+  }
   const db = await getDb();
-  const profile = sanitizeProfile(profileInput);
+  const values: Record<string, unknown> = { ...patch, lastSeen: new Date() };
   const updated = await db
     .update(players)
-    .set({ ...profile, lastSeen: new Date() })
+    .set(values)
     .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)))
     .returning({ id: players.id });
   return updated.length > 0;
 }
 
+export type AvatarOutcome =
+  | { ok: true; url: string | null }
+  | { ok: false; reason: "not_member" | "unsupported" | "too_large" };
+
+/** Profilbild setzen oder entfernen (nur wenn es sich wirklich ändert). */
+export async function updateAvatar(
+  codeInput: string,
+  playerId: string,
+  imageInput: unknown,
+): Promise<AvatarOutcome> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6) return { ok: false, reason: "not_member" };
+
+  const parsed = parseImageInput(imageInput);
+  if (!parsed.ok) return { ok: false, reason: parsed.reason };
+
+  const db = await getDb();
+  const [current] = await db
+    .select({ image: players.image, imageUpdatedAt: players.imageUpdatedAt })
+    .from(players)
+    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+  if (!current) return { ok: false, reason: "not_member" };
+
+  if (current.image === parsed.image) {
+    // Unverändert: nur Lebenszeichen aktualisieren, keine 200 KB schreiben.
+    await touchPlayer(code, playerId);
+    return {
+      ok: true,
+      url: parsed.image && current.imageUpdatedAt
+        ? avatarUrl(playerId, current.imageUpdatedAt)
+        : null,
+    };
+  }
+
+  const version = new Date();
+  await db
+    .update(players)
+    .set({
+      image: parsed.image,
+      imageUpdatedAt: parsed.image ? version : null,
+      lastSeen: version,
+    })
+    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+
+  return { ok: true, url: parsed.image ? avatarUrl(playerId, version) : null };
+}
+
+/** Profilbild eines Spielers (Rohdaten für `GET /api/lobby/avatar`). */
+export async function getAvatar(
+  playerId: string,
+): Promise<{ image: string } | null> {
+  if (!playerId) return null;
+  const db = await getDb();
+  const [row] = await db
+    .select({ image: players.image })
+    .from(players)
+    .where(eq(players.id, playerId));
+  return row?.image ? { image: row.image } : null;
+}
+
 export async function updateRoleCounts(
-  code: string,
+  codeInput: string,
   playerId: string,
   roleCountsInput: unknown,
 ): Promise<boolean> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6) return false;
+
   const db = await getDb();
   const [host] = await db
     .select({ id: players.id })
@@ -298,7 +633,13 @@ export async function updateRoleCounts(
   return true;
 }
 
-export async function removePlayer(code: string, playerId: string): Promise<void> {
+export async function removePlayer(
+  codeInput: string,
+  playerId: string,
+): Promise<void> {
+  const code = normalizeCode(codeInput);
+  if (code.length !== 6 || !playerId) return;
+
   const db = await getDb();
   await db
     .delete(players)
