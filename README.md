@@ -28,32 +28,40 @@ Rollen-Setup und der Spielstart werden live für alle synchronisiert.
   automatisch neu auf (`src/db/index.ts`); `/api/health` zeigt Modus, Speicherart
   und Fehlerzähler.
 
-## Empfehlung für Render: externe Datenbank in 3 Minuten (kostenlos)
+## Render + Datenbank: läuft automatisch (nichts einzurichten)
 
-**Das ist der wichtigste Punkt für ein stabiles Multiplayer-Spiel.** Render
-verwendet für Web-Services ein **flüchtiges Dateisystem**: Bei jedem Deploy und
-jedem Neustart ist die eingebettete Datenbank leer (Free-Instanzen werden zudem
-nach ~15 min Inaktivität schlafen gelegt und regelmäßig neu gestartet). Genau
-daher kam bisher „irgendwann" ein Fehler: Die Lobby war nach einem Neustart weg.
+**Du musst nichts von Hand einrichten.** Die `render.yaml` (Blueprint) im Repo
+sorgt dafür, dass Render beim Deploy beides anlegt: den Web-Service **und**
+eine PostgreSQL-Datenbank (`starafk-db`). Ihr Verbindungs-String landet
+automatisch als `AUTO_DATABASE_URL` im Service, die App legt alle Tabellen
+beim ersten Zugriff selbst an. Lobbys überleben damit Deploys und Neustarts,
+und „Lobby erstellen" funktioniert sofort.
 
-Mit einer externen Datenbank überleben Lobbys jeden Neustart:
+Reihenfolge, in der die App ihre Datenbank wählt (`src/db/index.ts`):
 
-1. Kostenlose PostgreSQL-Datenbank anlegen – am schnellsten bei
-   [Neon](https://neon.tech) (kein Kreditkarte nötig, verfällt nicht):
-   - Registrieren → „Create project" → Region z. B. Frankfurt wählen.
-   - Im Dashboard den **Connection String** kopieren, er sieht so aus:
-     `postgresql://user:passwort@ep-xyz.eu-central-1.aws.neon.tech/neondb?sslmode=require`
-   - Alternativen: [Supabase](https://supabase.com) (Project Settings →
-     Database → Connection String) oder **Render PostgreSQL** (im selben
-     Dashboard; im kostenlosen Plan verfällt die Datenbank nach 30 Tagen).
-2. In **Render** → deinen Service → **Environment** → **Add Environment Variable**:
-   - Key: `DATABASE_URL`
-   - Value: der kopierte Connection String (mit `?sslmode=require`)
-3. **Manual Deploy → Deploy latest commit**.
+1. **`DATABASE_URL`** – eine eigene Datenbank, z. B. **Neon**. Sobald diese
+   Variable gesetzt ist, gewinnt sie immer (Neon wird am Hostnamen erkannt,
+   TLS geht automatisch an, ein `channel_binding=require` aus dem
+   Neon-Dashboard wird verträglich entfernt).
+2. **`AUTO_DATABASE_URL`** – die von Render automatisch provisionierte
+   Datenbank aus der Blueprint (Standard, ganz ohne Einrichtung).
+3. **PGlite** eingebettet (`.data/`) – nur für lokale Entwicklung ohne DB.
 
-Fertig. Prüfen kannst du es unter `https://<deine-domain>/api/health` – dort
-muss jetzt `"db": "postgres"` stehen (und `"ready": true`). Ab dann gilt: Lobbys
-überleben Deploys, Neustarts und das Einschlafen der Free-Instanz.
+**Neon dauerhaft nutzen (optional):** Die kostenlose Render-Datenbank wird
+nach 30 Tagen gelöscht, Neon verfällt nicht. Für Neon nur einmalig im
+Render-Dashboard (Service → Environment) `DATABASE_URL` mit dem Neon
+Connection String setzen
+(`postgresql://…@ep-….eu-central-1.aws.neon.tech/neondb?sslmode=require`) –
+ab dem nächsten (automatischen) Deploy nutzt die App Neon, ganz ohne
+Codeänderung. Ein Konto bei Neon kann dir niemand abnehmen; angelegt ist es
+in ~2 Minuten auf [neon.tech](https://neon.tech) (keine Kreditkarte nötig).
+
+Prüfen kannst du alles unter `https://<deine-domain>/api/health`:
+`"ok": true` plus `"provider": "neon" | "postgres"` heißt: Backend und
+externe Datenbank laufen. Die Seite selbst bleibt auch bei einer gerade
+aufwachenden/kurz nicht erreichbaren Datenbank aufrufbar – der Health-Check
+antwortet dann `ok: false` mit Fehlertext in `status.lastError`, statt dass
+Render die Instanz in einer Neustart-Schleife festhält.
 
 > **Kein Datenbank-Download nötig.** Falls du wirklich offline/lokal spielen
 > willst: Die eingebettete PGlite-Datenbank liegt als normaler Ordner unter
@@ -78,7 +86,7 @@ muss jetzt `"db": "postgres"` stehen (und `"ready": true`). Ab dann gilt: Lobbys
    | Build Command | `npm ci && npm run build` |
    | Start Command | `npm run start` |
    | Health Check Path | `/api/health` |
-   | Environment | `DATABASE_URL` (empfohlen, siehe oben) |
+   | Environment | nichts nötig (DB kommt automatisch aus der Blueprint; optional `DATABASE_URL` = Neon) |
 
 4. **„Lobby existiert nicht mehr"** nach einem Neustart ohne externe Datenbank:
    Der Host kann die Lobby mit demselben Code neu öffnen – die App macht das
@@ -183,7 +191,8 @@ Die Attrappen liegen in `scripts/dev-mocks.mjs` und werden nur für Tests benutz
 
 | Umgebungsvariable | Bedeutung |
 | --- | --- |
-| `DATABASE_URL` | PostgreSQL-Verbindungsstring. Ohne sie läuft PGlite eingebettet. |
+| `DATABASE_URL` | PostgreSQL-Verbindungsstring (z. B. Neon). Hat Vorrang vor `AUTO_DATABASE_URL`; ohne beides läuft PGlite eingebettet. |
+| `AUTO_DATABASE_URL` | Von der Render-Blueprint automatisch provisionierte Datenbank (`render.yaml` → `starafk-db`) – muss nie von Hand gesetzt werden. |
 | `DATABASE_SSL` | `true`/`false` erzwingt bzw. deaktiviert TLS (Standard: automatisch – TLS bei bekannten Anbietern und bei `sslmode=…` im String). |
 | `DATABASE_POOL_MAX` | Größe des Verbindungspools (Standard 4). |
 | `PGLITE_DIR` | Ablageort der eingebetteten Datenbank (Standard `.data/pglite`). |

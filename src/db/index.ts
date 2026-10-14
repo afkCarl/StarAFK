@@ -38,17 +38,69 @@ function globals(): DbGlobals {
 }
 
 /**
+ * Verbindungs-String der externen Datenbank – ganz ohne Handarbeit:
+ * 1. `DATABASE_URL` – wird gesetzt, sobald eine eigene Datenbank (z. B. Neon)
+ *    angebunden ist; diese Angabe gewinnt immer.
+ * 2. `AUTO_DATABASE_URL` – wird von `render.yaml` automatisch mit der im
+ *    Blueprint mit-provisionierten Datenbank befüllt (kein Eintragen nötig).
+ * Ohne beides startet die eingebettete PGlite-Datenbank (lokale Entwicklung).
+ */
+export function resolveDatabaseUrl(): string | undefined {
+  const own = process.env.DATABASE_URL?.trim();
+  if (own) return sanitizeDatabaseUrl(own);
+  const auto = process.env.AUTO_DATABASE_URL?.trim();
+  if (auto) return sanitizeDatabaseUrl(auto);
+  return undefined;
+}
+
+/**
+ * Neon gibt im Dashboard Verbindungs-Strings mit `channel_binding=require`
+ * aus. Der `pg`-Treiber unterstützt kein SCRAM-Channel-Binding und würde
+ * die Verbindung sonst ablehnen – der Parameter wird deshalb entfernt.
+ * TLS bleibt über `sslmode` / die Host-Erkennung (siehe `sslFor`) aktiv.
+ */
+function sanitizeDatabaseUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.searchParams.has("channel_binding")) {
+      url.searchParams.delete("channel_binding");
+      return url.toString();
+    }
+    return raw;
+  } catch {
+    return raw;
+  }
+}
+
+export type DbProvider = "neon" | "postgres" | "pglite";
+
+/** Anbieter der aktiven Datenbank (nur für Anzeige/Health – ohne Secrets). */
+export function getDbProvider(): DbProvider {
+  const url = resolveDatabaseUrl();
+  if (!url) return "pglite";
+  try {
+    if (/\.neon\.tech$/i.test(new URL(url).hostname)) return "neon";
+  } catch {
+    /* kein URL-Format → unten allgemein als Postgres melden */
+  }
+  return "postgres";
+}
+
+/**
  * Welche Datenbank-Variante gerade aktiv ist:
- * - `postgres`: externe PostgreSQL-Instanz aus `DATABASE_URL` (empfohlen für Render)
+ * - `postgres`: externe PostgreSQL-Instanz (Neon oder automatisch von Render
+ *   provisioniert – siehe `resolveDatabaseUrl`)
  * - `pglite`: eingebettetes PostgreSQL (PGlite) im Ordner `.data/` –
  *   null Konfiguration nötig, ideal für einen einfachen Start.
  */
 export function getDbMode(): DbMode {
-  return process.env.DATABASE_URL ? "postgres" : "pglite";
+  return resolveDatabaseUrl() ? "postgres" : "pglite";
 }
 
 export interface DbStatus {
   mode: DbMode;
+  /** Konkreter Anbieter: `neon`, sonstiges externes `postgres` oder `pglite`. */
+  provider: DbProvider;
   storage: DbStorage;
   /** Letzte Datenbank-Aktion war erfolgreich (Schema angelegt, Abfrage ok). */
   ready: boolean;
@@ -63,6 +115,7 @@ export function dbStatus(): DbStatus {
   const g = globals();
   return {
     mode: getDbMode(),
+    provider: getDbProvider(),
     storage: getDbMode() === "postgres" ? "external" : g.pgliteStorage,
     ready: g.ready,
     failures: g.failures,
@@ -181,10 +234,16 @@ function poolOptions(connectionString: string): PoolConfig {
     max: Number.isFinite(configured) && configured > 0 ? configured : 4,
     // Bewusst kürzer als das Zeitlimit der API-Aufrufe im Browser (15 s) –
     // so antwortet die API mit einem klaren Fehler statt ins Leere zu laufen.
-    connectionTimeoutMillis: 8_000,
+    // 10 s geben einer gerade aufwachenden Neon-Datenbank (Scale-to-Zero)
+    // genug Zeit für den ersten Verbindungsaufbau.
+    connectionTimeoutMillis: 10_000,
+    // Einzelne Anfrage nie länger als 20 s hängen lassen.
+    query_timeout: 20_000,
+    statement_timeout: 20_000,
     idleTimeoutMillis: 30_000,
     allowExitOnIdle: true,
     keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
     ssl: sslFor(connectionString),
   };
 }
@@ -214,9 +273,9 @@ async function initSchema(db: Database): Promise<void> {
  * Migrationsschritte). API-Handler rufen dies asynchron auf, weil `next build`
  * Route-Module ohne Runtime-Secrets importiert.
  */
-export async function getDb(): Promise<Database> {
+async function getDbOnce(): Promise<Database> {
   const g = globals();
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = resolveDatabaseUrl();
 
   let db: Database;
   if (databaseUrl) {
@@ -238,6 +297,26 @@ export async function getDb(): Promise<Database> {
 
   await initSchema(db);
   return db;
+}
+
+export async function getDb(): Promise<Database> {
+  try {
+    return await getDbOnce();
+  } catch (error) {
+    // Nur bei einer externen Datenbank lohnt der sofortige Neuaufbau:
+    // Das betrifft z. B. den allerersten Verbindungsaufbau zu einer gerade
+    // aufwachenden Neon-Datenbank oder eine vom Pooler geschlossene
+    // Verbindung. Statt den Fehler (und damit einen fehlgeschlagenen
+    // „Lobby erstellen“-Klick) an den Spieler weiterzugeben, wird die
+    // Verbindung einmal frisch aufgebaut und der Zugriff wiederholt.
+    if (!resolveDatabaseUrl()) throw error;
+    console.warn(
+      "[db] Datenbankzugriff fehlgeschlagen – Verbindung wird neu aufgebaut und einmal wiederholt.",
+      error,
+    );
+    await resetDb();
+    return getDbOnce();
+  }
 }
 
 /** Verbindung verwerfen – die nächste Anfrage startet frisch. */

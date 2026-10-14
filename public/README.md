@@ -133,13 +133,20 @@ public/frames/GrayCatWalkingTwo.png
   "scripts": {
     "dev": "next dev --hostname 0.0.0.0",
     "build": "next build",
-    "start": "next start --hostname 0.0.0.0",
-    "typecheck": "tsc --noEmit"
+    "start": "next start --hostname 0.0.0.0 --port ${PORT:-3000}",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "node scripts/e2e-local.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1151.0",
     "@electric-sql/pglite": "^0.5.9",
+    "@neon/config": "^1.9.1",
+    "@neon/env": "^1.6.2",
+    "@neon/functions": "^0.11.0",
+    "@neondatabase/auth": "^0.6.0-beta",
     "clsx": "2.1.1",
     "drizzle-orm": "0.45.2",
+    "jose": "^6.2.12",
     "lucide-react": "^1.54.0",
     "next": "16.2.6",
     "pg": "8.20.0",
@@ -148,6 +155,7 @@ public/frames/GrayCatWalkingTwo.png
     "tailwind-merge": "3.4.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite-socket": "^0.2.12",
     "@tailwindcss/postcss": "4.1.17",
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
@@ -173,6 +181,8 @@ const nextConfig: NextConfig = {
   // Datenbank-Treiber nicht bundlen (stehen in node_modules und werden zur
   // Laufzeit von Node geladen) – wichtig für eingebettetes PGlite und `pg`.
   serverExternalPackages: ["@electric-sql/pglite", "pg"],
+  // `next dev` blockt sonst Cross-Origin-Anfragen von Preview-Hosts.
+  allowedDevOrigins: [".e2b.app", "localhost", "127.0.0.1"],
 };
 
 export default nextConfig;
@@ -265,18 +275,25 @@ export default postcssConfig;
 ```
 # Render Blueprint für https://render.com
 #
-# Einziger nötiger Service: die Next.js-App mit Backend (API-Routen) und
-# Datenbank. Standardmäßig läuft die eingebettete PostgreSQL-Datenbank (PGlite)
-# im Ordner `.data/` – KEINE Einrichtung nötig.
+# Alles läuft automatisch – KEINE Einrichtung von Hand nötig:
+# - Der Web-Service unten ist die Next.js-App (Frontend + Backend/API).
+# - Die Datenbank `starafk-db` wird von Render beim Blueprint-Deploy
+#   automatisch angelegt und ihr Verbindungs-String landet als
+#   `AUTO_DATABASE_URL` im Service. Die App legt alle Tabellen beim ersten
+#   Zugriff selbst an (keine Migration, nichts einzutragen).
+# - Danach überleben Lobbys jeden Deploy/Neustart – „Lobby erstellen"
+#   funktioniert sofort und flüssig.
 #
-# WICHTIG für dauerhafte Lobbys auf Render:
-# Das Dateisystem von Render-Instanzen ist flüchtig (bei Free-Instanzen sogar
-# ohne Persistent Disk). Bei jedem Deploy/Neustart ist die eingebettete
-# Datenbank daher leer. Entweder
-#   a) unten den Datenbank-Block einkommentieren (Render PostgreSQL), oder
-#   b) einfach DATABASE_URL in den Environment-Einstellungen setzen
-#      (z. B. kostenlos bei Neon, https://neon.tech – Anleitung in README.md).
-# Mit gesetzter DATABASE_URL überleben Lobbys jeden Neustart.
+# Neon statt Render-Datenbank (optional, dauerhaft kostenlos):
+# Neon hat in der App Vorrang, sobald `DATABASE_URL` gesetzt ist. Wer die
+# Lobbys dauerhaft bei Neon speichern will, trägt EINMALIG im
+# Render-Dashboard (Service → Environment) als `DATABASE_URL` den
+# Connection String von Neon ein
+# (postgresql://…@ep-….eu-central-1.aws.neon.tech/neondb?sslmode=require) –
+# die App erkennt Neon am Hostnamen, schaltet TLS ein und nutzt ab dem
+# nächsten Deploy automatisch Neon statt der Render-Datenbank.
+# Hinweis: Die kostenlose Render-Datenbank wird nach 30 Tagen gelöscht,
+# eine Neon-Datenbank verfällt nicht.
 
 services:
   - type: web
@@ -290,25 +307,27 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
-      # --- Variante a: Render PostgreSQL mitverwenden (einkommentieren) ------
-      # - key: DATABASE_URL
-      #   fromDatabase:
-      #     name: starafk-db
-      #     property: connectionString
-      # --- Variante b: eigene Datenbank (z. B. Neon) -------------------------
-      # - key: DATABASE_URL
-      #   sync: false        # Wert wird im Render-Dashboard eingetragen
-      # Optional: SSL erzwingen/deaktivieren, wenn die Automatik nicht greift
-      # - key: DATABASE_SSL
-      #   value: "true"
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"
+      # Automatisch provisionierte Datenbank (siehe `databases:` unten).
+      # Wird in der App nur benutzt, solange keine eigene DATABASE_URL
+      # (z. B. Neon) gesetzt ist – die hat immer Vorrang.
+      - key: AUTO_DATABASE_URL
+        fromDatabase:
+          name: starafk-db
+          property: connectionString
+      # --- Optional: Neon als Datenbank (stattdessen verwenden) -------------
+      # Im Render-Dashboard unter Environment eintragen (nicht hier, damit
+      # das Passwort nicht im Repo landet):
+      #   DATABASE_URL = postgresql://…@ep-….aws.neon.tech/neondb?sslmode=require
 
-# --- Variante a: Render PostgreSQL (einkommentieren, dann oben DATABASE_URL) --
-# Hinweis: Der kostenlose Postgres-Plan von Render verfällt nach 30 Tagen.
-# databases:
-#   - name: starafk-db
-#     plan: free
-#     databaseName: starafk
-#     user: starafk
+# Automatische Datenbank: wird beim Blueprint-Deploy von Render angelegt
+# und über `AUTO_DATABASE_URL` (oben) mit dem Web-Service verdrahtet.
+databases:
+  - name: starafk-db
+    plan: free
+    databaseName: starafk
+    user: starafk
 ```
 
 ## Datei: `src/instrumentation.ts`
@@ -319,17 +338,33 @@ services:
  *
  * Hier wird die Datenbank absichtlich schon im Hintergrund geöffnet: das
  * Anlegen/Öffnen der eingebetteten PostgreSQL-Datenbank (PGlite) dauert beim
- * allerersten Zugriff ein paar Sekunden. Ohne diesen Vorlauf müsste der erste
- * „Lobby erstellen"-Klick darauf warten (auf Render-Free-Instanzen spürbar).
+ * allerersten Zugriff ein paar Sekunden und auch eine externe Datenbank
+ * (Neon) braucht für den ersten Verbindungsaufbau kurz. Ohne diesen Vorlauf
+ * müsste der erste „Lobby erstellen“-Klick darauf warten (auf
+ * Render-Free-Instanzen spürbar).
+ *
+ * Wichtig: Der Vorlauf darf den Serverstart nie blockieren. Antwortet die
+ * Datenbank nicht innerhalb des Zeitlimits, startet der Server trotzdem –
+ * die API-Routen bauen die Verbindung dann bei Bedarf selbst auf (inkl.
+ * Wiederholung, siehe `getDb` in `src/db/index.ts`).
  */
 export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
   try {
     const { getDb, dbStatus } = await import("@/db");
-    await getDb();
-    console.log(
-      `[start] Datenbank bereit (${dbStatus().mode}/${dbStatus().storage}).`,
+    const warmup = getDb().then(() => true);
+    const timeout = new Promise<false>((resolve) =>
+      setTimeout(() => resolve(false), 15_000),
     );
+    if (await Promise.race([warmup, timeout])) {
+      console.log(
+        `[start] Datenbank bereit (${dbStatus().provider}/${dbStatus().storage}).`,
+      );
+    } else {
+      console.warn(
+        "[start] Datenbank-Vorlauf dauert länger als 15 s – Server startet trotzdem, die Verbindung wird bei der ersten Anfrage aufgebaut.",
+      );
+    }
   } catch (error) {
     // Nicht abbrechen: Die API-Routen bauen die Verbindung bei Bedarf selbst
     // auf (und heilen sich dabei selbst).
@@ -381,17 +416,69 @@ function globals(): DbGlobals {
 }
 
 /**
+ * Verbindungs-String der externen Datenbank – ganz ohne Handarbeit:
+ * 1. `DATABASE_URL` – wird gesetzt, sobald eine eigene Datenbank (z. B. Neon)
+ *    angebunden ist; diese Angabe gewinnt immer.
+ * 2. `AUTO_DATABASE_URL` – wird von `render.yaml` automatisch mit der im
+ *    Blueprint mit-provisionierten Datenbank befüllt (kein Eintragen nötig).
+ * Ohne beides startet die eingebettete PGlite-Datenbank (lokale Entwicklung).
+ */
+export function resolveDatabaseUrl(): string | undefined {
+  const own = process.env.DATABASE_URL?.trim();
+  if (own) return sanitizeDatabaseUrl(own);
+  const auto = process.env.AUTO_DATABASE_URL?.trim();
+  if (auto) return sanitizeDatabaseUrl(auto);
+  return undefined;
+}
+
+/**
+ * Neon gibt im Dashboard Verbindungs-Strings mit `channel_binding=require`
+ * aus. Der `pg`-Treiber unterstützt kein SCRAM-Channel-Binding und würde
+ * die Verbindung sonst ablehnen – der Parameter wird deshalb entfernt.
+ * TLS bleibt über `sslmode` / die Host-Erkennung (siehe `sslFor`) aktiv.
+ */
+function sanitizeDatabaseUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.searchParams.has("channel_binding")) {
+      url.searchParams.delete("channel_binding");
+      return url.toString();
+    }
+    return raw;
+  } catch {
+    return raw;
+  }
+}
+
+export type DbProvider = "neon" | "postgres" | "pglite";
+
+/** Anbieter der aktiven Datenbank (nur für Anzeige/Health – ohne Secrets). */
+export function getDbProvider(): DbProvider {
+  const url = resolveDatabaseUrl();
+  if (!url) return "pglite";
+  try {
+    if (/\.neon\.tech$/i.test(new URL(url).hostname)) return "neon";
+  } catch {
+    /* kein URL-Format → unten allgemein als Postgres melden */
+  }
+  return "postgres";
+}
+
+/**
  * Welche Datenbank-Variante gerade aktiv ist:
- * - `postgres`: externe PostgreSQL-Instanz aus `DATABASE_URL` (empfohlen für Render)
+ * - `postgres`: externe PostgreSQL-Instanz (Neon oder automatisch von Render
+ *   provisioniert – siehe `resolveDatabaseUrl`)
  * - `pglite`: eingebettetes PostgreSQL (PGlite) im Ordner `.data/` –
  *   null Konfiguration nötig, ideal für einen einfachen Start.
  */
 export function getDbMode(): DbMode {
-  return process.env.DATABASE_URL ? "postgres" : "pglite";
+  return resolveDatabaseUrl() ? "postgres" : "pglite";
 }
 
 export interface DbStatus {
   mode: DbMode;
+  /** Konkreter Anbieter: `neon`, sonstiges externes `postgres` oder `pglite`. */
+  provider: DbProvider;
   storage: DbStorage;
   /** Letzte Datenbank-Aktion war erfolgreich (Schema angelegt, Abfrage ok). */
   ready: boolean;
@@ -406,6 +493,7 @@ export function dbStatus(): DbStatus {
   const g = globals();
   return {
     mode: getDbMode(),
+    provider: getDbProvider(),
     storage: getDbMode() === "postgres" ? "external" : g.pgliteStorage,
     ready: g.ready,
     failures: g.failures,
@@ -524,10 +612,16 @@ function poolOptions(connectionString: string): PoolConfig {
     max: Number.isFinite(configured) && configured > 0 ? configured : 4,
     // Bewusst kürzer als das Zeitlimit der API-Aufrufe im Browser (15 s) –
     // so antwortet die API mit einem klaren Fehler statt ins Leere zu laufen.
-    connectionTimeoutMillis: 8_000,
+    // 10 s geben einer gerade aufwachenden Neon-Datenbank (Scale-to-Zero)
+    // genug Zeit für den ersten Verbindungsaufbau.
+    connectionTimeoutMillis: 10_000,
+    // Einzelne Anfrage nie länger als 20 s hängen lassen.
+    query_timeout: 20_000,
+    statement_timeout: 20_000,
     idleTimeoutMillis: 30_000,
     allowExitOnIdle: true,
     keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
     ssl: sslFor(connectionString),
   };
 }
@@ -557,9 +651,9 @@ async function initSchema(db: Database): Promise<void> {
  * Migrationsschritte). API-Handler rufen dies asynchron auf, weil `next build`
  * Route-Module ohne Runtime-Secrets importiert.
  */
-export async function getDb(): Promise<Database> {
+async function getDbOnce(): Promise<Database> {
   const g = globals();
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = resolveDatabaseUrl();
 
   let db: Database;
   if (databaseUrl) {
@@ -581,6 +675,26 @@ export async function getDb(): Promise<Database> {
 
   await initSchema(db);
   return db;
+}
+
+export async function getDb(): Promise<Database> {
+  try {
+    return await getDbOnce();
+  } catch (error) {
+    // Nur bei einer externen Datenbank lohnt der sofortige Neuaufbau:
+    // Das betrifft z. B. den allerersten Verbindungsaufbau zu einer gerade
+    // aufwachenden Neon-Datenbank oder eine vom Pooler geschlossene
+    // Verbindung. Statt den Fehler (und damit einen fehlgeschlagenen
+    // „Lobby erstellen“-Klick) an den Spieler weiterzugeben, wird die
+    // Verbindung einmal frisch aufgebaut und der Zugriff wiederholt.
+    if (!resolveDatabaseUrl()) throw error;
+    console.warn(
+      "[db] Datenbankzugriff fehlgeschlagen – Verbindung wird neu aufgebaut und einmal wiederholt.",
+      error,
+    );
+    await resetDb();
+    return getDbOnce();
+  }
 }
 
 /** Verbindung verwerfen – die nächste Anfrage startet frisch. */
@@ -673,6 +787,23 @@ const SCHEMA_STATEMENTS: string[] = [
   // Upgrades für Tabellen aus älteren Ständen:
   `ALTER TABLE lobbies ADD COLUMN IF NOT EXISTS game_started boolean NOT NULL DEFAULT false`,
   `ALTER TABLE players ADD COLUMN IF NOT EXISTS image_updated_at timestamptz`,
+  // Neon Auth: Spielfigur ↔ Konto.
+  `ALTER TABLE players ADD COLUMN IF NOT EXISTS user_id text`,
+  `CREATE INDEX IF NOT EXISTS players_user_id_idx ON players (user_id)`,
+  // Neon Object Storage: Bilddaten liegen im Bucket, hier steht nur der Schlüssel.
+  `ALTER TABLE players ADD COLUMN IF NOT EXISTS image_key text`,
+  // AI Game Master (Neon Function `gamemaster` schreibt hier hinein).
+  `CREATE TABLE IF NOT EXISTS game_master_lines (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    lobby_code varchar(6) NOT NULL REFERENCES lobbies(code) ON DELETE CASCADE,
+    kind text NOT NULL,
+    text text NOT NULL,
+    model text,
+    created_by text,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS game_master_lines_lobby_idx
+     ON game_master_lines (lobby_code, created_at DESC)`,
   // Alte Profilbilder (aus Ständen ohne image_updated_at) bekommen eine
   // Cache-Version, damit ihre Avatar-URLs stabil bleiben.
   `UPDATE players SET image_updated_at = created_at
@@ -686,8 +817,20 @@ type Executable = {
 };
 
 export async function ensureSchema(db: Executable): Promise<void> {
-  for (const statement of SCHEMA_STATEMENTS) {
-    await db.execute(sql.raw(statement));
+  // Schnellweg: alle Anweisungen in EINER Anfrage an die Datenbank schicken
+  // (Postgres/PGlite führen mehrere Statements pro Simple-Query aus). Das
+  // spart bei einer entfernten Datenbank (z. B. Neon) viele Roundtrips –
+  // der allererste „Lobby erstellen“-Klick bleibt dadurch flott.
+  try {
+    await db.execute(sql.raw(SCHEMA_STATEMENTS.join(";\n")));
+    return;
+  } catch {
+    // Fallback: einzeln ausführen (z. B. wenn ein Treiber/Pooler keine
+    // Multi-Statements erlaubt). Idempotent – bereits ausgeführte
+    // Anweisungen sind dann einfach No-Ops.
+    for (const statement of SCHEMA_STATEMENTS) {
+      await db.execute(sql.raw(statement));
+    }
   }
 }
 ```
@@ -723,6 +866,13 @@ export const players = pgTable("players", {
   lobbyCode: varchar("lobby_code", { length: 6 })
     .notNull()
     .references(() => lobbies.code, { onDelete: "cascade" }),
+  /**
+   * Neon-Auth-Nutzer (`user.id` aus der Session), sobald Login aktiv ist.
+   * Verknüpft die Spielfigur mit dem Konto: nur wer angemeldet ist und zu
+   * dieser Zeile gehört, darf sie verändern. NULL = Zeile aus der Zeit ohne
+   * Login (oder Login ist nicht konfiguriert).
+   */
+  userId: text("user_id"),
   name: text("name").notNull(),
   color: text("color").notNull(),
   fadeIntensity: integer("fade_intensity").notNull().default(50),
@@ -734,6 +884,13 @@ export const players = pgTable("players", {
    * über `GET /api/lobby/avatar?pid=…&v=…` (mit langem Browser-Cache).
    */
   image: text("image"),
+  /**
+   * Schlüssel des Profilbilds im Neon-Object-Storage-Bucket (`assets`), z. B.
+   * `avatars/<player-id>/<uuid>.jpg`. Ist er gesetzt, liegen die Bilddaten NICHT
+   * in der Datenbank, sondern im Bucket; `image` bleibt als Fallback (lokale
+   * Entwicklung ohne Bucket) erhalten.
+   */
+  imageKey: text("image_key"),
   /** Zeitpunkt des letzten Bildwechsels – dient als Cache-Version in der Avatar-URL. */
   imageUpdatedAt: timestamp("image_updated_at", { withTimezone: true }),
   isHost: boolean("is_host").notNull().default(false),
@@ -747,6 +904,30 @@ export const players = pgTable("players", {
 
 export type LobbyRow = typeof lobbies.$inferSelect;
 export type PlayerRow = typeof players.$inferSelect;
+
+/**
+ * Vom AI Game Master (Neon Function `gamemaster`) erzeugte Texte. Pro Lobby
+ * wird der jeweils neueste Text im Live-Zustand ausgeliefert, damit ihn alle
+ * Spieler sehen – die vollständige Historie bleibt hier liegen.
+ */
+export const gameMasterLines = pgTable("game_master_lines", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  lobbyCode: varchar("lobby_code", { length: 6 })
+    .notNull()
+    .references(() => lobbies.code, { onDelete: "cascade" }),
+  /** Art des Textes: `intro` (Rollen-Intro), `night` (Nacht), `recap` (Lage). */
+  kind: text("kind").notNull(),
+  text: text("text").notNull(),
+  /** Modell, das über das AI Gateway geantwortet hat. */
+  model: text("model"),
+  /** Neon-Auth-Nutzer, der den Text angestoßen hat. */
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export type GameMasterLineRow = typeof gameMasterLines.$inferSelect;
 ```
 
 ## Datei: `src/lib/api.ts`
@@ -908,11 +1089,21 @@ export interface LobbyPlayer extends PlayerProfile {
   isHost: boolean;
 }
 
+/** Vom AI Game Master (Neon Function `gamemaster`) erzeugter Text. */
+export interface LobbyNarration {
+  kind: string;
+  text: string;
+  model: string | null;
+  createdAt: string;
+}
+
 export interface LobbyState {
   code: string;
   players: LobbyPlayer[];
   roleCounts: Record<string, number>;
   gameStarted: boolean;
+  /** Neuester Game-Master-Text – für alle Spieler sichtbar. */
+  narration: LobbyNarration | null;
 }
 ```
 
@@ -962,19 +1153,21 @@ export function decodeImage(
 ## Datei: `src/lib/lobby-service.ts`
 
 ```tsx
-import { and, asc, eq, lt } from "drizzle-orm";
+import { and, asc, desc, eq, lt } from "drizzle-orm";
 
 import { getDb } from "@/db";
-import { lobbies, players } from "@/db/schema";
+import { gameMasterLines, lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
   defaultRoleCounts,
+  type LobbyNarration,
   type LobbyPlayer,
   type LobbyState,
   type PlayerProfile,
   ROLES,
 } from "@/lib/game";
-import { parseImageInput } from "@/lib/image";
+import { decodeImage, parseImageInput } from "@/lib/image";
+import { deleteObject, putObject, storageEnabled } from "@/lib/storage";
 
 /**
  * Nach dieser Zeit ohne Lebenszeichen gilt ein Spieler als getrennt.
@@ -1005,6 +1198,7 @@ let lastPurgeAt = 0;
 /** Profilfelder, die für den Lobby-Zustand gebraucht werden (ohne Bild!). */
 const playerColumns = {
   id: players.id,
+  userId: players.userId,
   name: players.name,
   color: players.color,
   fadeIntensity: players.fadeIntensity,
@@ -1017,6 +1211,7 @@ const playerColumns = {
 
 type PlayerSummary = {
   id: string;
+  userId: string | null;
   name: string;
   color: string;
   fadeIntensity: number;
@@ -1026,6 +1221,15 @@ type PlayerSummary = {
   lastSeen: Date;
   imageUpdatedAt: Date | null;
 };
+
+/**
+ * Zusatzbedingung für Schreibzugriffe, wenn Login aktiv ist: Nur der Besitzer
+ * (Neon-Auth-Nutzer) darf die Zeile verändern. Ohne `userId` (Login aus, z. B.
+ * lokale Entwicklung) bleibt das Verhalten wie vorher.
+ */
+function ownerFilter(userId?: string | null) {
+  return userId ? eq(players.userId, userId) : undefined;
+}
 
 /** Profilbild-URL (klein, cachebar) – Bilddaten selbst liegen unter derselben Route. */
 export function avatarUrl(playerId: string, version: Date | number): string {
@@ -1115,17 +1319,48 @@ function toLobbyPlayer(row: PlayerSummary): LobbyPlayer {
   };
 }
 
-function toState(
+/**
+ * Neuester Game-Master-Text der Lobby (Neon Function `gamemaster` schreibt ihn).
+ * Kleiner Text → er darf problemlos im Sekunden-Polling mitfahren, damit ihn
+ * alle Spieler gleichzeitig sehen.
+ */
+async function latestNarration(code: string): Promise<LobbyNarration | null> {
+  const db = await getDb();
+  const [line] = await db
+    .select({
+      kind: gameMasterLines.kind,
+      text: gameMasterLines.text,
+      model: gameMasterLines.model,
+      createdAt: gameMasterLines.createdAt,
+    })
+    .from(gameMasterLines)
+    .where(eq(gameMasterLines.lobbyCode, code))
+    .orderBy(desc(gameMasterLines.createdAt))
+    .limit(1);
+  if (!line) return null;
+  return {
+    kind: line.kind,
+    text: line.text,
+    model: line.model,
+    createdAt: line.createdAt.toISOString(),
+  };
+}
+
+async function toState(
   code: string,
   rows: PlayerSummary[],
   roleCounts: Record<string, number>,
   gameStarted: boolean,
-): LobbyState {
+  // Bereits (parallel) geladener Game-Master-Text – spart einen Roundtrip.
+  // `undefined` = hier nachladen, `null` = nachweislich keiner vorhanden.
+  narration?: LobbyNarration | null,
+): Promise<LobbyState> {
   return {
     code,
     players: rows.map(toLobbyPlayer),
     roleCounts,
     gameStarted,
+    narration: narration === undefined ? await latestNarration(code) : narration,
   };
 }
 
@@ -1163,12 +1398,18 @@ async function cleanupStalePlayers(code: string): Promise<void> {
     );
 }
 
-async function touchPlayer(code: string, playerId: string): Promise<void> {
+async function touchPlayer(
+  code: string,
+  playerId: string,
+  userId?: string | null,
+): Promise<void> {
   const db = await getDb();
   await db
     .update(players)
     .set({ lastSeen: new Date() })
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 }
 
 export type CreateOptions = {
@@ -1176,6 +1417,8 @@ export type CreateOptions = {
   code?: string;
   /** Bevorzugte Spieler-ID, damit ein Reconnect dieselbe Identität behält. */
   playerId?: string;
+  /** Neon-Auth-Nutzer der Session (wird an die Spielerzeile gebunden). */
+  userId?: string | null;
 };
 
 export type CreateOutcome =
@@ -1221,21 +1464,44 @@ export async function createLobby(
     code = generateCode();
   }
 
-  const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
-  if (!lobby) throw new Error("Lobby konnte nicht angelegt werden");
+  // Frisch angelegt? Dann sind Rollen-Setup und Spielstatus bekannt und die
+  // zusätzliche Lobby-Abfrage entfällt (ein Roundtrip weniger pro Erstellen –
+  // bei einer entfernten Datenbank wie Neon direkt spürbar).
+  let lobby: { roleCounts: Record<string, number>; gameStarted: boolean };
+  if (created) {
+    lobby = { roleCounts, gameStarted: false };
+  } else {
+    const [row] = await db.select().from(lobbies).where(eq(lobbies.code, code));
+    if (!row) throw new Error("Lobby konnte nicht angelegt werden");
+    lobby = row;
+  }
 
   if (wantedId) {
     const [existing] = await db
-      .select({ id: players.id })
+      .select({ id: players.id, userId: players.userId })
       .from(players)
       .where(and(eq(players.id, wantedId), eq(players.lobbyCode, code)));
     if (existing) {
+      // Fremde Spielfigur (anderes Konto) → keine Wiederherstellung.
+      if (existing.userId && options.userId && existing.userId !== options.userId) {
+        return { ok: false, reason: "full" };
+      }
+      if (options.userId && existing.userId !== options.userId) {
+        // Zeile aus der Zeit ohne Login → dem Konto zuschreiben.
+        await db
+          .update(players)
+          .set({ userId: options.userId })
+          .where(and(eq(players.id, wantedId), eq(players.lobbyCode, code)));
+      }
       await applyProfilePatch(code, wantedId, sanitizeProfilePatch(profileInput));
-      const rows = await listPlayers(code);
+      const [rows, narration] = await Promise.all([
+        listPlayers(code),
+        latestNarration(code),
+      ]);
       return {
         ok: true,
         selfId: wantedId,
-        lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+        lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted, narration),
         reused: true,
       };
     }
@@ -1249,6 +1515,7 @@ export async function createLobby(
   const profile = sanitizeProfile(profileInput);
   const base = {
     lobbyCode: code,
+    userId: options.userId ?? null,
     ...profile,
     imageUpdatedAt: profile.image ? new Date() : null,
     isHost: !existingPlayers.some((row) => row.isHost),
@@ -1266,11 +1533,20 @@ export async function createLobby(
     [self] = await db.insert(players).values(base).returning(playerColumns);
   }
 
-  const rows = await listPlayers(code);
+  // Kein erneutes Auslesen nötig: Die Spieler von vor dem Einfügen plus der
+  // neue Spieler (jüngster Eintrag) ergeben den aktuellen Zustand. Frisch
+  // angelegte Lobbys haben außerdem noch keinen Game-Master-Text.
+  const rows = [...existingPlayers, self];
   return {
     ok: true,
     selfId: self.id,
-    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    lobby: await toState(
+      code,
+      rows,
+      lobby.roleCounts,
+      lobby.gameStarted,
+      created ? null : undefined,
+    ),
     reused: !created,
   };
 }
@@ -1287,7 +1563,7 @@ export type JoinOutcome =
 export async function joinLobby(
   codeInput: string,
   profileInput: unknown,
-  options: { playerId?: string } = {},
+  options: { playerId?: string; userId?: string | null } = {},
 ): Promise<JoinOutcome> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return { ok: false, reason: "not_found" };
@@ -1301,13 +1577,27 @@ export async function joinLobby(
 
   if (resumeId) {
     const [existing] = await db
-      .select({ id: players.id })
+      .select({ id: players.id, userId: players.userId })
       .from(players)
       .where(and(eq(players.id, resumeId), eq(players.lobbyCode, code)));
     if (existing) {
+      // Zeile gehört einem anderen Konto → nicht wiederherstellen.
+      if (existing.userId && options.userId && existing.userId !== options.userId) {
+        return { ok: false, reason: "not_found" };
+      }
+      if (options.userId && existing.userId !== options.userId) {
+        // Zeile aus der Zeit ohne Login → jetzt dem Konto zuschreiben.
+        await db
+          .update(players)
+          .set({ userId: options.userId })
+          .where(and(eq(players.id, resumeId), eq(players.lobbyCode, code)));
+      }
       await applyProfilePatch(code, resumeId, patch);
-      const rows = await listPlayers(code);
-      const state = toState(code, rows, lobby.roleCounts, lobby.gameStarted);
+      const [rows, narration] = await Promise.all([
+        listPlayers(code),
+        latestNarration(code),
+      ]);
+      const state = await toState(code, rows, lobby.roleCounts, lobby.gameStarted, narration);
       return { ok: true, selfId: resumeId, lobby: state, resumed: true };
     }
 
@@ -1323,6 +1613,7 @@ export async function joinLobby(
           .values({
             id: resumeId,
             lobbyCode: code,
+            userId: options.userId ?? null,
             ...profile,
             imageUpdatedAt: profile.image ? new Date() : null,
             isHost: !current.some((row) => row.isHost),
@@ -1330,11 +1621,17 @@ export async function joinLobby(
           .onConflictDoNothing()
           .returning(playerColumns);
         if (recreated) {
-          const rows = await listPlayers(code);
+          const narration = await latestNarration(code);
           return {
             ok: true,
             selfId: recreated.id,
-            lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+            lobby: await toState(
+              code,
+              [...current, recreated],
+              lobby.roleCounts,
+              lobby.gameStarted,
+              narration,
+            ),
             resumed: true,
           };
         }
@@ -1352,17 +1649,24 @@ export async function joinLobby(
     .insert(players)
     .values({
       lobbyCode: code,
+      userId: options.userId ?? null,
       ...profile,
       imageUpdatedAt: profile.image ? new Date() : null,
       isHost: false,
     })
     .returning(playerColumns);
 
-  const rows = await listPlayers(code);
+  const narration = await latestNarration(code);
   return {
     ok: true,
     selfId: self.id,
-    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    lobby: await toState(
+      code,
+      [...existingPlayers, self],
+      lobby.roleCounts,
+      lobby.gameStarted,
+      narration,
+    ),
     resumed: false,
   };
 }
@@ -1372,6 +1676,7 @@ async function applyProfilePatch(
   code: string,
   playerId: string,
   patch: Partial<PlayerProfile>,
+  userId?: string | null,
 ): Promise<void> {
   const db = await getDb();
   const values: Record<string, unknown> = { lastSeen: new Date() };
@@ -1386,7 +1691,9 @@ async function applyProfilePatch(
   await db
     .update(players)
     .set(values)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 }
 
 export type StateOutcome =
@@ -1403,6 +1710,7 @@ export type StateOutcome =
 export async function getLobbyState(
   codeInput: string,
   playerId?: string,
+  userId?: string | null,
 ): Promise<StateOutcome> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return { status: "not_found" };
@@ -1412,7 +1720,14 @@ export async function getLobbyState(
   if (!lobby) return { status: "not_found" };
 
   await cleanupStalePlayers(code);
-  let rows = await listPlayers(code);
+  // Spielerliste und Game-Master-Text parallel laden – zwei Datenbank-
+  // Roundtrips zum Preis von einem. Das hält das Sekunden-Polling aller
+  // Spieler auch mit entfernter Datenbank (Neon) leicht und schnell.
+  const [initialRows, narration] = await Promise.all([
+    listPlayers(code),
+    latestNarration(code),
+  ]);
+  let rows = initialRows;
 
   if (rows.length === 0) {
     const age = Date.now() - lobby.createdAt.getTime();
@@ -1426,7 +1741,7 @@ export async function getLobbyState(
       ? { status: "not_member" }
       : {
           status: "ok",
-          state: toState(code, [], lobby.roleCounts, lobby.gameStarted),
+          state: await toState(code, [], lobby.roleCounts, lobby.gameStarted, narration),
         };
   }
 
@@ -1441,6 +1756,8 @@ export async function getLobbyState(
   if (playerId) {
     const self = rows.find((row) => row.id === playerId);
     if (!self) return { status: "not_member" };
+    // Mit Login: nur die eigene Spielfigur darf abgefragt werden.
+    if (userId && self.userId !== userId) return { status: "not_member" };
     if (Date.now() - self.lastSeen.getTime() > TOUCH_INTERVAL_MS) {
       await touchPlayer(code, playerId);
     }
@@ -1448,7 +1765,7 @@ export async function getLobbyState(
 
   return {
     status: "ok",
-    state: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    state: await toState(code, rows, lobby.roleCounts, lobby.gameStarted, narration),
   };
 }
 
@@ -1460,6 +1777,7 @@ export async function setGameStarted(
   codeInput: string,
   playerId: string,
   started: boolean,
+  userId?: string | null,
 ): Promise<boolean> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return false;
@@ -1473,6 +1791,7 @@ export async function setGameStarted(
         eq(players.id, playerId),
         eq(players.lobbyCode, code),
         eq(players.isHost, true),
+        ownerFilter(userId),
       ),
     );
   if (!host) return false;
@@ -1481,7 +1800,7 @@ export async function setGameStarted(
     .update(lobbies)
     .set({ gameStarted: started })
     .where(eq(lobbies.code, code));
-  await touchPlayer(code, playerId);
+  await touchPlayer(code, playerId, userId);
   return true;
 }
 
@@ -1490,6 +1809,7 @@ export async function updateProfile(
   code: string,
   playerId: string,
   profileInput: unknown,
+  userId?: string | null,
 ): Promise<boolean> {
   const patch = sanitizeProfilePatch(profileInput);
   if (patch.image !== undefined) {
@@ -1503,20 +1823,37 @@ export async function updateProfile(
   const updated = await db
     .update(players)
     .set(values)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)))
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    )
     .returning({ id: players.id });
   return updated.length > 0;
 }
 
 export type AvatarOutcome =
   | { ok: true; url: string | null }
-  | { ok: false; reason: "not_member" | "unsupported" | "too_large" };
+  | { ok: false; reason: "not_member" | "unsupported" | "too_large" | "storage" };
 
-/** Profilbild setzen oder entfernen (nur wenn es sich wirklich ändert). */
+const MIME_EXTENSION: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
+
+/**
+ * Profilbild setzen oder entfernen.
+ *
+ * Mit Neon Object Storage (AWS_* gesetzt) wandern die Bilddaten in den Bucket
+ * `assets` unter `avatars/<player-id>/<uuid>.<ext>`; in Postgres steht dann nur
+ * der Schlüssel (`image_key`). Ohne Bucket (lokale Entwicklung) bleibt es beim
+ * bisherigen Weg: Data-URL in der Spalte `image`.
+ */
 export async function updateAvatar(
   codeInput: string,
   playerId: string,
   imageInput: unknown,
+  userId?: string | null,
 ): Promise<AvatarOutcome> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return { ok: false, reason: "not_member" };
@@ -1526,52 +1863,102 @@ export async function updateAvatar(
 
   const db = await getDb();
   const [current] = await db
-    .select({ image: players.image, imageUpdatedAt: players.imageUpdatedAt })
+    .select({
+      image: players.image,
+      imageKey: players.imageKey,
+      imageUpdatedAt: players.imageUpdatedAt,
+    })
     .from(players)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
   if (!current) return { ok: false, reason: "not_member" };
 
-  if (current.image === parsed.image) {
-    // Unverändert: nur Lebenszeichen aktualisieren, keine 200 KB schreiben.
-    await touchPlayer(code, playerId);
-    return {
-      ok: true,
-      url: parsed.image && current.imageUpdatedAt
-        ? avatarUrl(playerId, current.imageUpdatedAt)
-        : null,
-    };
+  const version = new Date();
+
+  // Bild entfernen.
+  if (!parsed.image) {
+    if (current.imageKey) void deleteObject(current.imageKey);
+    await db
+      .update(players)
+      .set({ image: null, imageKey: null, imageUpdatedAt: null, lastSeen: version })
+      .where(
+        and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+      );
+    return { ok: true, url: null };
   }
 
-  const version = new Date();
+  if (!storageEnabled) {
+    if (current.image === parsed.image) {
+      // Unverändert: nur Lebenszeichen aktualisieren, keine 200 KB schreiben.
+      await touchPlayer(code, playerId, userId);
+      return {
+        ok: true,
+        url: current.imageUpdatedAt ? avatarUrl(playerId, current.imageUpdatedAt) : null,
+      };
+    }
+    await db
+      .update(players)
+      .set({ image: parsed.image, imageKey: null, imageUpdatedAt: version, lastSeen: version })
+      .where(
+        and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+      );
+    return { ok: true, url: avatarUrl(playerId, version) };
+  }
+
+  const decoded = decodeImage(parsed.image);
+  if (!decoded) return { ok: false, reason: "unsupported" };
+
+  // Jede Version bekommt einen eigenen Key (CDN/Browser-Cache bleibt gültig).
+  const key = `avatars/${playerId}/${version.getTime()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}.${MIME_EXTENSION[decoded.mime] ?? "bin"}`;
+  try {
+    await putObject(key, decoded.bytes, decoded.mime);
+  } catch (error) {
+    console.error("[storage] Profilbild konnte nicht hochgeladen werden", error);
+    return { ok: false, reason: "storage" };
+  }
+
   await db
     .update(players)
     .set({
-      image: parsed.image,
-      imageUpdatedAt: parsed.image ? version : null,
+      image: null,
+      imageKey: key,
+      imageUpdatedAt: version,
       lastSeen: version,
     })
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 
-  return { ok: true, url: parsed.image ? avatarUrl(playerId, version) : null };
+  if (current.imageKey && current.imageKey !== key) void deleteObject(current.imageKey);
+
+  return { ok: true, url: avatarUrl(playerId, version) };
 }
 
-/** Profilbild eines Spielers (Rohdaten für `GET /api/lobby/avatar`). */
+/**
+ * Profilbild eines Spielers für `GET /api/lobby/avatar`: entweder der
+ * Bucket-Schlüssel (Neon Object Storage) oder die Data-URL (Fallback).
+ */
 export async function getAvatar(
   playerId: string,
-): Promise<{ image: string } | null> {
+): Promise<{ image: string | null; imageKey: string | null } | null> {
   if (!playerId) return null;
   const db = await getDb();
   const [row] = await db
-    .select({ image: players.image })
+    .select({ image: players.image, imageKey: players.imageKey })
     .from(players)
     .where(eq(players.id, playerId));
-  return row?.image ? { image: row.image } : null;
+  if (!row || (!row.image && !row.imageKey)) return null;
+  return { image: row.image, imageKey: row.imageKey };
 }
 
 export async function updateRoleCounts(
   codeInput: string,
   playerId: string,
   roleCountsInput: unknown,
+  userId?: string | null,
 ): Promise<boolean> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return false;
@@ -1585,6 +1972,7 @@ export async function updateRoleCounts(
         eq(players.id, playerId),
         eq(players.lobbyCode, code),
         eq(players.isHost, true),
+        ownerFilter(userId),
       ),
     );
   if (!host) return false;
@@ -1593,21 +1981,36 @@ export async function updateRoleCounts(
     .update(lobbies)
     .set({ roleCounts: sanitizeRoleCounts(roleCountsInput) })
     .where(eq(lobbies.code, code));
-  await touchPlayer(code, playerId);
+  await touchPlayer(code, playerId, userId);
   return true;
 }
 
 export async function removePlayer(
   codeInput: string,
   playerId: string,
+  userId?: string | null,
 ): Promise<void> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6 || !playerId) return;
 
   const db = await getDb();
+
+  // Bild im Bucket mit aufräumen (best effort).
+  if (storageEnabled) {
+    const [row] = await db
+      .select({ imageKey: players.imageKey })
+      .from(players)
+      .where(
+        and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+      );
+    if (row?.imageKey) void deleteObject(row.imageKey);
+  }
+
   await db
     .delete(players)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 
   // Promote another player if the host left.
   const rows = await db
@@ -1668,10 +2071,15 @@ export default function RootLayout({ children }: { children: ReactNode }) {
 ## Datei: `src/app/page.tsx`
 
 ```tsx
+import { AuthGate } from "@/components/auth/auth-gate";
 import WerwolfApp from "@/components/werwolf/werwolf-app";
 
 export default function HomePage() {
-  return <WerwolfApp />;
+  return (
+    <AuthGate>
+      <WerwolfApp />
+    </AuthGate>
+  );
 }
 ```
 
@@ -1749,18 +2157,35 @@ import { sql } from "drizzle-orm";
 
 import { dbStatus, getDb, noteDbFailure, noteDbSuccess } from "@/db";
 import { json, route } from "@/lib/api";
+import { authEnabled } from "@/lib/auth/server";
+import { aiGatewayConfigured, gameMasterEnabled } from "@/lib/game-master";
+import { BUCKET, storageEnabled } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 
 /**
  * Health-Check (Render: `healthCheckPath: /api/health`). Prüft die Datenbank
- * wirklich an und zeigt an, welche Variante aktiv ist (`postgres` = externe
- * Datenbank aus DATABASE_URL, `pglite` = eingebettet). Fehlgeschlagene
- * Prüfungen lösen den automatischen Neuaufbau der Verbindung aus
- * (siehe src/db/index.ts).
+ * wirklich an und zeigt an, welche Variante aktiv ist (`provider: "neon"` =
+ * Neon-Datenbank aus DATABASE_URL, `"postgres"` = sonstige externe Datenbank,
+ * z. B. automatisch von Render provisioniert, `"pglite"` = eingebettet).
+ *
+ * Bewusst IMMER HTTP 200, solange der Server selbst lebt: Render würde die
+ * Instanz bei einem 503 sonst als „kaputt“ behandeln und neu starten – auch
+ * dann, wenn die Datenbank nur kurz aufwacht (Neon Scale-to-Zero) oder die
+ * Seite längst wieder funktioniert. Der eigentliche Zustand steht im Body
+ * (`ok`, `status.lastError`, …); eine fehlgeschlagene Prüfung löst zusätzlich
+ * den automatischen Neuaufbau der Verbindung aus (siehe src/db/index.ts).
  */
 export const GET = route("health", async () => {
   const started = Date.now();
+  const services = () => ({
+    postgres: dbStatus().mode,
+    provider: dbStatus().provider,
+    auth: authEnabled,
+    objectStorage: storageEnabled ? `bucket:${BUCKET}` : false,
+    aiGateway: aiGatewayConfigured,
+    functions: gameMasterEnabled,
+  });
   try {
     const db = await getDb();
     await db.execute(sql`select 1`);
@@ -1768,22 +2193,26 @@ export const GET = route("health", async () => {
     return json({
       ok: true,
       db: dbStatus().mode,
+      provider: dbStatus().provider,
       status: dbStatus(),
+      // Zeigt, welche Neon-Dienste verdrahtet sind (Neon Postgres, Auth,
+      // Object Storage, AI Gateway, Functions).
+      services: services(),
       latencyMs: Date.now() - started,
       uptimeSec: Math.round(process.uptime()),
     });
   } catch (error) {
     noteDbFailure(error);
     console.error("[api] health check failed", error);
-    return json(
-      {
-        ok: false,
-        db: dbStatus().mode,
-        status: dbStatus(),
-        latencyMs: Date.now() - started,
-      },
-      503,
-    );
+    return json({
+      ok: false,
+      db: dbStatus().mode,
+      provider: dbStatus().provider,
+      status: dbStatus(),
+      services: services(),
+      latencyMs: Date.now() - started,
+      uptimeSec: Math.round(process.uptime()),
+    });
   }
 });
 ```
@@ -1792,19 +2221,25 @@ export const GET = route("health", async () => {
 
 ```tsx
 import { json, readJson, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { createLobby } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
 export const POST = route("lobby:create", async (request) => {
+  // Lobby anlegen: mit konfiguriertem Neon Auth nur für angemeldete Spieler.
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const body = await readJson(request);
   // `code` + `playerId` (optional): Wiederherstellung – z. B. wenn die
-  // Render-Free-Instanz neu gestartet ist und die Lobby verloren ging, kann
-  // der Host sie mit DEMSELBEN Code wieder aufmachen und seine Freunde landen
-  // automatisch wieder drin.
+  // Instanz neu gestartet ist und die Lobby verloren ging, kann der Host sie
+  // mit DEMSELBEN Code wieder aufmachen und seine Freunde landen automatisch
+  // wieder drin.
   const result = await createLobby(String(body.mode ?? "WERWOLF"), body.profile, {
     code: typeof body.code === "string" ? body.code : undefined,
     playerId: typeof body.playerId === "string" ? body.playerId : undefined,
+    userId: guard.userId,
   });
 
   if (!result.ok) {
@@ -1823,17 +2258,22 @@ export const POST = route("lobby:create", async (request) => {
 
 ```tsx
 import { json, readJson, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { joinLobby } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
 export const POST = route("lobby:join", async (request) => {
+  // Beitreten: mit konfiguriertem Neon Auth nur für angemeldete Spieler.
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const body = await readJson(request);
   // `playerId` (optional): Reconnect – derselbe Spieler kommt in dieselbe
-  // Lobby zurück (z. B. nachdem der Tab im Hintergrund war oder die
-  // Render-Instanz kurz neu gestartet ist). Host-Rolle bleibt erhalten.
+  // Lobby zurück (z. B. nachdem der Tab im Hintergrund war). Host-Rolle bleibt.
   const result = await joinLobby(String(body.code ?? ""), body.profile, {
     playerId: typeof body.playerId === "string" ? body.playerId : undefined,
+    userId: guard.userId,
   });
 
   if (!result.ok) {
@@ -1855,16 +2295,20 @@ export const POST = route("lobby:join", async (request) => {
 
 ```tsx
 import { json, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { getLobbyState } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
 export const GET = route("lobby:state", async (request) => {
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const url = new URL(request.url);
   const code = url.searchParams.get("code") ?? "";
   const pid = url.searchParams.get("pid") ?? undefined;
 
-  const outcome = await getLobbyState(code, pid);
+  const outcome = await getLobbyState(code, pid, guard.userId);
   if (outcome.status === "not_found") {
     return json({ ok: false, reason: "not_found" }, 404);
   }
@@ -1879,16 +2323,21 @@ export const GET = route("lobby:state", async (request) => {
 
 ```tsx
 import { json, readJson, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { updateProfile } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
 export const POST = route("lobby:profile", async (request) => {
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const body = await readJson(request);
   const ok = await updateProfile(
     String(body.code ?? ""),
     String(body.playerId ?? ""),
     body.profile,
+    guard.userId,
   );
   if (!ok) {
     return json({ ok: false, reason: "not_member" }, 409);
@@ -1901,16 +2350,21 @@ export const POST = route("lobby:profile", async (request) => {
 
 ```tsx
 import { json, readJson, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { updateRoleCounts } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
 export const POST = route("lobby:roles", async (request) => {
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const body = await readJson(request);
   const ok = await updateRoleCounts(
     String(body.code ?? ""),
     String(body.playerId ?? ""),
     body.roleCounts,
+    guard.userId,
   );
   if (!ok) {
     return json({ ok: false, reason: "not_host" }, 403);
@@ -1923,16 +2377,21 @@ export const POST = route("lobby:roles", async (request) => {
 
 ```tsx
 import { json, readJson, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { setGameStarted } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
 export const POST = route("lobby:start", async (request) => {
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const body = await readJson(request);
   const ok = await setGameStarted(
     String(body.code ?? ""),
     String(body.playerId ?? ""),
     body.started !== false,
+    guard.userId,
   );
   if (!ok) {
     return json({ ok: false, reason: "not_host" }, 403);
@@ -1945,13 +2404,22 @@ export const POST = route("lobby:start", async (request) => {
 
 ```tsx
 import { json, readJson, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { removePlayer } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
 export const POST = route("lobby:leave", async (request) => {
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const body = await readJson(request);
-  await removePlayer(String(body.code ?? ""), String(body.playerId ?? ""));
+  await removePlayer(
+    String(body.code ?? ""),
+    String(body.playerId ?? ""),
+    // Ohne Login (lokale Entwicklung) wird wie bisher anhand der playerId gelöscht.
+    guard.userId,
+  );
   return json({ ok: true });
 });
 ```
@@ -1960,17 +2428,22 @@ export const POST = route("lobby:leave", async (request) => {
 
 ```tsx
 import { json, readJson, route } from "@/lib/api";
+import { requireUser } from "@/lib/auth/guard";
 import { decodeImage } from "@/lib/image";
 import { getAvatar, updateAvatar } from "@/lib/lobby-service";
+import { getObject } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 
 const UUID_RE = /^[0-9a-fA-F-]{36}$/;
 
 /**
- * Profilbild eines Spielers (Rohdaten). Die URL enthält eine Versionsnummer
- * (`v=…`), darf also lange im Browser-Cache liegen – dadurch muss das Bild
- * genau EINMAL geladen werden und nicht bei jeder Statusabfrage erneut.
+ * Profilbild eines Spielers. Die URL enthält eine Versionsnummer (`v=…`), darf
+ * also lange im Browser-Cache liegen – dadurch muss das Bild genau EINMAL
+ * geladen werden und nicht bei jeder Statusabfrage erneut.
+ *
+ * Mit Neon Object Storage liegen die Bilddaten im Bucket (`assets`) und werden
+ * hier serverseitig durchgereicht; ohne Bucket kommt die Data-URL aus Postgres.
  */
 export const GET = route("lobby:avatar:get", async (request) => {
   const pid = new URL(request.url).searchParams.get("pid") ?? "";
@@ -1979,18 +2452,41 @@ export const GET = route("lobby:avatar:get", async (request) => {
   }
 
   const found = await getAvatar(pid);
-  const decoded = found ? decodeImage(found.image) : null;
-  if (!decoded) {
+  if (!found) {
     return new Response("not found", {
       status: 404,
       headers: { "Cache-Control": "no-store, max-age=0" },
     });
   }
 
-  return new Response(decoded.bytes, {
+  let bytes: Uint8Array | null = null;
+  let mime = "application/octet-stream";
+
+  if (found.imageKey) {
+    const object = await getObject(found.imageKey);
+    if (object) {
+      bytes = object.bytes;
+      mime = object.contentType;
+    }
+  }
+  if (!bytes && found.image) {
+    const decoded = decodeImage(found.image);
+    if (decoded) {
+      bytes = decoded.bytes;
+      mime = decoded.mime;
+    }
+  }
+  if (!bytes) {
+    return new Response("not found", {
+      status: 404,
+      headers: { "Cache-Control": "no-store, max-age=0" },
+    });
+  }
+
+  return new Response(bytes as unknown as BodyInit, {
     headers: {
-      "Content-Type": decoded.mime,
-      "Content-Length": String(decoded.bytes.byteLength),
+      "Content-Type": mime,
+      "Content-Length": String(bytes.byteLength),
       "Cache-Control": "public, max-age=604800, immutable",
     },
   });
@@ -1998,11 +2494,15 @@ export const GET = route("lobby:avatar:get", async (request) => {
 
 /** Profilbild hochladen oder entfernen (`image: null`). */
 export const POST = route("lobby:avatar", async (request) => {
+  const guard = await requireUser();
+  if (!guard.ok) return guard.response;
+
   const body = await readJson(request);
   const result = await updateAvatar(
     String(body.code ?? ""),
     String(body.playerId ?? ""),
     body.image,
+    guard.userId,
   );
   if (!result.ok) {
     return json(
@@ -2032,6 +2532,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { GameMasterCard } from "@/components/werwolf/game-master-card";
 import { GlassCard } from "@/components/werwolf/glass-card";
 import { RoleIcon } from "@/components/werwolf/role-icon";
 import { SkyBackground } from "@/components/werwolf/sky-background";
@@ -2043,6 +2544,7 @@ import {
   colorWash,
   randomName,
   winCondition,
+  type LobbyNarration,
   type LobbyPlayer,
   type LobbyState,
   type PlayerProfile,
@@ -2277,6 +2779,8 @@ export default function WerwolfApp() {
   const [roleCounts, setRoleCounts] = useState<Record<string, number>>(defaultCounts);
   const [cardModalOpen, setCardModalOpen] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
+  /** Neuester AI-Game-Master-Text (kommt über das Lobby-Polling zu allen Spielern). */
+  const [narration, setNarration] = useState<LobbyNarration | null>(null);
   const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [slowHint, setSlowHint] = useState<string | null>(null);
@@ -2373,6 +2877,7 @@ export default function WerwolfApp() {
     setPlayers(state.players);
     setRoleCounts(state.roleCounts);
     setGameStarted(Boolean(state.gameStarted));
+    setNarration(state.narration ?? null);
     setSelfId((current) => {
       if (current) {
         const self = state.players.find((p) => p.id === current);
@@ -3622,6 +4127,13 @@ export default function WerwolfApp() {
                     Keine besonderen Regeln festgelegt.
                   </p>
                 </GlassCard>
+                <GameMasterCard
+                  code={lobbyCode}
+                  playerId={selfId}
+                  gameStarted={gameStarted}
+                  narration={narration}
+                  onNarration={setNarration}
+                />
                 {isHost ? (
                   gameStarted ? (
                     <div className="flex flex-col gap-2">
