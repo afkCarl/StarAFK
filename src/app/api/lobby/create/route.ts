@@ -1,16 +1,26 @@
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { createLobby } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const result = await createLobby(String(body?.mode ?? "WERWOLF"), body?.profile);
-    return NextResponse.json({ ok: true, selfId: result.selfId, lobby: result.lobby });
-  } catch (error) {
-    console.error("lobby:create failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:create", async (request) => {
+  const body = await readJson(request);
+  // `code` + `playerId` (optional): Wiederherstellung – z. B. wenn die
+  // Render-Free-Instanz neu gestartet ist und die Lobby verloren ging, kann
+  // der Host sie mit DEMSELBEN Code wieder aufmachen und seine Freunde landen
+  // automatisch wieder drin.
+  const result = await createLobby(String(body.mode ?? "WERWOLF"), body.profile, {
+    code: typeof body.code === "string" ? body.code : undefined,
+    playerId: typeof body.playerId === "string" ? body.playerId : undefined,
+  });
+
+  if (!result.ok) {
+    return json({ ok: false, reason: result.reason }, 409);
   }
-}
+  return json({
+    ok: true,
+    selfId: result.selfId,
+    reused: result.reused,
+    lobby: result.lobby,
+  });
+});

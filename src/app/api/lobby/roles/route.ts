@@ -1,20 +1,17 @@
-import { NextResponse } from "next/server";
-
+import { json, readJson, route } from "@/lib/api";
 import { updateRoleCounts } from "@/lib/lobby-service";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const ok = await updateRoleCounts(
-      String(body?.code ?? ""),
-      String(body?.playerId ?? ""),
-      body?.roleCounts,
-    );
-    return NextResponse.json({ ok });
-  } catch (error) {
-    console.error("lobby:updateRoles failed", error);
-    return NextResponse.json({ ok: false }, { status: 500 });
+export const POST = route("lobby:roles", async (request) => {
+  const body = await readJson(request);
+  const ok = await updateRoleCounts(
+    String(body.code ?? ""),
+    String(body.playerId ?? ""),
+    body.roleCounts,
+  );
+  if (!ok) {
+    return json({ ok: false, reason: "not_host" }, 403);
   }
-}
+  return json({ ok: true });
+});

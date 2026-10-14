@@ -18,10 +18,14 @@ const TEXT_FILES = [
   "tsconfig.json",
   "drizzle.config.json",
   "postcss.config.mjs",
+  "render.yaml",
+  "src/instrumentation.ts",
   "src/db/index.ts",
   "src/db/migrate.ts",
   "src/db/schema.ts",
+  "src/lib/api.ts",
   "src/lib/game.ts",
+  "src/lib/image.ts",
   "src/lib/lobby-service.ts",
   "src/app/layout.tsx",
   "src/app/page.tsx",
@@ -34,6 +38,7 @@ const TEXT_FILES = [
   "src/app/api/lobby/roles/route.ts",
   "src/app/api/lobby/start/route.ts",
   "src/app/api/lobby/leave/route.ts",
+  "src/app/api/lobby/avatar/route.ts",
   "src/components/werwolf/werwolf-app.tsx",
   "src/components/werwolf/sky-background.tsx",
   "src/components/werwolf/walking-cat.tsx",
@@ -99,9 +104,12 @@ sections.push(`# Werwolf Lobby — Vollständiger Quellcode
 > 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig, die App läuft
 >    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne \`DATABASE_URL\` wird
 >    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in \`.data/\` angelegt.
-> 5. Optional: \`.env\` mit \`DATABASE_URL=postgresql://…\` für eine externe
->    PostgreSQL-Datenbank — die Tabellen werden ebenfalls automatisch angelegt
->    (kein \`drizzle-kit push\` nötig).
+> 5. Optional (empfohlen auf Render): \`.env\` bzw. Umgebungsvariable
+>    \`DATABASE_URL=postgresql://…\` für eine externe PostgreSQL-Datenbank — die
+>    Tabellen werden ebenfalls automatisch angelegt (kein \`drizzle-kit push\`).
+>    Ohne \`DATABASE_URL\` läuft die App eingebettet (PGlite); auf Render-Free-
+>    Instanzen ist das Dateisystem flüchtig, Lobbys sind dann nach einem
+>    Neustart weg (die Lobby wird automatisch mit gleichem Code neu geöffnet).
 
 ## Projektübersicht
 
@@ -119,9 +127,17 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **15 Rollen** (Teams gut/böse/neutral) mit Beschreibung, Gewinnkondition und
   Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: \`?code=ABCDEF\` öffnet das Beitreten-Feld vorausgefüllt.
-- **Realtime**: REST-Polling (1,2 s) + Heartbeat-Cleanup (15 s), automatische
-  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM. „Spiel starten"
-  (Host) synchronisiert den Spielstart in Echtzeit an alle Spieler.
+- **Realtime**: REST-Polling (1,2 s sichtbar / 20 s im Hintergrund-Tab),
+  Lebenszeichen-Fenster 120 s, automatischer **Reconnect/Resume** (gleiche
+  Spieler-ID, Host-Rolle bleibt), automatische Host-Nachfolge, Lobbys/Spieler in
+  PostgreSQL via Drizzle ORM. „Spiel starten" (Host) synchronisiert den
+  Spielstart in Echtzeit an alle Spieler.
+- **Profilbilder**: im Browser auf max. 256 px verkleinert, liegen in der
+  Datenbank und werden über \`GET /api/lobby/avatar?pid=…&v=…\` mit langem
+  Browser-Cache ausgeliefert (winziges Polling statt Megabyte-Payloads).
+- **Robuste Datenbank**: Verbindung baut sich bei Fehlern automatisch neu auf
+  (\`src/db/index.ts\`), PGlite fällt bei Problemen mit dem Datenordner in den
+  Speicher-Modus zurück; \`/api/health\` zeigt Modus, Speicherart und Fehlerzähler.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 

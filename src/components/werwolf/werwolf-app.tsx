@@ -45,6 +45,30 @@ type Screen = "menu" | "menuLeaving" | "lobbyEntering" | "lobby";
 type SlidePhase = "idle" | "start" | "go";
 type JoinPanel = "closed" | "opening" | "open" | "closing";
 type Direction = "left" | "right";
+type ConnectionState = "ok" | "reconnecting";
+
+/** Laufende Sitzung (Lobbycode + eigene Spieler-ID) – übersteht ein Neuladen. */
+const SESSION_KEY = "werwolf-lobby-session";
+/** Poll-Intervalle: aktiv sichtbar / Tab im Hintergrund (Browser drosseln dort). */
+const POLL_ACTIVE_MS = 1_200;
+const POLL_HIDDEN_MS = 20_000;
+/** Nach so vielen Fehlversuchen in Folge gilt die Lobby als verloren. */
+const MAX_POLL_FAILURES = 8;
+/** Profilbilder werden im Browser verkleinert, damit sie schnell übertragen werden. */
+const AVATAR_MAX_SIZE = 256;
+const AVATAR_MAX_CHARS = 380_000;
+
+type ApiResult<T> =
+  | { ok: true; status: number; data: T }
+  | { ok: false; status: number; reason: string };
+
+interface LobbyResponse {
+  ok: boolean;
+  selfId: string;
+  lobby: LobbyState;
+  resumed?: boolean;
+  reason?: string;
+}
 
 function loadStoredProfile<K extends keyof PlayerProfile>(
   key: K,
@@ -55,6 +79,157 @@ function loadStoredProfile<K extends keyof PlayerProfile>(
     return stored[key] ?? fallback;
   } catch {
     return fallback;
+  }
+}
+
+function saveSession(code: string, playerId: string): void {
+  try {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify({ code, playerId }));
+  } catch {
+    /* Privater Modus o. Ä. – Sitzung geht dann beim Neuladen verloren. */
+  }
+}
+
+function loadSession(): { code: string; playerId: string } | null {
+  try {
+    const parsed: unknown = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const { code, playerId } = parsed as { code?: unknown; playerId?: unknown };
+    if (typeof code !== "string" || typeof playerId !== "string") return null;
+    if (code.length !== 6 || playerId.length < 8) return null;
+    return { code, playerId };
+  } catch {
+    return null;
+  }
+}
+
+function clearSession(): void {
+  try {
+    sessionStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* egal */
+  }
+}
+
+/**
+ * Schlanker API-Aufruf mit Zeitlimit. Wichtig für Render-Free-Instanzen:
+ * Ohne Zeitlimit hängt die Oberfläche bei einem eingeschlafenen Server ewig,
+ * statt eine verständliche Meldung zu zeigen.
+ */
+async function apiRequest<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 15_000,
+): Promise<ApiResult<T>> {
+  try {
+    // `AbortSignal.timeout` gibt es in älteren Safari-Versionen nicht – dann
+    // läuft die Anfrage eben ohne Zeitlimit weiter (der Server antwortet
+    // dank eigener Limits trotzdem schnell).
+    const signal =
+      typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(timeoutMs)
+        : undefined;
+    const response = await fetch(path, {
+      ...init,
+      cache: "no-store",
+      headers: {
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...((init?.headers as Record<string, string> | undefined) ?? {}),
+      },
+      ...(signal ? { signal } : {}),
+    });
+    const parsed: unknown = await response.json().catch(() => null);
+    const data = (typeof parsed === "object" && parsed !== null ? parsed : {}) as T & {
+      reason?: string;
+    };
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        reason: data.reason ?? (response.status >= 500 ? "server" : "error"),
+      };
+    }
+    return { ok: true, status: response.status, data };
+  } catch (error) {
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+    return { ok: false, status: 0, reason: timedOut ? "timeout" : "network" };
+  }
+}
+
+/** Netzwerk-/Serverhänger dürfen wiederholt werden – Fehlentscheidungen nicht. */
+function isTransient(reason: string): boolean {
+  return (
+    reason === "network" ||
+    reason === "timeout" ||
+    reason === "server" ||
+    reason === "db"
+  );
+}
+
+/**
+ * Auf Render braucht die erste Anfrage nach dem Einschlafen deutlich länger
+ * (oder läuft in einen 502, während der Server noch startet). Deshalb werden
+ * vorübergehende Fehler automatisch wiederholt – der Spieler merkt nur, dass
+ * es ein paar Sekunden dauert.
+ */
+async function withTransientRetry<T>(
+  run: () => Promise<ApiResult<T>>,
+  attempts = 3,
+  delayMs = 2_500,
+): Promise<ApiResult<T>> {
+  let last: ApiResult<T> | null = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    last = await run();
+    if (last.ok || !isTransient(last.reason)) return last;
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return last as ApiResult<T>;
+}
+
+export async function shrinkAvatar(file: File): Promise<string | null> {
+  const original = await new Promise<string | null>((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () =>
+      resolve(typeof reader.result === "string" ? reader.result : null);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+  if (!original) return null;
+
+  try {
+    const image = await new Promise<HTMLImageElement | null>((resolve) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => resolve(null);
+      element.src = original;
+    });
+    if (!image) return original.length <= AVATAR_MAX_CHARS ? original : null;
+
+    const scale = Math.min(
+      1,
+      AVATAR_MAX_SIZE / Math.max(image.width || 1, image.height || 1),
+    );
+    const width = Math.max(1, Math.round((image.width || 1) * scale));
+    const height = Math.max(1, Math.round((image.height || 1) * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) return original.length <= AVATAR_MAX_CHARS ? original : null;
+    // Weißer Hintergrund: PNG-Transparenz wird sonst beim JPEG schwarz.
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+
+    for (const quality of [0.85, 0.7, 0.55]) {
+      const shrunk = canvas.toDataURL("image/jpeg", quality);
+      if (shrunk.length <= AVATAR_MAX_CHARS) return shrunk;
+    }
+    return original.length <= AVATAR_MAX_CHARS ? original : null;
+  } catch {
+    return original.length <= AVATAR_MAX_CHARS ? original : null;
   }
 }
 
@@ -85,6 +260,9 @@ export default function WerwolfApp() {
   const [gameStarted, setGameStarted] = useState(false);
   const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [slowHint, setSlowHint] = useState<string | null>(null);
+  const [connection, setConnection] = useState<ConnectionState>("ok");
+  const [profileLoaded, setProfileLoaded] = useState(false);
 
   // Deterministische Initialwerte; localStorage wird nach dem Mount geladen,
   // damit Server-Render und Hydration identisch sind (Multi-Tab-sicher).
@@ -104,6 +282,12 @@ export default function WerwolfApp() {
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lobbyCodeRef = useRef("");
   const selfIdRef = useRef<string | null>(null);
+  const pollFailuresRef = useRef(0);
+  const resumeRef = useRef<Promise<boolean> | null>(null);
+  const isHostRef = useRef(true);
+  const modeRef = useRef(MODES[0]);
+  const profileRef = useRef<PlayerProfile | null>(null);
+  const lastAvatarRef = useRef<string | null>(null);
 
   lobbyCodeRef.current = lobbyCode;
   selfIdRef.current = selfId;
@@ -115,6 +299,15 @@ export default function WerwolfApp() {
     setFadeIntensity(loadStoredProfile("fadeIntensity", 50));
     setFrame(loadStoredProfile("frame", "none"));
     setImage(loadStoredProfile("image", null));
+    setProfileLoaded(true);
+  }, []);
+
+  // Server beim Laden der Seite „aufwecken“. Render-Free-Instanzen schlafen
+  // nach Inaktivität ein – der erste Aufruf dauert dann ~30 s. Wenn das
+  // parallel zum Ausfüllen der Spielerkarte passiert, fühlt sich danach
+  // „Lobby erstellen" sofort an.
+  useEffect(() => {
+    void apiRequest("/api/health", undefined, 60_000);
   }, []);
 
   // Einladungslinks (?code=ABCDEF) öffnen das Beitreten-Feld vorausgefüllt —
@@ -154,6 +347,7 @@ export default function WerwolfApp() {
     }),
     [name, color, fadeIntensity, frame, image],
   );
+  profileRef.current = profile;
 
   const applyState = (state: LobbyState) => {
     setLobbyCode(state.code);
@@ -169,66 +363,269 @@ export default function WerwolfApp() {
     });
   };
 
-  // Poll lobby state while inside a lobby (replaces the original socket push).
+  // Lobby-Zustand pollen – mit automatischem Reconnect. Ein einzelner Fehler
+  // (Free-Instanz wacht gerade auf, Tab war im Hintergrund, kurzer Hänger)
+  // wirft niemanden mehr aus der Lobby: erst wird still wieder beigetreten,
+  // erst nach vielen Fehlern in Folge gibt es eine Meldung.
   useEffect(() => {
     if (screen !== "lobby" && screen !== "lobbyEntering") return;
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-    const poll = async () => {
-      const code = lobbyCodeRef.current;
-      const pid = selfIdRef.current;
-      if (!code || !pid) return;
-      try {
-        const res = await fetch(
-          `/api/lobby/state?code=${encodeURIComponent(code)}&pid=${encodeURIComponent(pid)}`,
-          { cache: "no-store" },
-        );
-        if (cancelled) return;
-        if (!res.ok) {
-          setScreen("menu");
-          setSelfId(null);
-          setPlayers([]);
-          setActionError(
-            "Die Lobby ist nicht mehr verfügbar – sie wurde geschlossen oder du wurdest entfernt.",
-          );
-          return;
-        }
-        const data = await res.json();
-        if (!cancelled && data?.ok) applyState(data.state as LobbyState);
-      } catch {
-        /* keep polling */
-      }
+    const nextDelay = () => (document.hidden ? POLL_HIDDEN_MS : POLL_ACTIVE_MS);
+
+    const schedule = (ms: number) => {
+      if (cancelled) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => void run(), ms);
     };
 
-    poll();
-    const interval = setInterval(poll, 1200);
+    const leaveLobbyWithMessage = (message: string) => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      clearSession();
+      pollFailuresRef.current = 0;
+      setConnection("ok");
+      setScreen("menu");
+      setSelfId(null);
+      setLobbyCode("");
+      setPlayers([]);
+      setActionError(message);
+    };
+
+    // Reconnect: derselbe Spieler kommt mit derselben ID zurück – die
+    // Host-Rolle bleibt dabei erhalten.
+    const resume = (code: string, pid: string): Promise<boolean> => {
+      if (resumeRef.current) return resumeRef.current;
+      const attempt = (async () => {
+        const res = await apiRequest<LobbyResponse>(
+          "/api/lobby/join",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              code,
+              playerId: pid,
+              profile: profileRef.current,
+            }),
+          },
+          20_000,
+        );
+        if (cancelled || !res.ok || !res.data.ok) return false;
+        applyState(res.data.lobby);
+        setSelfId(res.data.selfId);
+        setConnection("ok");
+        return true;
+      })().finally(() => {
+        resumeRef.current = null;
+      });
+      resumeRef.current = attempt;
+      return attempt;
+    };
+
+    // Lobby ist verschwunden (z. B. Render-Instanz neu gestartet). Der Host
+    // öffnet sie mit demselben Code neu – die Freunde landen über ihr
+    // Resume-Polling automatisch wieder drin.
+    const recreate = async (code: string, pid: string): Promise<boolean> => {
+      const res = await apiRequest<LobbyResponse>(
+        "/api/lobby/create",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            mode: modeRef.current.title,
+            code,
+            playerId: pid,
+            profile: profileRef.current,
+          }),
+        },
+        25_000,
+      );
+      if (cancelled || !res.ok || !res.data.ok) return false;
+      applyState(res.data.lobby);
+      setSelfId(res.data.selfId);
+      saveSession(res.data.lobby.code, res.data.selfId);
+      setConnection("ok");
+      return true;
+    };
+
+    const run = async () => {
+      const code = lobbyCodeRef.current;
+      const pid = selfIdRef.current;
+      if (!code || !pid) {
+        schedule(nextDelay());
+        return;
+      }
+
+      const res = await apiRequest<{
+        ok: boolean;
+        state?: LobbyState;
+        reason?: string;
+      }>(
+        `/api/lobby/state?code=${encodeURIComponent(code)}&pid=${encodeURIComponent(pid)}`,
+        undefined,
+        15_000,
+      );
+      if (cancelled) return;
+
+      if (res.ok && res.data.ok && res.data.state) {
+        pollFailuresRef.current = 0;
+        setConnection("ok");
+        applyState(res.data.state);
+        schedule(nextDelay());
+        return;
+      }
+
+      const reason = res.ok ? "server" : res.reason;
+      if (reason === "not_member" || reason === "not_found") {
+        const back = await resume(code, pid);
+        if (cancelled) return;
+        if (back) {
+          pollFailuresRef.current = 0;
+          schedule(nextDelay());
+          return;
+        }
+        if (reason === "not_found" && isHostRef.current) {
+          const recovered = await recreate(code, pid);
+          if (cancelled) return;
+          if (recovered) {
+            pollFailuresRef.current = 0;
+            schedule(nextDelay());
+            return;
+          }
+        }
+      }
+
+      pollFailuresRef.current += 1;
+      setConnection("reconnecting");
+      if (pollFailuresRef.current >= MAX_POLL_FAILURES) {
+        leaveLobbyWithMessage(
+          "Die Verbindung zur Lobby ist verloren gegangen (Server oder Datenbank nicht erreichbar). Bitte erstelle eine neue Lobby oder tritt dem Code erneut bei.",
+        );
+        return;
+      }
+      schedule(Math.min(6_000, 800 * pollFailuresRef.current));
+    };
+
+    void run();
+
+    // Zurück im Tab: sofort aktualisieren statt bis zum nächsten Intervall warten.
+    const onVisibility = () => {
+      if (document.hidden) return;
+      pollFailuresRef.current = 0;
+      setConnection("ok");
+      void run();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
 
-  // Push profile changes (debounced) while inside a lobby.
+  // Profiländerungen (Name, Farbe, Rahmen) gebündelt übertragen – absichtlich
+  // OHNE Bild: das läuft über /api/lobby/avatar, damit die Payload pro
+  // Tastendruck klein bleibt.
   useEffect(() => {
-    if (screen === "lobby" || screen === "lobbyEntering") {
-      const timeout = setTimeout(() => {
-        const code = lobbyCodeRef.current;
-        const pid = selfIdRef.current;
-        if (!code || !pid) return;
-        fetch("/api/lobby/profile", {
+    if (screen !== "lobby" && screen !== "lobbyEntering") return;
+    const timeout = setTimeout(() => {
+      const code = lobbyCodeRef.current;
+      const pid = selfIdRef.current;
+      if (!code || !pid) return;
+      void apiRequest(
+        "/api/lobby/profile",
+        {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code, playerId: pid, profile }),
-        }).catch(() => {});
-      }, 150);
-      return () => clearTimeout(timeout);
-    }
+          body: JSON.stringify({
+            code,
+            playerId: pid,
+            profile: {
+              name: profile.name,
+              color: profile.color,
+              fadeIntensity: profile.fadeIntensity,
+              frame: profile.frame,
+            },
+          }),
+        },
+        12_000,
+      );
+    }, 250);
+    return () => clearTimeout(timeout);
   }, [profile, screen]);
 
-  // Leave the lobby when the tab is closed.
+  // Neues Profilbild übertragen – nur wenn es sich wirklich geändert hat.
   useEffect(() => {
-    const handler = () => {
+    if (screen !== "lobby" && screen !== "lobbyEntering") return;
+    const code = lobbyCodeRef.current;
+    const pid = selfIdRef.current;
+    if (!code || !pid || lastAvatarRef.current === image) return;
+    const timeout = setTimeout(() => {
+      void apiRequest<{ ok: boolean; url: string | null }>(
+        "/api/lobby/avatar",
+        { method: "POST", body: JSON.stringify({ code, playerId: pid, image }) },
+        30_000,
+      ).then((res) => {
+        if (res.ok && res.data.ok) {
+          lastAvatarRef.current = image;
+        } else if (!res.ok && res.reason !== "not_member") {
+          setActionError(
+            "Profilbild konnte nicht gespeichert werden. Bitte versuche es erneut.",
+          );
+        }
+      });
+    }, 400);
+    return () => clearTimeout(timeout);
+  }, [image, screen]);
+
+  // Sitzung wiederherstellen: Nach einem Neuladen (Handy-Tab, versehentliches
+  // Aktualisieren) landet man automatisch wieder in derselben Lobby.
+  useEffect(() => {
+    if (!profileLoaded) return;
+    const session = loadSession();
+    if (!session || lobbyCodeRef.current || selfIdRef.current) return;
+    let cancelled = false;
+    void (async () => {
+      const res = await apiRequest<LobbyResponse>(
+        "/api/lobby/join",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            code: session.code,
+            playerId: session.playerId,
+            profile: profileRef.current,
+          }),
+        },
+        25_000,
+      );
+      if (cancelled) return;
+      if (res.ok && res.data.ok) {
+        const self = res.data.lobby.players.find((p) => p.id === res.data.selfId);
+        lastAvatarRef.current = profileRef.current?.image ?? null;
+        saveSession(res.data.lobby.code, res.data.selfId);
+        enterLobby(
+          res.data.lobby.code,
+          res.data.lobby.players,
+          self?.isHost ?? false,
+          res.data.selfId,
+          res.data.lobby.roleCounts,
+          Boolean(res.data.lobby.gameStarted),
+        );
+      } else {
+        clearSession();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileLoaded]);
+
+  // Beim Schließen des Tabs abmelden. Die Lobby selbst bleibt bestehen –
+  // ein versehentliches Neuladen kann so wieder in dieselbe Runde finden.
+  useEffect(() => {
+    const handler = (event: PageTransitionEvent) => {
+      if (event.persisted) return; // nur bfcache – Seite lebt weiter
       const code = lobbyCodeRef.current;
       const pid = selfIdRef.current;
       if (!code || !pid) return;
@@ -254,14 +651,23 @@ export default function WerwolfApp() {
 
   const handleImageUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = () => setImage(String(reader.result));
-      reader.readAsDataURL(file);
+    event.target.value = "";
+    if (!file) return;
+    // Im Browser verkleinern (max. 256 px, JPEG) – dadurch sind Profilbilder
+    // nur wenige Kilobyte groß und die Lobby bleibt schnell.
+    const shrunk = await shrinkAvatar(file);
+    if (!shrunk) {
+      setActionError(
+        "Dieses Bild konnte nicht verarbeitet werden. Bitte versuche ein anderes (JPG/PNG).",
+      );
+      return;
     }
+    setImage(shrunk);
   };
 
   const mode = MODES[modeIndex];
+  modeRef.current = mode;
+  isHostRef.current = isHost;
   const prevMode = prevModeIndex !== null ? MODES[prevModeIndex] : null;
   const modeLabel = mode.title === "WERWOLF" ? "Werwolf (Standard)" : mode.title;
   const modeShort = mode.title === "WERWOLF" ? "WW" : mode.title.slice(0, 2);
@@ -324,6 +730,13 @@ export default function WerwolfApp() {
     setPlayers(lobbyPlayers);
     setRoleCounts(counts);
     setGameStarted(started);
+    setConnection("ok");
+    setActionError(null);
+    pollFailuresRef.current = 0;
+    // Sitzung merken (übersteht ein Neuladen) und das Profilbild als bereits
+    // übertragen markieren.
+    saveSession(code, id);
+    lastAvatarRef.current = profileRef.current?.image ?? null;
     setScreen("menuLeaving");
     leaveTimerRef.current = setTimeout(() => {
       setScreen("lobbyEntering");
@@ -331,7 +744,22 @@ export default function WerwolfApp() {
     }, 440);
   };
 
-  const handleCreate = () => {
+  /** Langsame Free-Instanzen: nach ein paar Sekunden einen Hinweis zeigen. */
+  const withSlowHint = async <T,>(
+    message: string,
+    run: () => Promise<T>,
+  ): Promise<T> => {
+    setSlowHint(null);
+    const timer = setTimeout(() => setSlowHint(message), 3_500);
+    try {
+      return await run();
+    } finally {
+      clearTimeout(timer);
+      setSlowHint(null);
+    }
+  };
+
+  const handleCreate = async () => {
     if (screen !== "menu" || modeLocked || busy) return;
     if (mode.title !== "WERWOLF") return;
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
@@ -341,32 +769,48 @@ export default function WerwolfApp() {
     setRoleModalOpen(false);
     setActionError(null);
     setBusy("create");
-    fetch("/api/lobby/create", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: mode.title, profile }),
-    })
-      .then(async (res) => {
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data?.ok) throw new Error("create failed");
-        enterLobby(
-          data.lobby.code,
-          data.lobby.players,
-          true,
-          data.selfId,
-          data.lobby.roleCounts,
-          Boolean(data.lobby.gameStarted),
-        );
-      })
-      .catch(() => {
-        setActionError(
-          "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
-        );
-      })
-      .finally(() => setBusy(null));
+    try {
+      const res = await withSlowHint(
+        "Der Server startet gerade (Free-Instanz) – das dauert beim ersten Mal bis zu 30 Sekunden …",
+        () =>
+          withTransientRetry(() =>
+            apiRequest<LobbyResponse>(
+              "/api/lobby/create",
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  mode: mode.title,
+                  profile: profileRef.current,
+                }),
+              },
+              35_000,
+            ),
+          ),
+      );
+      if (!res.ok || !res.data.ok) {
+        throw new Error(res.ok ? "server" : res.reason);
+      }
+      enterLobby(
+        res.data.lobby.code,
+        res.data.lobby.players,
+        true,
+        res.data.selfId,
+        res.data.lobby.roleCounts,
+        Boolean(res.data.lobby.gameStarted),
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "server";
+      setActionError(
+        isTransient(reason)
+          ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
+          : "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+      );
+    } finally {
+      setBusy(null);
+    }
   };
 
-  const handleJoin = () => {
+  const handleJoin = async () => {
     if (screen !== "menu" || modeLocked || busy) return;
     if (joinCode.length !== 6) {
       setActionError("Bitte gib einen 6-stelligen Lobbycode ein (A–Z).");
@@ -377,72 +821,115 @@ export default function WerwolfApp() {
     setRoleModalOpen(false);
     setActionError(null);
     setBusy("join");
-    fetch("/api/lobby/join", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: joinCode, profile }),
-    })
-      .then(async (res) => {
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data?.ok) {
-          if (data?.reason === "full") {
-            throw new Error("full");
-          }
-          throw new Error("not_found");
-        }
-        const self = (data.lobby.players as LobbyPlayer[]).find(
-          (p) => p.id === data.selfId,
-        );
-        setJoinPanel("closed");
-        setJoinCode("");
-        enterLobby(
-          data.lobby.code,
-          data.lobby.players,
-          self?.isHost || false,
-          data.selfId,
-          data.lobby.roleCounts,
-          Boolean(data.lobby.gameStarted),
-        );
-      })
-      .catch((error: unknown) => {
-        const message =
-          error instanceof Error && error.message === "full"
-            ? "Die Lobby ist leider voll (max. 12 Spieler)."
-            : error instanceof Error && error.message === "not_found"
-              ? "Lobby mit diesem Code wurde nicht gefunden."
-              : "Beitreten fehlgeschlagen – der Server ist gerade nicht erreichbar.";
-        setActionError(message);
-      })
-      .finally(() => setBusy(null));
+    try {
+      const res = await withSlowHint(
+        "Der Server startet gerade (Free-Instanz) – das dauert beim ersten Mal bis zu 30 Sekunden …",
+        () =>
+          withTransientRetry(() =>
+            apiRequest<LobbyResponse>(
+              "/api/lobby/join",
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  code: joinCode,
+                  profile: profileRef.current,
+                }),
+              },
+              35_000,
+            ),
+          ),
+      );
+      if (!res.ok || !res.data.ok) {
+        throw new Error(res.ok ? "server" : res.reason);
+      }
+      const self = res.data.lobby.players.find((p) => p.id === res.data.selfId);
+      setJoinPanel("closed");
+      setJoinCode("");
+      enterLobby(
+        res.data.lobby.code,
+        res.data.lobby.players,
+        self?.isHost || false,
+        res.data.selfId,
+        res.data.lobby.roleCounts,
+        Boolean(res.data.lobby.gameStarted),
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "server";
+      setActionError(
+        reason === "full"
+          ? "Die Lobby ist leider voll (max. 12 Spieler)."
+          : reason === "not_found"
+            ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
+            : isTransient(reason)
+              ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
+              : "Beitreten fehlgeschlagen – bitte versuche es erneut.",
+      );
+    } finally {
+      setBusy(null);
+    }
   };
 
-  const handleStartGame = (started: boolean) => {
+  const handleStartGame = async (started: boolean) => {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid || busy) return;
     setActionError(null);
     setBusy("start");
-    fetch("/api/lobby/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, playerId: pid, started }),
-    })
-      .then(async (res) => {
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data?.ok) throw new Error("start failed");
-        setGameStarted(started);
-      })
-      .catch(() => {
-        setActionError(
-          started
-            ? "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
-            : "Das Spiel konnte nicht zurückgesetzt werden.",
-        );
-      })
-      .finally(() => setBusy(null));
+    try {
+      const res = await apiRequest(
+        "/api/lobby/start",
+        {
+          method: "POST",
+          body: JSON.stringify({ code, playerId: pid, started }),
+        },
+        15_000,
+      );
+      if (!res.ok) throw new Error(res.reason);
+      setGameStarted(started);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "server";
+      setActionError(
+        started
+          ? isTransient(reason)
+            ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
+            : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+          : "Das Spiel konnte nicht zurückgesetzt werden.",
+      );
+    } finally {
+      setBusy(null);
+    }
   };
 
-  const changeRoleCount = (roleName: string, delta: number) => {
+  /** Lobby bewusst verlassen (Button) – ganz normal zurück ins Menü. */
+  const handleLeaveLobby = () => {
+    const code = lobbyCodeRef.current;
+    const pid = selfIdRef.current;
+    clearSession();
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current);
+    enterTimerRef.current = null;
+    leaveTimerRef.current = null;
+    setScreen("menu");
+    setSelfId(null);
+    setLobbyCode("");
+    setPlayers([]);
+    setConnection("ok");
+    pollFailuresRef.current = 0;
+    lastAvatarRef.current = null;
+    if (code && pid) {
+      const body = new Blob([JSON.stringify({ code, playerId: pid })], {
+        type: "application/json",
+      });
+      if (!navigator.sendBeacon?.("/api/lobby/leave", body)) {
+        void apiRequest("/api/lobby/leave", {
+          method: "POST",
+          body: JSON.stringify({ code, playerId: pid }),
+        });
+      }
+    }
+  };
+
+  const changeRoleCount = async (roleName: string, delta: number) => {
     if (!isHost) return;
     const next = {
       ...roleCounts,
@@ -452,11 +939,19 @@ export default function WerwolfApp() {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid) return;
-    fetch("/api/lobby/roles", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, playerId: pid, roleCounts: next }),
-    }).catch(() => {});
+    const res = await apiRequest(
+      "/api/lobby/roles",
+      { method: "POST", body: JSON.stringify({ code, playerId: pid, roleCounts: next }) },
+      12_000,
+    );
+    if (!res.ok && isTransient(res.reason)) {
+      // Einmal nachfassen – kurze Hänger der Free-Instanz sind normal.
+      await apiRequest(
+        "/api/lobby/roles",
+        { method: "POST", body: JSON.stringify({ code, playerId: pid, roleCounts: next }) },
+        12_000,
+      );
+    }
   };
 
   // --- animation helpers -------------------------------------------------
@@ -568,6 +1063,18 @@ export default function WerwolfApp() {
             >
               <X size={16} />
             </button>
+          </div>
+        </div>
+      )}
+
+      {slowHint && (
+        <div
+          className="fixed inset-x-0 bottom-4 z-[60] flex justify-center px-4"
+          role="status"
+        >
+          <div className="flex max-w-[min(36rem,92vw)] items-center gap-3 rounded-[1.2rem] border border-sky-400/40 bg-sky-950/90 px-4 py-3 text-sm font-semibold text-sky-100 shadow-2xl backdrop-blur-md">
+            <span className="h-3 w-3 shrink-0 animate-pulse rounded-full bg-sky-300" />
+            <span className="leading-relaxed">{slowHint}</span>
           </div>
         </div>
       )}
@@ -928,6 +1435,38 @@ export default function WerwolfApp() {
                   <p className="mt-3 font-mono text-[clamp(2.3rem,6vw,4.8rem)] font-black uppercase tracking-[0.28em] text-white">
                     {lobbyCode}
                   </p>
+                  <div className="mt-4 flex flex-wrap items-center gap-3">
+                    <span
+                      className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] ${
+                        connection === "ok"
+                          ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
+                          : "border-amber-400/50 bg-amber-400/15 text-amber-100"
+                      }`}
+                      title={
+                        connection === "ok"
+                          ? "Lobby wird live synchronisiert"
+                          : "Kurzer Hänger – die Verbindung wird automatisch wiederhergestellt"
+                      }
+                    >
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          connection === "ok"
+                            ? "bg-emerald-400"
+                            : "animate-pulse bg-amber-300"
+                        }`}
+                      />
+                      {connection === "ok"
+                        ? "Live verbunden"
+                        : "Verbindung wird wiederhergestellt …"}
+                    </span>
+                    <button
+                      onClick={handleLeaveLobby}
+                      className="flex items-center gap-2 rounded-full border border-white/25 bg-white/5 px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] text-white/70 transition-all duration-200 hover:border-red-400/50 hover:bg-red-500/15 hover:text-red-100"
+                    >
+                      <X size={13} />
+                      Lobby verlassen
+                    </button>
+                  </div>
                   <button
                     onClick={copyCode}
                     className="absolute right-4 top-4 flex items-center gap-2 rounded-[1rem] border border-white/30 bg-white/10 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/20 sm:right-5 sm:top-5"
