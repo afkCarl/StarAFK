@@ -63,7 +63,19 @@ type Executable = {
 };
 
 export async function ensureSchema(db: Executable): Promise<void> {
-  for (const statement of SCHEMA_STATEMENTS) {
-    await db.execute(sql.raw(statement));
+  // Schnellweg: alle Anweisungen in EINER Anfrage an die Datenbank schicken
+  // (Postgres/PGlite führen mehrere Statements pro Simple-Query aus). Das
+  // spart bei einer entfernten Datenbank (z. B. Neon) viele Roundtrips –
+  // der allererste „Lobby erstellen“-Klick bleibt dadurch flott.
+  try {
+    await db.execute(sql.raw(SCHEMA_STATEMENTS.join(";\n")));
+    return;
+  } catch {
+    // Fallback: einzeln ausführen (z. B. wenn ein Treiber/Pooler keine
+    // Multi-Statements erlaubt). Idempotent – bereits ausgeführte
+    // Anweisungen sind dann einfach No-Ops.
+    for (const statement of SCHEMA_STATEMENTS) {
+      await db.execute(sql.raw(statement));
+    }
   }
 }

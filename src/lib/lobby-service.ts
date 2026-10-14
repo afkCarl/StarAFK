@@ -196,13 +196,16 @@ async function toState(
   rows: PlayerSummary[],
   roleCounts: Record<string, number>,
   gameStarted: boolean,
+  // Bereits (parallel) geladener Game-Master-Text – spart einen Roundtrip.
+  // `undefined` = hier nachladen, `null` = nachweislich keiner vorhanden.
+  narration?: LobbyNarration | null,
 ): Promise<LobbyState> {
   return {
     code,
     players: rows.map(toLobbyPlayer),
     roleCounts,
     gameStarted,
-    narration: await latestNarration(code),
+    narration: narration === undefined ? await latestNarration(code) : narration,
   };
 }
 
@@ -306,8 +309,17 @@ export async function createLobby(
     code = generateCode();
   }
 
-  const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
-  if (!lobby) throw new Error("Lobby konnte nicht angelegt werden");
+  // Frisch angelegt? Dann sind Rollen-Setup und Spielstatus bekannt und die
+  // zusätzliche Lobby-Abfrage entfällt (ein Roundtrip weniger pro Erstellen –
+  // bei einer entfernten Datenbank wie Neon direkt spürbar).
+  let lobby: { roleCounts: Record<string, number>; gameStarted: boolean };
+  if (created) {
+    lobby = { roleCounts, gameStarted: false };
+  } else {
+    const [row] = await db.select().from(lobbies).where(eq(lobbies.code, code));
+    if (!row) throw new Error("Lobby konnte nicht angelegt werden");
+    lobby = row;
+  }
 
   if (wantedId) {
     const [existing] = await db
@@ -327,11 +339,14 @@ export async function createLobby(
           .where(and(eq(players.id, wantedId), eq(players.lobbyCode, code)));
       }
       await applyProfilePatch(code, wantedId, sanitizeProfilePatch(profileInput));
-      const rows = await listPlayers(code);
+      const [rows, narration] = await Promise.all([
+        listPlayers(code),
+        latestNarration(code),
+      ]);
       return {
         ok: true,
         selfId: wantedId,
-        lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+        lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted, narration),
         reused: true,
       };
     }
@@ -363,11 +378,20 @@ export async function createLobby(
     [self] = await db.insert(players).values(base).returning(playerColumns);
   }
 
-  const rows = await listPlayers(code);
+  // Kein erneutes Auslesen nötig: Die Spieler von vor dem Einfügen plus der
+  // neue Spieler (jüngster Eintrag) ergeben den aktuellen Zustand. Frisch
+  // angelegte Lobbys haben außerdem noch keinen Game-Master-Text.
+  const rows = [...existingPlayers, self];
   return {
     ok: true,
     selfId: self.id,
-    lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    lobby: await toState(
+      code,
+      rows,
+      lobby.roleCounts,
+      lobby.gameStarted,
+      created ? null : undefined,
+    ),
     reused: !created,
   };
 }
@@ -414,8 +438,11 @@ export async function joinLobby(
           .where(and(eq(players.id, resumeId), eq(players.lobbyCode, code)));
       }
       await applyProfilePatch(code, resumeId, patch);
-      const rows = await listPlayers(code);
-      const state = await toState(code, rows, lobby.roleCounts, lobby.gameStarted);
+      const [rows, narration] = await Promise.all([
+        listPlayers(code),
+        latestNarration(code),
+      ]);
+      const state = await toState(code, rows, lobby.roleCounts, lobby.gameStarted, narration);
       return { ok: true, selfId: resumeId, lobby: state, resumed: true };
     }
 
@@ -439,11 +466,17 @@ export async function joinLobby(
           .onConflictDoNothing()
           .returning(playerColumns);
         if (recreated) {
-          const rows = await listPlayers(code);
+          const narration = await latestNarration(code);
           return {
             ok: true,
             selfId: recreated.id,
-            lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+            lobby: await toState(
+              code,
+              [...current, recreated],
+              lobby.roleCounts,
+              lobby.gameStarted,
+              narration,
+            ),
             resumed: true,
           };
         }
@@ -468,11 +501,17 @@ export async function joinLobby(
     })
     .returning(playerColumns);
 
-  const rows = await listPlayers(code);
+  const narration = await latestNarration(code);
   return {
     ok: true,
     selfId: self.id,
-    lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    lobby: await toState(
+      code,
+      [...existingPlayers, self],
+      lobby.roleCounts,
+      lobby.gameStarted,
+      narration,
+    ),
     resumed: false,
   };
 }
@@ -526,7 +565,14 @@ export async function getLobbyState(
   if (!lobby) return { status: "not_found" };
 
   await cleanupStalePlayers(code);
-  let rows = await listPlayers(code);
+  // Spielerliste und Game-Master-Text parallel laden – zwei Datenbank-
+  // Roundtrips zum Preis von einem. Das hält das Sekunden-Polling aller
+  // Spieler auch mit entfernter Datenbank (Neon) leicht und schnell.
+  const [initialRows, narration] = await Promise.all([
+    listPlayers(code),
+    latestNarration(code),
+  ]);
+  let rows = initialRows;
 
   if (rows.length === 0) {
     const age = Date.now() - lobby.createdAt.getTime();
@@ -540,7 +586,7 @@ export async function getLobbyState(
       ? { status: "not_member" }
       : {
           status: "ok",
-          state: await toState(code, [], lobby.roleCounts, lobby.gameStarted),
+          state: await toState(code, [], lobby.roleCounts, lobby.gameStarted, narration),
         };
   }
 
@@ -564,7 +610,7 @@ export async function getLobbyState(
 
   return {
     status: "ok",
-    state: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    state: await toState(code, rows, lobby.roleCounts, lobby.gameStarted, narration),
   };
 }
 

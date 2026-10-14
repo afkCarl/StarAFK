@@ -1,17 +1,24 @@
 # Render Blueprint für https://render.com
 #
-# Einziger nötiger Service: die Next.js-App mit Backend (API-Routen) und
-# Datenbank. Standardmäßig läuft die eingebettete PostgreSQL-Datenbank (PGlite)
-# im Ordner `.data/` – KEINE Einrichtung nötig.
+# Alles läuft automatisch – KEINE Einrichtung von Hand nötig:
+# - Der Web-Service unten ist die Next.js-App (Frontend + Backend/API).
+# - Die Datenbank `starafk-db` wird von Render beim Blueprint-Deploy
+#   automatisch angelegt und ihr Verbindungs-String landet als
+#   `AUTO_DATABASE_URL` im Service. Die App legt alle Tabellen beim ersten
+#   Zugriff selbst an (keine Migration, nichts einzutragen).
+# - Danach überleben Lobbys jeden Deploy/Neustart – „Lobby erstellen"
+#   funktioniert sofort und flüssig.
 #
-# WICHTIG für dauerhafte Lobbys auf Render:
-# Das Dateisystem von Render-Instanzen ist flüchtig (bei Free-Instanzen sogar
-# ohne Persistent Disk). Bei jedem Deploy/Neustart ist die eingebettete
-# Datenbank daher leer. Entweder
-#   a) unten den Datenbank-Block einkommentieren (Render PostgreSQL), oder
-#   b) einfach DATABASE_URL in den Environment-Einstellungen setzen
-#      (z. B. kostenlos bei Neon, https://neon.tech – Anleitung in README.md).
-# Mit gesetzter DATABASE_URL überleben Lobbys jeden Neustart.
+# Neon statt Render-Datenbank (optional, dauerhaft kostenlos):
+# Neon hat in der App Vorrang, sobald `DATABASE_URL` gesetzt ist. Wer die
+# Lobbys dauerhaft bei Neon speichern will, trägt EINMALIG im
+# Render-Dashboard (Service → Environment) als `DATABASE_URL` den
+# Connection String von Neon ein
+# (postgresql://…@ep-….eu-central-1.aws.neon.tech/neondb?sslmode=require) –
+# die App erkennt Neon am Hostnamen, schaltet TLS ein und nutzt ab dem
+# nächsten Deploy automatisch Neon statt der Render-Datenbank.
+# Hinweis: Die kostenlose Render-Datenbank wird nach 30 Tagen gelöscht,
+# eine Neon-Datenbank verfällt nicht.
 
 services:
   - type: web
@@ -25,22 +32,24 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
-      # --- Variante a: Render PostgreSQL mitverwenden (einkommentieren) ------
-      # - key: DATABASE_URL
-      #   fromDatabase:
-      #     name: starafk-db
-      #     property: connectionString
-      # --- Variante b: eigene Datenbank (z. B. Neon) -------------------------
-      # - key: DATABASE_URL
-      #   sync: false        # Wert wird im Render-Dashboard eingetragen
-      # Optional: SSL erzwingen/deaktivieren, wenn die Automatik nicht greift
-      # - key: DATABASE_SSL
-      #   value: "true"
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"
+      # Automatisch provisionierte Datenbank (siehe `databases:` unten).
+      # Wird in der App nur benutzt, solange keine eigene DATABASE_URL
+      # (z. B. Neon) gesetzt ist – die hat immer Vorrang.
+      - key: AUTO_DATABASE_URL
+        fromDatabase:
+          name: starafk-db
+          property: connectionString
+      # --- Optional: Neon als Datenbank (stattdessen verwenden) -------------
+      # Im Render-Dashboard unter Environment eintragen (nicht hier, damit
+      # das Passwort nicht im Repo landet):
+      #   DATABASE_URL = postgresql://…@ep-….aws.neon.tech/neondb?sslmode=require
 
-# --- Variante a: Render PostgreSQL (einkommentieren, dann oben DATABASE_URL) --
-# Hinweis: Der kostenlose Postgres-Plan von Render verfällt nach 30 Tagen.
-# databases:
-#   - name: starafk-db
-#     plan: free
-#     databaseName: starafk
-#     user: starafk
+# Automatische Datenbank: wird beim Blueprint-Deploy von Render angelegt
+# und über `AUTO_DATABASE_URL` (oben) mit dem Web-Service verdrahtet.
+databases:
+  - name: starafk-db
+    plan: free
+    databaseName: starafk
+    user: starafk
