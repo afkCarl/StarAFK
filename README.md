@@ -87,6 +87,98 @@ muss jetzt `"db": "postgres"` stehen (und `"ready": true`). Ab dann gilt: Lobbys
    werden jetzt abgefangen (Badge „Verbindung wird wiederhergestellt …"), statt
    den Spieler sofort aus der Lobby zu werfen.
 
+## Neon-Setup (Postgres, Auth, Object Storage, AI Gateway, Functions)
+
+Die App ist auf **Neon** verdrahtet: Datenbank, Login, Profilbild-Speicher, die
+AI-Game-Master-Texte und deren Serverless-Endpunkte kommen aus einem Projekt.
+`neon.ts` deklariert die Dienste (Infrastructure as Code), `neon deploy`
+provisioniert sie und schreibt die Zugangsdaten in `.env.local`.
+
+| Dienst | Verwendung in der App | Variablen |
+| --- | --- | --- |
+| **Neon Postgres** | Lobbys, Spieler, Game-Master-Texte (Drizzle ORM + `pg`) | `DATABASE_URL`, `DATABASE_URL_UNPOOLED` |
+| **Neon Auth** (Managed Better Auth) | Anmeldung; ohne Session kein Lobby-Beitritt | `NEON_AUTH_BASE_URL`, `NEON_AUTH_JWKS_URL`, `NEON_AUTH_COOKIE_SECRET` |
+| **Neon Object Storage** | Profilbilder im Bucket `assets` (`avatars/<player-id>/…`) | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION` |
+| **Neon AI Gateway** | Texte des AI Game Masters | `NEON_AI_GATEWAY_BASE_URL`, `NEON_AI_GATEWAY_TOKEN` |
+| **Neon Functions** | Function `gamemaster` (`functions/gamemaster.ts`) mit `/narration` + `/health` | `NEON_FUNCTION_GAMEMASTER_BASE_URL` |
+
+### Einrichtung (auf einem Rechner mit Neon-Zugang)
+
+```bash
+npm i -g neon@latest          # Neon CLI
+neon login                    # Browser-Sign-in
+
+# Projekt verknüpfen (Org/Projekt stehen unten) und Dienste deployen:
+neon link --project-id broad-thunder-03529066 --branch production -y
+neon deploy                   # provisioniert neon.ts + zieht die Variablen in .env.local
+
+# App-Secret für den Session-Cookie (wird NICHT von Neon injiziert):
+echo "NEON_AUTH_COOKIE_SECRET=$(openssl rand -base64 32)" >> .env.local
+
+npm run build && npm run start
+```
+
+> **Region:** Auth, Functions, Object Storage und AI Gateway laufen nur in
+> `aws-us-east-1`, `aws-us-east-2`, `aws-eu-central-1` und `aws-ap-southeast-1`.
+> Ein Projekt außerhalb dieser Regionen unterstützt diese Dienste nicht.
+
+> **Trusted Domain:** Neon Auth leitet nur auf registrierte Origins um.
+> `localhost` ist voreingestellt; für Deployments einmalig
+> `neon neon-auth domain add https://<deine-domain>` ausführen.
+
+### Prüfen, dass alles läuft
+
+```bash
+node --env-file=.env.local scripts/verify-neon.mjs   # echter Branch: DB, Auth, Bucket, Gateway, Function
+npm run test:e2e                                     # lokaler E2E-Test ohne Neon (Mocks, siehe unten)
+```
+
+`/api/health` zeigt jederzeit, was verdrahtet ist:
+
+```json
+{ "ok": true, "db": "postgres",
+  "services": { "postgres": "postgres", "auth": true, "objectStorage": "bucket:assets",
+                "aiGateway": true, "functions": true } }
+```
+
+**Ohne Neon-Zugangsdaten bleibt alles lauffähig:** ohne `DATABASE_URL` läuft die
+eingebettete PGlite-Datenbank, ohne Auth-Variablen bleibt der Login aus (die App
+spielt dann anonym wie vorher), ohne `AWS_*` werden Profilbilder als Data-URL in
+Postgres gespeichert.
+
+### AI Game Master
+
+Der Game Master ist eine **Neon Function** (`functions/gamemaster.ts`, Slug
+`gamemaster`): Der Browser holt sich ein kurzlebiges JWT aus der Neon-Auth-
+Session (`authClient.token()`), ruft die Function **direkt** auf (`POST
+<narration-URL>` mit `Authorization: Bearer …`) und die Function
+
+1. prüft das JWT gegen die Branch-JWKS (`NEON_AUTH_JWKS_URL`),
+2. liest Lobby, Spieler und Rollen-Setup aus Postgres,
+3. fragt das **AI Gateway** (`/v1/models` → Modellwahl, dann
+   `/v1/chat/completions`) nach einem deutschen Text,
+4. schreibt den Text in `game_master_lines` – von dort holt ihn das Lobby-Polling
+   und zeigt ihn **allen** Spielern in der Karte „AI Game Master“.
+
+Modell: automatisch das schnellste verfügbare (bevorzugt `…mini`/`flash`/
+`haiku`). Festlegen lässt sich eines über `GAMEMASTER_MODEL` – dann zusätzlich in
+`neon.ts` unter `functions.gamemaster.env` deklarieren und erneut deployen.
+
+### Lokaler E2E-Test (`npm run test:e2e`)
+
+Weil dieser Sandkasten keinen Zugang zu Neon hat, startet der Test Neon-ähnliche
+Dienste lokal und prüft die echten Codepfade der App:
+
+- **Phase A** – App ohne Neon (PGlite, Data-URL-Avatare): Lobby-Flow, Rollen,
+  Spielstart, Profilbild, Verlassen.
+- **Phase B** – App mit „Neon": Postgres über echtes Wire-Protokoll
+  (`@electric-sql/pglite-socket`), `DATABASE_URL`-Pfad, Neon Auth (Sign-up,
+  Session, JWT, 401-Schutz), S3-kompatibler Bucket (AWS SDK, Path-Style),
+  OpenAI-kompatibles Gateway und die echte Function `gamemaster` – inklusive
+  Zusammenspiel: Function → Gateway → Postgres → Live-Zustand der Lobby.
+
+Die Attrappen liegen in `scripts/dev-mocks.mjs` und werden nur für Tests benutzt.
+
 ## Optional: lokale/externe Datenbank konfigurieren
 
 | Umgebungsvariable | Bedeutung |
@@ -96,6 +188,9 @@ muss jetzt `"db": "postgres"` stehen (und `"ready": true`). Ab dann gilt: Lobbys
 | `DATABASE_POOL_MAX` | Größe des Verbindungspools (Standard 4). |
 | `PGLITE_DIR` | Ablageort der eingebetteten Datenbank (Standard `.data/pglite`). |
 | `LOBBY_STALE_MS` | Lebenszeichen-Fenster in ms (Standard 120000). |
+| `NEON_AUTH_*` | Neon Auth (siehe Neon-Setup) – ohne sie bleibt der Login aus. |
+| `AWS_*` | Neon Object Storage – ohne sie liegen Profilbilder als Data-URL in Postgres. |
+| `NEON_AI_GATEWAY_*`, `NEON_FUNCTION_GAMEMASTER_BASE_URL` | AI Game Master – ohne sie wird die Karte als „nicht konfiguriert“ angezeigt. |
 
 ## Lokal testen
 
@@ -111,7 +206,9 @@ Auch lokal greift der Fallback: ohne `DATABASE_URL` entsteht automatisch
 
 | Endpunkt | Methode | Zweck |
 | --- | --- | --- |
-| `/api/health` | GET | Status, Datenbankmodus, Speicherart, Fehlerzähler |
+| `/api/health` | GET | Status, Datenbankmodus, Fehlerzähler, verdrahtete Neon-Dienste |
+| `/api/config` | GET | Laufzeit-Konfiguration für den Browser (Login aktiv? Game-Master-URL) |
+| `/api/auth/*` | GET/POST/… | Neon Auth (Sign-up, Sign-in, Session, Sign-out, JWT) – Proxy zum Managed-Auth-Server |
 | `/api/lobby/create` | POST | Lobby anlegen (6-stelliger Code; optional `code`/`playerId` zum Wiederherstellen) |
 | `/api/lobby/join` | POST | Beitreten (`max. 12 Spieler`); mit `playerId` = Reconnect/Resume |
 | `/api/lobby/state` | GET | Zustand abfragen (Polling, Heartbeat) |
@@ -128,15 +225,26 @@ das Beitreten-Feld vorausgefüllt.
 ## Architektur in Kürze
 
 ```
+neon.ts                Neon Infrastructure as Code (Auth, AI Gateway, Function, Bucket)
+functions/gamemaster.ts Neon Function: AI-Game-Master-Endpunkte (JWT-geschützt)
 src/
   app/api/…            REST-Routen (dünn: Parameter prüfen, Service aufrufen)
-  app/page.tsx         Seite → WerwolfApp
-  components/werwolf/  UI (Menü, Lobby, Rollen-Modal, Profilkarte)
+  app/api/auth/…       Neon-Auth-Proxy (/api/auth/*)
+  app/page.tsx         Seite → AuthGate → WerwolfApp
+  components/auth/     Anmeldebildschirm + Login-Schranke
+  components/werwolf/  UI (Menü, Lobby, Rollen-Modal, Profilkarte, AI-Game-Master-Karte)
   lib/api.ts           einheitlicher Route-Rahmen (Logging, Fehler, Selbstheilung)
-  lib/lobby-service.ts Lobby-Logik (Lobbys, Spieler, Rollen, Avatare, Resume)
+  lib/auth/            Neon Auth (Server-Session, Browser-Client, 401-Guard)
+  lib/storage.ts       Neon Object Storage (S3Client, Put/Get/Delete)
+  lib/game-master.ts   Function-URL + Beschriftungen für den AI Game Master
+  lib/lobby-service.ts Lobby-Logik (Lobbys, Spieler, Rollen, Avatare, Resume, Narration)
   lib/image.ts         Prüfen/Zerlegen der Profilbild-Data-URLs
   db/index.ts          Verbindung (extern via DATABASE_URL oder PGlite) + Selbstheilung
   db/migrate.ts        idempotentes Schema (CREATE TABLE IF NOT EXISTS …)
-  db/schema.ts         Drizzle-Tabellen
+  db/schema.ts         Drizzle-Tabellen (inkl. user_id, image_key, game_master_lines)
   instrumentation.ts   Datenbank-Vorlauf beim Serverstart
+scripts/
+  verify-neon.mjs      Prüft den echten Neon-Branch (DB, Auth, Bucket, Gateway, Function)
+  e2e-local.mjs        End-to-End-Test ohne Neon (Phase A/B, siehe oben)
+  dev-mocks.mjs        Lokale Attrappen (Postgres-Socket, S3, Gateway, Auth)
 ```

@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { GameMasterCard } from "@/components/werwolf/game-master-card";
 import { GlassCard } from "@/components/werwolf/glass-card";
 import { RoleIcon } from "@/components/werwolf/role-icon";
 import { SkyBackground } from "@/components/werwolf/sky-background";
@@ -24,6 +25,7 @@ import {
   colorWash,
   randomName,
   winCondition,
+  type LobbyNarration,
   type LobbyPlayer,
   type LobbyState,
   type PlayerProfile,
@@ -258,6 +260,8 @@ export default function WerwolfApp() {
   const [roleCounts, setRoleCounts] = useState<Record<string, number>>(defaultCounts);
   const [cardModalOpen, setCardModalOpen] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
+  /** Neuester AI-Game-Master-Text (kommt über das Lobby-Polling zu allen Spielern). */
+  const [narration, setNarration] = useState<LobbyNarration | null>(null);
   const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [slowHint, setSlowHint] = useState<string | null>(null);
@@ -354,6 +358,7 @@ export default function WerwolfApp() {
     setPlayers(state.players);
     setRoleCounts(state.roleCounts);
     setGameStarted(Boolean(state.gameStarted));
+    setNarration(state.narration ?? null);
     setSelfId((current) => {
       if (current) {
         const self = state.players.find((p) => p.id === current);
@@ -1603,6 +1608,13 @@ export default function WerwolfApp() {
                     Keine besonderen Regeln festgelegt.
                   </p>
                 </GlassCard>
+                <GameMasterCard
+                  code={lobbyCode}
+                  playerId={selfId}
+                  gameStarted={gameStarted}
+                  narration={narration}
+                  onNarration={setNarration}
+                />
                 {isHost ? (
                   gameStarted ? (
                     <div className="flex flex-col gap-2">

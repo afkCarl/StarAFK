@@ -2,6 +2,9 @@ import { sql } from "drizzle-orm";
 
 import { dbStatus, getDb, noteDbFailure, noteDbSuccess } from "@/db";
 import { json, route } from "@/lib/api";
+import { authEnabled } from "@/lib/auth/server";
+import { aiGatewayConfigured, gameMasterEnabled } from "@/lib/game-master";
+import { BUCKET, storageEnabled } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -22,6 +25,15 @@ export const GET = route("health", async () => {
       ok: true,
       db: dbStatus().mode,
       status: dbStatus(),
+      // Zeigt, welche Neon-Dienste verdrahtet sind (Neon Postgres, Auth,
+      // Object Storage, AI Gateway, Functions).
+      services: {
+        postgres: dbStatus().mode,
+        auth: authEnabled,
+        objectStorage: storageEnabled ? `bucket:${BUCKET}` : false,
+        aiGateway: aiGatewayConfigured,
+        functions: gameMasterEnabled,
+      },
       latencyMs: Date.now() - started,
       uptimeSec: Math.round(process.uptime()),
     });

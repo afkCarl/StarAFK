@@ -33,6 +33,23 @@ const SCHEMA_STATEMENTS: string[] = [
   // Upgrades für Tabellen aus älteren Ständen:
   `ALTER TABLE lobbies ADD COLUMN IF NOT EXISTS game_started boolean NOT NULL DEFAULT false`,
   `ALTER TABLE players ADD COLUMN IF NOT EXISTS image_updated_at timestamptz`,
+  // Neon Auth: Spielfigur ↔ Konto.
+  `ALTER TABLE players ADD COLUMN IF NOT EXISTS user_id text`,
+  `CREATE INDEX IF NOT EXISTS players_user_id_idx ON players (user_id)`,
+  // Neon Object Storage: Bilddaten liegen im Bucket, hier steht nur der Schlüssel.
+  `ALTER TABLE players ADD COLUMN IF NOT EXISTS image_key text`,
+  // AI Game Master (Neon Function `gamemaster` schreibt hier hinein).
+  `CREATE TABLE IF NOT EXISTS game_master_lines (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    lobby_code varchar(6) NOT NULL REFERENCES lobbies(code) ON DELETE CASCADE,
+    kind text NOT NULL,
+    text text NOT NULL,
+    model text,
+    created_by text,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS game_master_lines_lobby_idx
+     ON game_master_lines (lobby_code, created_at DESC)`,
   // Alte Profilbilder (aus Ständen ohne image_updated_at) bekommen eine
   // Cache-Version, damit ihre Avatar-URLs stabil bleiben.
   `UPDATE players SET image_updated_at = created_at
