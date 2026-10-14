@@ -1,10 +1,23 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
-import { PGlite } from "@electric-sql/pglite";
 import { drizzle as drizzleNodePg } from "drizzle-orm/node-postgres";
-import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { Pool, type PoolConfig } from "pg";
+
+/**
+ * PGlite wird AUSSCHLIESSLICH als Typ importiert (`import type` verschwindet
+ * beim Kompilieren). Grund: RAM.
+ *
+ * Gemessen (Node 22, `process.memoryUsage.rss()`):
+ *   - `import("@electric-sql/pglite")`          →  +9 MB
+ *   - `new PGlite(); await db.waitReady`        → +456 MB  (!)
+ *   - kompletter `next start` mit PGlite        →  596 MB RSS
+ * Eine eingebettete PostgreSQL-Instanz lebt als WASM IN DIESEM Node-Prozess und
+ * sprengt damit das 512-MB-Limit der Render-Free-Instanz. Deshalb wird das
+ * Modul nicht mehr pauschal beim Serverstart geladen, sondern nur noch in dem
+ * Moment, in dem PGlite tatsächlich gestartet werden darf (siehe `pglitePolicy`).
+ */
+import type { PGlite as PGliteClient } from "@electric-sql/pglite";
 
 import { ensureSchema } from "@/db/migrate";
 
@@ -16,9 +29,11 @@ export type DbStorage = "external" | "file" | "memory" | "none";
 interface DbGlobals {
   pool?: Pool;
   db?: Database;
-  pglite?: PGlite;
+  pglite?: PGliteClient;
   pgliteInit?: Promise<Database>;
   pgliteStorage: DbStorage;
+  /** Blockade-Hinweis nur EINMAL pro Prozess loggen (kein Log-Spam). */
+  pgliteBlockLogged?: boolean;
   schemaInit?: WeakMap<object, Promise<void>>;
   failures: number;
   resets: number;
@@ -97,6 +112,116 @@ export function getDbMode(): DbMode {
   return resolveDatabaseUrl() ? "postgres" : "pglite";
 }
 
+/* ------------------------------------------------------------------ *
+ * PGlite-Schutz: Die eingebettete Datenbank darf nie einen Container
+ * sprengen (gemessen: +456 MB RSS, kompletter Server 596 MB > 512 MB).
+ * ------------------------------------------------------------------ */
+
+/**
+ * Kleinste Container-RAM-Grenze, ab der PGlite noch gestartet werden darf.
+ *
+ * Herleitung aus der Messung: PGlite selbst ~456 MB + Node/Next.js-Server
+ * ~145 MB ≈ 600 MB. Unter 900 MB bleibt also kein Spielraum für Requests,
+ * GC und den Turbopack-Runtime-Overhead – deshalb Standard 900 MB.
+ * Über `PGLITE_MIN_MEMORY_MB` anpassbar.
+ */
+const PGLITE_MIN_MEMORY_MB_DEFAULT = 900;
+
+function envFlag(name: string): boolean {
+  const raw = (process.env[name] ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function pgliteMinMemoryMb(): number {
+  const configured = Number(process.env.PGLITE_MIN_MEMORY_MB);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : PGLITE_MIN_MEMORY_MB_DEFAULT;
+}
+
+/**
+ * Fehler, den ein Neuaufbau der Verbindung NICHT beheben kann (fehlende
+ * Konfiguration). Wichtig, damit `noteDbFailure` nicht endlos Pools verwirft
+ * und `resets` in `/api/health` ins Uferlose steigt.
+ */
+export class DbUnavailableError extends Error {
+  readonly permanent = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "DbUnavailableError";
+  }
+}
+
+/**
+ * Handelt es sich um einen Konfigurationsfehler, den auch ein Neuaufbau der
+ * Verbindung nicht heilt (z. B. blockiertes PGlite ohne DATABASE_URL)?
+ * Öffentlich, damit Start-Hook und Health-Monitor solche Fehler kurz und ohne
+ * Stacktrace loggen können, statt bei jedem Versuch denselben Text zu kippen.
+ */
+export function isPermanentDbError(error: unknown): boolean {
+  return Boolean((error as { permanent?: unknown } | null)?.permanent);
+}
+
+export type PglitePolicy =
+  | { allowed: true }
+  | { allowed: false; reason: string; hint: string };
+
+/**
+ * Darf PGlite (eingebettetes PostgreSQL im Prozess) in DIESER Umgebung
+ * gestartet werden?
+ *
+ * - `PGLITE_IN_PRODUCTION=1`      → immer erlaubt (bewusster Notausgang,
+ *                                   nur auf Instanzen mit ≥ 1 GB RAM nutzen).
+ * - Container meldet < 900 MB     → verboten (das ist der Render-Free-Fall:
+ *                                   512 MB; PGlite würde die Instanz sofort
+ *                                   über das Limit heben → OOM-Kill).
+ * - `NODE_ENV=production`         → verboten, außer Override (Produktion soll
+ *                                   eine echte Datenbank nutzen).
+ * - sonst (lokale Entwicklung)    → erlaubt, Verhalten unverändert.
+ *
+ * `process.constrainedMemory()` liefert das cgroup-Limit des Containers und
+ * `undefined`, wenn Node ohne Grenze läuft – dann greift nur die NODE_ENV-Regel.
+ */
+export function pglitePolicy(): PglitePolicy {
+  if (envFlag("PGLITE_IN_PRODUCTION")) return { allowed: true };
+
+  const hint =
+    "Bitte eine externe PostgreSQL-Datenbank setzen: DATABASE_URL (z. B. Neon) " +
+    "oder AUTO_DATABASE_URL (wird von der render.yaml-Blueprint automatisch " +
+    "befüllt). Notfall-Override für Instanzen mit mindestens 1 GB RAM: " +
+    "PGLITE_IN_PRODUCTION=1";
+
+  const limitBytes =
+    typeof process.constrainedMemory === "function"
+      ? process.constrainedMemory()
+      : undefined;
+  const limitMb =
+    typeof limitBytes === "number" && limitBytes > 0
+      ? Math.round(limitBytes / 1_048_576)
+      : undefined;
+  const minMb = pgliteMinMemoryMb();
+
+  if (limitMb !== undefined && limitMb < minMb) {
+    return {
+      allowed: false,
+      reason:
+        `Der Container meldet ein RAM-Limit von ${limitMb} MB ` +
+        `(PGlite braucht allein ~456 MB, benötigt werden ≥ ${minMb} MB)`,
+      hint,
+    };
+  }
+  if (process.env.NODE_ENV === "production") {
+    return {
+      allowed: false,
+      reason:
+        "NODE_ENV=production – PGlite würde als WASM-PostgreSQL im Serverprozess " +
+        "laufen und ~456 MB RAM belegen (gemessen: 596 MB RSS für next start)",
+      hint,
+    };
+  }
+  return { allowed: true };
+}
+
 export interface DbStatus {
   mode: DbMode;
   /** Konkreter Anbieter: `neon`, sonstiges externes `postgres` oder `pglite`. */
@@ -109,18 +234,31 @@ export interface DbStatus {
   /** Wie oft die Verbindung bereits automatisch neu aufgebaut wurde. */
   resets: number;
   lastError?: string;
+  /**
+   * Konfigurationshinweis, wenn die Datenbank BEWUSST nicht gestartet wurde
+   * (PGlite-Schutz). Steht 1:1 in `/api/health`, damit die Ursache sofort
+   * sichtbar ist und nicht erst in den Render-Logs gesucht werden muss.
+   */
+  notice?: string;
 }
 
 export function dbStatus(): DbStatus {
   const g = globals();
+  const mode = getDbMode();
+  let notice: string | undefined;
+  if (mode === "pglite") {
+    const policy = pglitePolicy();
+    if (!policy.allowed) notice = `${policy.reason}. ${policy.hint}`;
+  }
   return {
-    mode: getDbMode(),
+    mode,
     provider: getDbProvider(),
-    storage: getDbMode() === "postgres" ? "external" : g.pgliteStorage,
+    storage: mode === "postgres" ? "external" : g.pgliteStorage,
     ready: g.ready,
     failures: g.failures,
     resets: g.resets,
     ...(g.lastError ? { lastError: g.lastError } : {}),
+    ...(notice ? { notice } : {}),
   };
 }
 
@@ -152,22 +290,55 @@ function pgliteDataDir(): string {
   return process.env.PGLITE_DIR ?? path.join(process.cwd(), ".data", "pglite");
 }
 
-async function createPglite(
-  dir: string | null,
-): Promise<{ client: PGlite; db: Database }> {
-  if (dir) mkdirSync(dir, { recursive: true });
-  const client = dir ? new PGlite(dir) : new PGlite();
-  await withTimeout(client.waitReady, 30_000, "PGlite-Start");
-  return { client, db: drizzlePglite(client) as unknown as Database };
+/**
+ * Lädt PGlite und den passenden Drizzle-Treiber – und zwar ERST hier.
+ *
+ * Vorher standen beide als statische `import`-Zeilen am Dateianfang. Folge:
+ * Jeder Server-Chunk, der `@/db` importiert (also jede API-Route UND der
+ * Instrumentation-Hook beim Start), hat das PGlite-Modul samt WASM-Lader
+ * geladen, obwohl auf Render immer eine externe Datenbank genutzt wird.
+ * `import()`-Ausdrücke sind dagegen lazy: ohne PGlite-Start bleiben Modul und
+ * WASM komplett außerhalb des Prozesses.
+ */
+async function loadPgliteModules(): Promise<{
+  create: (dir: string | null) => Promise<PGliteClient>;
+  wrap: (client: PGliteClient) => Database;
+}> {
+  const [{ PGlite }, { drizzle }] = await Promise.all([
+    import("@electric-sql/pglite"),
+    import("drizzle-orm/pglite"),
+  ]);
+  return {
+    create: async (dir) => {
+      if (dir) mkdirSync(dir, { recursive: true });
+      const client = dir ? new PGlite(dir) : new PGlite();
+      await withTimeout(client.waitReady, 30_000, "PGlite-Start");
+      return client;
+    },
+    wrap: (client) => drizzle(client) as unknown as Database,
+  };
 }
 
 async function initPglite(): Promise<Database> {
   const g = globals();
+
+  // RAM-Schutz: In Produktion bzw. in kleinen Containern (< 900 MB) wird
+  // PGlite gar nicht erst geladen – sonst OOM-Kill durch Render.
+  const policy = pglitePolicy();
+  if (!policy.allowed) {
+    const message = `PGlite wurde nicht gestartet: ${policy.reason}. ${policy.hint}`;
+    if (!g.pgliteBlockLogged) {
+      g.pgliteBlockLogged = true;
+      console.error(`[db] ${message}`);
+    }
+    throw new DbUnavailableError(message);
+  }
+
+  const { create, wrap } = await loadPgliteModules();
   const dir = pgliteDataDir();
-  let client: PGlite;
-  let db: Database;
+  let client: PGliteClient;
   try {
-    ({ client, db } = await createPglite(dir));
+    client = await create(dir);
     g.pgliteStorage = "file";
   } catch (error) {
     console.warn(
@@ -176,12 +347,12 @@ async function initPglite(): Promise<Database> {
         `für dauerhafte Lobbys DATABASE_URL setzen.`,
       error,
     );
-    ({ client, db } = await createPglite(null));
+    client = await create(null);
     g.pgliteStorage = "memory";
   }
   g.pglite = client;
-  g.db = db;
-  return db;
+  g.db = wrap(client);
+  return g.db;
 }
 
 function getPgliteDatabase(): Promise<Database> {
@@ -348,9 +519,18 @@ export async function resetDb(): Promise<void> {
  */
 export function noteDbFailure(error?: unknown): void {
   const g = globals();
-  g.failures += 1;
   g.ready = false;
   if (error !== undefined) g.lastError = errorMessage(error);
+
+  // Konfigurationsfehler (z. B. PGlite-Schutz ohne DATABASE_URL) heilt kein
+  // Neuaufbau. Würde hier mitgezählt, stiege `resets` in `/api/health` endlos
+  // und alle 3 Aufrufe würde sinnlos ein Pool verworfen.
+  if (isPermanentDbError(error)) {
+    g.failures = 0;
+    return;
+  }
+
+  g.failures += 1;
   if (g.failures === 3 || g.failures % 10 === 0) {
     console.error(
       `[db] ${g.failures} Fehler in Folge (${g.lastError ?? "unbekannt"}) – ` +

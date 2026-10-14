@@ -43,11 +43,13 @@
   "include": [
     "next-env.d.ts",
     "src",
-    "vite.config.ts",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "vite.config.ts",
+    "src/App.tsx",
+    "src/main.tsx"
   ]
 }

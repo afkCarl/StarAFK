@@ -12,15 +12,22 @@
 > 1. Leeres Next.js-Projekt anlegen (oder Dateien einfach in einen Ordner schreiben).
 > 2. ALLE Textdateien exakt wie hier abgedruckt anlegen.
 > 3. Alle Binärdateien von dieser Website herunterladen (Liste unten).
-> 4. `npm install` → `npm run build` → `npm run start` — fertig, die App läuft
->    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne `DATABASE_URL` wird
->    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in `.data/` angelegt.
-> 5. Optional (empfohlen auf Render): `.env` bzw. Umgebungsvariable
->    `DATABASE_URL=postgresql://…` für eine externe PostgreSQL-Datenbank — die
->    Tabellen werden ebenfalls automatisch angelegt (kein `drizzle-kit push`).
->    Ohne `DATABASE_URL` läuft die App eingebettet (PGlite); auf Render-Free-
->    Instanzen ist das Dateisystem flüchtig, Lobbys sind dann nach einem
->    Neustart weg (die Lobby wird automatisch mit gleichem Code neu geöffnet).
+> 4. `npm install` → `npm run build` → `npm run start` — fertig.
+>    **Wichtig (RAM):** `next start` setzt `NODE_ENV=production`. Dort startet die
+>    eingebettete PGlite-Datenbank NICHT mehr von selbst, weil sie als
+>    WASM-PostgreSQL im Serverprozess ~456 MB belegt (gemessen: 596 MB RSS ohne
+>    Last, 758 MB Spitze mit 6 pollenden Spielern) und eine 512-MB-Instanz damit
+>    sofort gekillt wird. Für `npm run start` also `DATABASE_URL` setzen — oder
+>    bei >= 1 GB RAM den Notausgang `PGLITE_IN_PRODUCTION=1`.
+>    In `npm run dev` (`NODE_ENV=development`) bleibt alles beim Alten: ohne
+>    `DATABASE_URL` entsteht automatisch `.data/pglite`.
+> 5. Externe PostgreSQL-Datenbank (auf Render Pflicht): `.env` bzw.
+>    Umgebungsvariable `DATABASE_URL=postgresql://…` — die Tabellen werden
+>    ebenfalls automatisch angelegt (kein `drizzle-kit push`). Auf Render wird
+>    `AUTO_DATABASE_URL` von der Blueprint (`render.yaml`) automatisch befüllt.
+>    Ohne gültige Datenbank bleibt die Seite erreichbar (Startseite, `/api/health`),
+>    die Lobby-API meldet einen klaren Fehler und die Ursache steht in
+>    `/api/health` unter `status.notice`.
 
 ## Projektübersicht
 
@@ -49,6 +56,11 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Robuste Datenbank**: Verbindung baut sich bei Fehlern automatisch neu auf
   (`src/db/index.ts`), PGlite fällt bei Problemen mit dem Datenordner in den
   Speicher-Modus zurück; `/api/health` zeigt Modus, Speicherart und Fehlerzähler.
+- **RAM-Budget 512 MB**: PGlite wird lazy geladen und in Produktion bzw. in
+  Containern unter `PGLITE_MIN_MEMORY_MB` (Standard 900) blockiert
+  (`pglitePolicy()`), der S3-Client wird nur mit konfiguriertem Bucket geladen,
+  und das `start`-Skript begrenzt den V8-Heap (`NODE_MAX_OLD_SPACE_MB`,
+  Standard 384). Nachmessen: `node scripts/measure-ram.mjs`.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 
@@ -106,6 +118,7 @@ src/components/werwolf/role-icon.tsx
 src/components/werwolf/glass-card.tsx
 src/components/auth/auth-gate.tsx
 src/components/auth/sign-in-screen.tsx
+scripts/measure-ram.mjs
 public/favicon-light.svg
 public/favicon-dark.svg
 public/roles/Amoricon.svg
@@ -143,7 +156,7 @@ public/frames/GrayCatWalkingTwo.png
   "scripts": {
     "dev": "next dev --hostname 0.0.0.0",
     "build": "next build",
-    "start": "next start --hostname 0.0.0.0 --port ${PORT:-3000}",
+    "start": "node --max-old-space-size=${NODE_MAX_OLD_SPACE_MB:-384} node_modules/next/dist/bin/next start --hostname 0.0.0.0 --port ${PORT:-3000}",
     "typecheck": "tsc --noEmit",
     "test:e2e": "node scripts/e2e-local.mjs"
   },
@@ -151,7 +164,6 @@ public/frames/GrayCatWalkingTwo.png
     "@aws-sdk/client-s3": "^3.1151.0",
     "@electric-sql/pglite": "^0.5.9",
     "@neon/config": "^1.9.1",
-    "@neon/env": "^1.6.2",
     "@neon/functions": "^0.11.0",
     "@neondatabase/auth": "^0.6.0-beta",
     "clsx": "2.1.1",
@@ -167,17 +179,13 @@ public/frames/GrayCatWalkingTwo.png
   "devDependencies": {
     "@electric-sql/pglite-socket": "^0.2.12",
     "@tailwindcss/postcss": "4.1.17",
-    "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
     "@types/pg": "8.18.0",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "5.1.1",
     "postcss": "8.5.8",
     "tailwindcss": "4.1.17",
-    "typescript": "5.9.3",
-    "vite": "7.3.2",
-    "vite-plugin-singlefile": "2.3.0"
+    "typescript": "5.9.3"
   }
 }
 ```
@@ -246,12 +254,14 @@ export default nextConfig;
   "include": [
     "next-env.d.ts",
     "src",
-    "vite.config.ts",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "vite.config.ts",
+    "src/App.tsx",
+    "src/main.tsx"
   ]
 }
 ```
@@ -319,9 +329,32 @@ services:
         value: "22"
       - key: NEXT_TELEMETRY_DISABLED
         value: "1"
+      # --- RAM-Budget (512 MB auf dem Free-Plan) ---------------------------
+      # Obergrenze für den V8-Heap des Laufzeitprozesses, gesetzt vom
+      # `start`-Skript in package.json (`node --max-old-space-size=…`).
+      # Ohne diese Grenze richtet sich V8 nach dem RAM des HOSTS und lässt den
+      # Heap wachsen, bis der Container von Render hart gekillt wird (OOM,
+      # keine verwertbare Fehlermeldung im Log). Mit der Grenze mistet V8
+      # rechtzeitig aus; ein echtes Leck meldet sich stattdessen als
+      # „Reached heap limit“ in den Logs. 384 MB Heap + ~100 MB für
+      # Node/Next.js/Buffer bleiben unter 512 MB.
+      # Nur der Startprozess nutzt den Wert – der Build bleibt unberührt.
+      - key: NODE_MAX_OLD_SPACE_MB
+        value: "384"
       # Automatisch provisionierte Datenbank (siehe `databases:` unten).
       # Wird in der App nur benutzt, solange keine eigene DATABASE_URL
       # (z. B. Neon) gesetzt ist – die hat immer Vorrang.
+      #
+      # WICHTIG seit der RAM-Optimierung: Diese Variable ist auf Render PFLICHT.
+      # Die eingebettete PGlite-Datenbank (der Fallback ohne DATABASE_URL)
+      # läuft als WASM-PostgreSQL im Node-Prozess und kostet gemessen ~456 MB
+      # zusätzlich – der Server landete damit bei 596 MB RSS und wurde von
+      # Render gekillt. Ohne gültige Datenbank startet die App jetzt trotzdem,
+      # meldet die Ursache aber klar unter /api/health (`status.notice`) und in
+      # den Logs, statt die Instanz in eine OOM-Neustartschleife zu schicken.
+      # Fällt die kostenlose Render-Datenbank nach 30 Tagen weg, bitte
+      # DATABASE_URL (Neon) im Dashboard setzen – oder den Notausgang
+      # PGLITE_IN_PRODUCTION=1 (nur sinnvoll bei >= 1 GB RAM, z. B. Starter-Plan).
       - key: AUTO_DATABASE_URL
         fromDatabase:
           name: starafk-db
@@ -362,6 +395,12 @@ databases:
  *    Sekunden, eine externe Datenbank (Neon) braucht für den ersten
  *    Verbindungsaufbau kurz. Ohne Vorlauf müsste der erste
  *    „Lobby erstellen“-Klick darauf warten.
+ * 4. **RAM-Schutz** (`logDatabasePlan`): PGlite läuft als WASM-PostgreSQL IM
+ *    Node-Prozess und kostet gemessen ~456 MB zusätzlich – zusammen mit dem
+ *    Server 596 MB, also mehr als die 512 MB einer Render-Free-Instanz.
+ *    Deshalb wird PGlite in Produktion/kleinen Containern gar nicht erst
+ *    geladen (siehe `pglitePolicy` in src/db/index.ts); diese Funktion macht
+ *    die Entscheidung sofort in den Logs sichtbar.
  *
  * Wichtig: Nichts davon darf den Serverstart blockieren. Antwortet die
  * Datenbank nicht innerhalb des Zeitlimits, startet der Server trotzdem – die
@@ -385,17 +424,48 @@ export async function register(): Promise<void> {
   // dieser Hook fertig ist. Ein blockierender Vorlauf würde also genau die
   // ersten Health-Checks verzögern, die Render sofort nach dem Start schickt
   // (und die nach 5 s abbrechen). Der Vorlauf läuft daher im Hintergrund.
+  void logDatabasePlan();
   void warmUpDatabase();
+}
+
+/**
+ * Einmalige Startmeldung: Welche Datenbank soll genutzt werden – und falls
+ * keine verfügbar ist, WARUM (steht dann ganz oben in den Render-Logs und
+ * zusätzlich in `/api/health` unter `status.notice`).
+ */
+async function logDatabasePlan(): Promise<void> {
+  try {
+    const { getDbMode, getDbProvider, pglitePolicy } = await import("@/db");
+    if (getDbMode() === "postgres") {
+      console.log(`[start] Datenbank: extern (${getDbProvider()}).`);
+      return;
+    }
+    const policy = pglitePolicy();
+    if (policy.allowed) {
+      console.log("[start] Datenbank: eingebettetes PGlite (ohne DATABASE_URL).");
+      return;
+    }
+    console.error(
+      `[start] KEINE Datenbank nutzbar: ${policy.reason}.\n[start] ${policy.hint}`,
+    );
+  } catch {
+    // Kein Grund für den Serverstart abzubrechen – die API-Routen und
+    // `/api/health` melden den Zustand selbst.
+  }
 }
 
 /** Öffnet die Datenbank im Hintergrund, damit der erste Klick nicht wartet. */
 async function warmUpDatabase(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const { getDb, dbStatus } = await import("@/db");
     const warmup = getDb().then(() => true);
-    const timeout = new Promise<false>((resolve) =>
-      setTimeout(() => resolve(false), 15_000),
-    );
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), 15_000);
+      // Der Timer soll den Prozess weder am Beenden hindern noch nach dem
+      // erfolgreichen Vorlauf weiter im Event-Loop hängen bleiben.
+      timer.unref?.();
+    });
     if (await Promise.race([warmup, timeout])) {
       console.log(
         `[start] Datenbank bereit (${dbStatus().provider}/${dbStatus().storage}).`,
@@ -408,7 +478,22 @@ async function warmUpDatabase(): Promise<void> {
   } catch (error) {
     // Nicht abbrechen: Die API-Routen bauen die Verbindung bei Bedarf selbst
     // auf (und heilen sich dabei selbst).
+    //
+    // Ein Konfigurationsfehler (`permanent`, z. B. der PGlite-RAM-Schutz) wurde
+    // von `logDatabasePlan` direkt davor bereits vollständig gemeldet – hier
+    // kommt dann nur eine Kurzzeile ohne Stacktrace, damit die Render-Logs
+    // beim Start lesbar bleiben.
+    if ((error as { permanent?: unknown } | null)?.permanent) {
+      console.warn(
+        "[start] Datenbank-Vorlauf übersprungen (Konfiguration – siehe Meldung oben).",
+      );
+      return;
+    }
     console.error("[start] Datenbank-Vorlauf fehlgeschlagen", error);
+  } finally {
+    // Aufgeräumt: ohne `clearTimeout` bliebe der 15-s-Timer bis zum Ablauf
+    // referenziert, obwohl das Rennen längst entschieden ist.
+    if (timer) clearTimeout(timer);
   }
 }
 ```
@@ -419,10 +504,23 @@ async function warmUpDatabase(): Promise<void> {
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
-import { PGlite } from "@electric-sql/pglite";
 import { drizzle as drizzleNodePg } from "drizzle-orm/node-postgres";
-import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { Pool, type PoolConfig } from "pg";
+
+/**
+ * PGlite wird AUSSCHLIESSLICH als Typ importiert (`import type` verschwindet
+ * beim Kompilieren). Grund: RAM.
+ *
+ * Gemessen (Node 22, `process.memoryUsage.rss()`):
+ *   - `import("@electric-sql/pglite")`          →  +9 MB
+ *   - `new PGlite(); await db.waitReady`        → +456 MB  (!)
+ *   - kompletter `next start` mit PGlite        →  596 MB RSS
+ * Eine eingebettete PostgreSQL-Instanz lebt als WASM IN DIESEM Node-Prozess und
+ * sprengt damit das 512-MB-Limit der Render-Free-Instanz. Deshalb wird das
+ * Modul nicht mehr pauschal beim Serverstart geladen, sondern nur noch in dem
+ * Moment, in dem PGlite tatsächlich gestartet werden darf (siehe `pglitePolicy`).
+ */
+import type { PGlite as PGliteClient } from "@electric-sql/pglite";
 
 import { ensureSchema } from "@/db/migrate";
 
@@ -434,9 +532,11 @@ export type DbStorage = "external" | "file" | "memory" | "none";
 interface DbGlobals {
   pool?: Pool;
   db?: Database;
-  pglite?: PGlite;
+  pglite?: PGliteClient;
   pgliteInit?: Promise<Database>;
   pgliteStorage: DbStorage;
+  /** Blockade-Hinweis nur EINMAL pro Prozess loggen (kein Log-Spam). */
+  pgliteBlockLogged?: boolean;
   schemaInit?: WeakMap<object, Promise<void>>;
   failures: number;
   resets: number;
@@ -515,6 +615,116 @@ export function getDbMode(): DbMode {
   return resolveDatabaseUrl() ? "postgres" : "pglite";
 }
 
+/* ------------------------------------------------------------------ *
+ * PGlite-Schutz: Die eingebettete Datenbank darf nie einen Container
+ * sprengen (gemessen: +456 MB RSS, kompletter Server 596 MB > 512 MB).
+ * ------------------------------------------------------------------ */
+
+/**
+ * Kleinste Container-RAM-Grenze, ab der PGlite noch gestartet werden darf.
+ *
+ * Herleitung aus der Messung: PGlite selbst ~456 MB + Node/Next.js-Server
+ * ~145 MB ≈ 600 MB. Unter 900 MB bleibt also kein Spielraum für Requests,
+ * GC und den Turbopack-Runtime-Overhead – deshalb Standard 900 MB.
+ * Über `PGLITE_MIN_MEMORY_MB` anpassbar.
+ */
+const PGLITE_MIN_MEMORY_MB_DEFAULT = 900;
+
+function envFlag(name: string): boolean {
+  const raw = (process.env[name] ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function pgliteMinMemoryMb(): number {
+  const configured = Number(process.env.PGLITE_MIN_MEMORY_MB);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : PGLITE_MIN_MEMORY_MB_DEFAULT;
+}
+
+/**
+ * Fehler, den ein Neuaufbau der Verbindung NICHT beheben kann (fehlende
+ * Konfiguration). Wichtig, damit `noteDbFailure` nicht endlos Pools verwirft
+ * und `resets` in `/api/health` ins Uferlose steigt.
+ */
+export class DbUnavailableError extends Error {
+  readonly permanent = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "DbUnavailableError";
+  }
+}
+
+/**
+ * Handelt es sich um einen Konfigurationsfehler, den auch ein Neuaufbau der
+ * Verbindung nicht heilt (z. B. blockiertes PGlite ohne DATABASE_URL)?
+ * Öffentlich, damit Start-Hook und Health-Monitor solche Fehler kurz und ohne
+ * Stacktrace loggen können, statt bei jedem Versuch denselben Text zu kippen.
+ */
+export function isPermanentDbError(error: unknown): boolean {
+  return Boolean((error as { permanent?: unknown } | null)?.permanent);
+}
+
+export type PglitePolicy =
+  | { allowed: true }
+  | { allowed: false; reason: string; hint: string };
+
+/**
+ * Darf PGlite (eingebettetes PostgreSQL im Prozess) in DIESER Umgebung
+ * gestartet werden?
+ *
+ * - `PGLITE_IN_PRODUCTION=1`      → immer erlaubt (bewusster Notausgang,
+ *                                   nur auf Instanzen mit ≥ 1 GB RAM nutzen).
+ * - Container meldet < 900 MB     → verboten (das ist der Render-Free-Fall:
+ *                                   512 MB; PGlite würde die Instanz sofort
+ *                                   über das Limit heben → OOM-Kill).
+ * - `NODE_ENV=production`         → verboten, außer Override (Produktion soll
+ *                                   eine echte Datenbank nutzen).
+ * - sonst (lokale Entwicklung)    → erlaubt, Verhalten unverändert.
+ *
+ * `process.constrainedMemory()` liefert das cgroup-Limit des Containers und
+ * `undefined`, wenn Node ohne Grenze läuft – dann greift nur die NODE_ENV-Regel.
+ */
+export function pglitePolicy(): PglitePolicy {
+  if (envFlag("PGLITE_IN_PRODUCTION")) return { allowed: true };
+
+  const hint =
+    "Bitte eine externe PostgreSQL-Datenbank setzen: DATABASE_URL (z. B. Neon) " +
+    "oder AUTO_DATABASE_URL (wird von der render.yaml-Blueprint automatisch " +
+    "befüllt). Notfall-Override für Instanzen mit mindestens 1 GB RAM: " +
+    "PGLITE_IN_PRODUCTION=1";
+
+  const limitBytes =
+    typeof process.constrainedMemory === "function"
+      ? process.constrainedMemory()
+      : undefined;
+  const limitMb =
+    typeof limitBytes === "number" && limitBytes > 0
+      ? Math.round(limitBytes / 1_048_576)
+      : undefined;
+  const minMb = pgliteMinMemoryMb();
+
+  if (limitMb !== undefined && limitMb < minMb) {
+    return {
+      allowed: false,
+      reason:
+        `Der Container meldet ein RAM-Limit von ${limitMb} MB ` +
+        `(PGlite braucht allein ~456 MB, benötigt werden ≥ ${minMb} MB)`,
+      hint,
+    };
+  }
+  if (process.env.NODE_ENV === "production") {
+    return {
+      allowed: false,
+      reason:
+        "NODE_ENV=production – PGlite würde als WASM-PostgreSQL im Serverprozess " +
+        "laufen und ~456 MB RAM belegen (gemessen: 596 MB RSS für next start)",
+      hint,
+    };
+  }
+  return { allowed: true };
+}
+
 export interface DbStatus {
   mode: DbMode;
   /** Konkreter Anbieter: `neon`, sonstiges externes `postgres` oder `pglite`. */
@@ -527,18 +737,31 @@ export interface DbStatus {
   /** Wie oft die Verbindung bereits automatisch neu aufgebaut wurde. */
   resets: number;
   lastError?: string;
+  /**
+   * Konfigurationshinweis, wenn die Datenbank BEWUSST nicht gestartet wurde
+   * (PGlite-Schutz). Steht 1:1 in `/api/health`, damit die Ursache sofort
+   * sichtbar ist und nicht erst in den Render-Logs gesucht werden muss.
+   */
+  notice?: string;
 }
 
 export function dbStatus(): DbStatus {
   const g = globals();
+  const mode = getDbMode();
+  let notice: string | undefined;
+  if (mode === "pglite") {
+    const policy = pglitePolicy();
+    if (!policy.allowed) notice = `${policy.reason}. ${policy.hint}`;
+  }
   return {
-    mode: getDbMode(),
+    mode,
     provider: getDbProvider(),
-    storage: getDbMode() === "postgres" ? "external" : g.pgliteStorage,
+    storage: mode === "postgres" ? "external" : g.pgliteStorage,
     ready: g.ready,
     failures: g.failures,
     resets: g.resets,
     ...(g.lastError ? { lastError: g.lastError } : {}),
+    ...(notice ? { notice } : {}),
   };
 }
 
@@ -570,22 +793,55 @@ function pgliteDataDir(): string {
   return process.env.PGLITE_DIR ?? path.join(process.cwd(), ".data", "pglite");
 }
 
-async function createPglite(
-  dir: string | null,
-): Promise<{ client: PGlite; db: Database }> {
-  if (dir) mkdirSync(dir, { recursive: true });
-  const client = dir ? new PGlite(dir) : new PGlite();
-  await withTimeout(client.waitReady, 30_000, "PGlite-Start");
-  return { client, db: drizzlePglite(client) as unknown as Database };
+/**
+ * Lädt PGlite und den passenden Drizzle-Treiber – und zwar ERST hier.
+ *
+ * Vorher standen beide als statische `import`-Zeilen am Dateianfang. Folge:
+ * Jeder Server-Chunk, der `@/db` importiert (also jede API-Route UND der
+ * Instrumentation-Hook beim Start), hat das PGlite-Modul samt WASM-Lader
+ * geladen, obwohl auf Render immer eine externe Datenbank genutzt wird.
+ * `import()`-Ausdrücke sind dagegen lazy: ohne PGlite-Start bleiben Modul und
+ * WASM komplett außerhalb des Prozesses.
+ */
+async function loadPgliteModules(): Promise<{
+  create: (dir: string | null) => Promise<PGliteClient>;
+  wrap: (client: PGliteClient) => Database;
+}> {
+  const [{ PGlite }, { drizzle }] = await Promise.all([
+    import("@electric-sql/pglite"),
+    import("drizzle-orm/pglite"),
+  ]);
+  return {
+    create: async (dir) => {
+      if (dir) mkdirSync(dir, { recursive: true });
+      const client = dir ? new PGlite(dir) : new PGlite();
+      await withTimeout(client.waitReady, 30_000, "PGlite-Start");
+      return client;
+    },
+    wrap: (client) => drizzle(client) as unknown as Database,
+  };
 }
 
 async function initPglite(): Promise<Database> {
   const g = globals();
+
+  // RAM-Schutz: In Produktion bzw. in kleinen Containern (< 900 MB) wird
+  // PGlite gar nicht erst geladen – sonst OOM-Kill durch Render.
+  const policy = pglitePolicy();
+  if (!policy.allowed) {
+    const message = `PGlite wurde nicht gestartet: ${policy.reason}. ${policy.hint}`;
+    if (!g.pgliteBlockLogged) {
+      g.pgliteBlockLogged = true;
+      console.error(`[db] ${message}`);
+    }
+    throw new DbUnavailableError(message);
+  }
+
+  const { create, wrap } = await loadPgliteModules();
   const dir = pgliteDataDir();
-  let client: PGlite;
-  let db: Database;
+  let client: PGliteClient;
   try {
-    ({ client, db } = await createPglite(dir));
+    client = await create(dir);
     g.pgliteStorage = "file";
   } catch (error) {
     console.warn(
@@ -594,12 +850,12 @@ async function initPglite(): Promise<Database> {
         `für dauerhafte Lobbys DATABASE_URL setzen.`,
       error,
     );
-    ({ client, db } = await createPglite(null));
+    client = await create(null);
     g.pgliteStorage = "memory";
   }
   g.pglite = client;
-  g.db = db;
-  return db;
+  g.db = wrap(client);
+  return g.db;
 }
 
 function getPgliteDatabase(): Promise<Database> {
@@ -766,9 +1022,18 @@ export async function resetDb(): Promise<void> {
  */
 export function noteDbFailure(error?: unknown): void {
   const g = globals();
-  g.failures += 1;
   g.ready = false;
   if (error !== undefined) g.lastError = errorMessage(error);
+
+  // Konfigurationsfehler (z. B. PGlite-Schutz ohne DATABASE_URL) heilt kein
+  // Neuaufbau. Würde hier mitgezählt, stiege `resets` in `/api/health` endlos
+  // und alle 3 Aufrufe würde sinnlos ein Pool verworfen.
+  if (isPermanentDbError(error)) {
+    g.failures = 0;
+    return;
+  }
+
+  g.failures += 1;
   if (g.failures === 3 || g.failures % 10 === 0) {
     console.error(
       `[db] ${g.failures} Fehler in Folge (${g.lastError ?? "unbekannt"}) – ` +
@@ -1055,6 +1320,7 @@ import { sql } from "drizzle-orm";
 import {
   dbStatus,
   getDb,
+  isPermanentDbError,
   noteDbFailure,
   noteDbSuccess,
   type DbMode,
@@ -1124,6 +1390,8 @@ interface HealthState {
   running?: Promise<void>;
   monitor?: ReturnType<typeof setInterval>;
   guardsInstalled?: boolean;
+  /** Letzter bereits geloggter Fehlertext – verhindert Dauer-Log-Spam. */
+  loggedError?: string;
 }
 
 function state(): HealthState {
@@ -1179,10 +1447,25 @@ async function runCheck(): Promise<void> {
     await db.execute(sql`select 1`);
     noteDbSuccess();
     g.ok = true;
+    g.loggedError = undefined;
   } catch (error) {
     // Fehler zählen + ggf. Verbindung neu aufbauen (siehe src/db/index.ts).
     noteDbFailure(error);
-    console.error("[health] Datenbankprüfung im Hintergrund fehlgeschlagen", error);
+    // Derselbe Fehler soll nicht alle 60 s erneut ins Log: Bei einem
+    // Konfigurationsfehler (z. B. PGlite-Schutz ohne DATABASE_URL) würde sonst
+    // pro Minute dieselbe Meldung auftauchen und die Render-Logs fluten.
+    const text = error instanceof Error ? error.message : String(error);
+    if (g.loggedError !== text) {
+      g.loggedError = text;
+      if (isPermanentDbError(error)) {
+        // Konfigurationsfehler (z. B. PGlite-Schutz ohne DATABASE_URL): kurz und
+        // ohne Stacktrace. Der ausführliche Text steht bereits beim Serverstart
+        // im Log und dauerhaft in `/api/health` unter `status.notice`.
+        console.error(`[health] Datenbank nicht nutzbar: ${text}`);
+      } else {
+        console.error("[health] Datenbankprüfung im Hintergrund fehlgeschlagen", error);
+      }
+    }
     g.ok = false;
   } finally {
     g.latencyMs = Date.now() - started;
@@ -2324,12 +2607,7 @@ export const NARRATION_LABELS: Record<NarrationKind, string> = {
 ## Datei: `src/lib/storage.ts`
 
 ```tsx
-import {
-  DeleteObjectCommand,
-  GetObjectCommand,
-  PutObjectCommand,
-  S3Client,
-} from "@aws-sdk/client-s3";
+import type { S3Client as S3ClientType } from "@aws-sdk/client-s3";
 
 /**
  * Neon Object Storage (S3-kompatibel, branch-scoped).
@@ -2351,12 +2629,54 @@ export const storageEnabled = Boolean(
     process.env.AWS_ENDPOINT_URL_S3,
 );
 
-let client: S3Client | null = null;
+/**
+ * SDK und S3-Client werden ERST beim ersten echten Bild-Upload/-Download geladen.
+ *
+ * Warum das RAM spart – der Mechanismus (Next.js 16, Turbopack):
+ * `@aws-sdk/client-s3` steht bereits in Next.js' eigener Liste
+ * `next/dist/lib/server-external-packages.jsonc`, wird also NICHT gebündelt,
+ * sondern im Server-Chunk als `require("@aws-sdk/client-s3-…")` referenziert.
+ * Entscheidend ist, WANN dieses `require` ausgeführt wird:
+ *   - Vorher stand der Import statisch am Dateianfang → das SDK wurde beim
+ *     Initialisieren dieses Moduls geladen. Und dieses Modul liegt im Startpfad:
+ *     `src/instrumentation.ts` → `src/lib/health.ts` → `src/lib/storage.ts`
+ *     (health.ts liest `storageEnabled`). Der SDK landete also bei JEDEM
+ *     Serverstart im Speicher, auch ganz ohne konfigurierten Bucket.
+ *   - Jetzt steht er in einem `import()`-Ausdruck, den Turbopack als lazy
+ *     Chunk-Load (`e.A(67533)`) übersetzt → ohne `AWS_*`-Variablen wird das
+ *     SDK nie geladen und kostet 0 MB.
+ *
+ * Gemessen (A/B, sonst identischer Build, 12 pollende Spieler):
+ *   statischer Import: Boot 138–139 MB, Spitze 154 MB
+ *   lazy `import()`:   Boot 131 MB,      Spitze 150 MB   → ~8 MB weniger
+ *   (isoliert in einem leeren Node-Prozess kostet `import("@aws-sdk/client-s3")`
+ *   sogar +30 MB RSS; im bereits laufenden Next-Server ist der Zuwachs kleiner,
+ *   weil sich Laufzeit-Overhead teilt.)
+ *
+ * `storageEnabled` bleibt bewusst ein synchroner Env-Check – health.ts braucht
+ * den Wert beim Start, ohne dafür ein Modul laden zu müssen.
+ */
+type S3Module = typeof import("@aws-sdk/client-s3");
 
-function s3(): S3Client | null {
-  if (!storageEnabled) return null;
-  client ??= new S3Client({ forcePathStyle: true });
-  return client;
+/** Einmal geladenes SDK + ein einziger, wiederverwendeter Client. */
+type LoadedS3 = { mod: S3Module; client: S3ClientType };
+
+let loaded: Promise<LoadedS3 | null> | null = null;
+
+function s3(): Promise<LoadedS3 | null> {
+  if (!storageEnabled) return Promise.resolve(null);
+  loaded ??= import("@aws-sdk/client-s3")
+    .then((mod) => ({
+      mod,
+      client: new mod.S3Client({ forcePathStyle: true }) as S3ClientType,
+    }))
+    .catch((error: unknown) => {
+      // Fehlschlag nicht dauerhaft cachen (sonst wäre der Bucket bis zum
+      // nächsten Neustart tot) – der nächste Versuch lädt erneut.
+      loaded = null;
+      throw error;
+    });
+  return loaded;
 }
 
 export type StoredObject = {
@@ -2369,9 +2689,10 @@ export async function putObject(
   bytes: Uint8Array,
   contentType: string,
 ): Promise<void> {
-  const s3Client = s3();
-  if (!s3Client) throw new Error("Object Storage ist nicht konfiguriert");
-  await s3Client.send(
+  const bucket = await s3();
+  if (!bucket) throw new Error("Object Storage ist nicht konfiguriert");
+  const { PutObjectCommand } = bucket.mod;
+  await bucket.client.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: key,
@@ -2384,10 +2705,11 @@ export async function putObject(
 }
 
 export async function getObject(key: string): Promise<StoredObject | null> {
-  const s3Client = s3();
-  if (!s3Client) return null;
+  const bucket = await s3();
+  if (!bucket) return null;
   try {
-    const result = await s3Client.send(
+    const { GetObjectCommand } = bucket.mod;
+    const result = await bucket.client.send(
       new GetObjectCommand({ Bucket: BUCKET, Key: key }),
     );
     const bytes = await result.Body?.transformToByteArray();
@@ -2404,10 +2726,11 @@ export async function getObject(key: string): Promise<StoredObject | null> {
 
 /** Alte Bildversion aufräumen – Fehler dürfen den Upload nicht scheitern lassen. */
 export async function deleteObject(key: string): Promise<void> {
-  const s3Client = s3();
-  if (!s3Client) return;
+  const bucket = await s3();
+  if (!bucket) return;
   try {
-    await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+    const { DeleteObjectCommand } = bucket.mod;
+    await bucket.client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
   } catch (error) {
     console.warn(`[storage] Objekt ${key} konnte nicht gelöscht werden`, error);
   }
@@ -5349,6 +5672,388 @@ export function SignInScreen({ onDone }: { onDone?: () => void }) {
 }
 ```
 
+## Datei: `scripts/measure-ram.mjs`
+
+```js
+#!/usr/bin/env node
+/**
+ * RAM-Messung für die StarAFK-App (Render-Free-Plan: 512 MB).
+ *
+ * Startet den FERTIG gebauten Server (`npm run build` vorher ausführen) in
+ * verschiedenen Szenarien, simuliert nebenbei Spieler, die den Lobby-Zustand
+ * pollen, und misst dabei durchgehend den RSS-Speicher des Serverprozesses.
+ *
+ * Aufruf:
+ *   node scripts/measure-ram.mjs                      # alle drei Szenarien
+ *   node scripts/measure-ram.mjs --scenario extern    # nur mit externer DB
+ *   node scripts/measure-ram.mjs --players 24 --seconds 40
+ *   node scripts/measure-ram.mjs --with-build         # zusätzlich Build-Peak
+ *
+ * Szenarien:
+ *   extern   – DATABASE_URL gesetzt (Normalfall auf Render, sobald die
+ *              Blueprint-Datenbank oder Neon verdrahtet ist)
+ *   blocked  – KEINE Datenbank-URL: PGlite bleibt aus (RAM-Schutz, siehe
+ *              `pglitePolicy` in src/db/index.ts). Die Seite muss trotzdem
+ *              antworten und /api/health muss die Ursache nennen.
+ *   pglite   – KEINE Datenbank-URL, aber PGLITE_IN_PRODUCTION=1: zeigt den
+ *              RAM-Preis der eingebetteten Datenbank (Vorsicht: > 500 MB!).
+ *
+ * Nur Node-Bordmittel, keine zusätzlichen Abhängigkeiten.
+ */
+import { execSync, spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+
+const ROOT = path.resolve(import.meta.dirname, "..");
+const LIMIT_MB = Number(process.env.RENDER_MEMORY_LIMIT_MB ?? 512);
+const POLL_INTERVAL_MS = 1_200; // wie im Frontend (POLL_ACTIVE_MS)
+
+/* ----------------------------- CLI-Argumente ---------------------------- */
+
+const cliArgs = process.argv.slice(2);
+
+function argValue(name, fallback) {
+  const index = cliArgs.indexOf(`--${name}`);
+  return index >= 0 && cliArgs[index + 1] ? cliArgs[index + 1] : fallback;
+}
+
+const onlyScenario = argValue("scenario", null);
+const players = Math.max(1, Number(argValue("players", 12)) || 12);
+const seconds = Math.max(5, Number(argValue("seconds", 25)) || 25);
+const withBuild = cliArgs.includes("--with-build");
+const basePort = Number(argValue("port", 3210)) || 3210;
+
+const ALL_SCENARIOS = [
+  {
+    id: "extern",
+    label: "externe Datenbank (DATABASE_URL gesetzt)",
+    env: {
+      // Absichtlich eine nicht erreichbare Adresse: gemessen werden soll der
+      // Speicherbedarf des SERVERS, nicht eine laufende Datenbank. Wer den
+      // vollen Durchlauf mit echter DB will, setzt DATABASE_URL selbst und
+      // startet mit: DATABASE_URL=… node scripts/measure-ram.mjs --scenario extern
+      DATABASE_URL: process.env.DATABASE_URL || "postgresql://u:p@127.0.0.1:5432/db",
+    },
+    lobbyErwartet: false,
+  },
+  {
+    id: "blocked",
+    label: "ohne DB – PGlite blockiert (Produktions-Standard)",
+    env: { DATABASE_URL: "", AUTO_DATABASE_URL: "" },
+    lobbyErwartet: false,
+  },
+  {
+    id: "pglite",
+    label: "ohne DB – PGlite erzwungen (PGLITE_IN_PRODUCTION=1)",
+    env: { DATABASE_URL: "", AUTO_DATABASE_URL: "", PGLITE_IN_PRODUCTION: "1" },
+    lobbyErwartet: true,
+  },
+];
+
+const scenarios = onlyScenario
+  ? ALL_SCENARIOS.filter((scenario) => scenario.id === onlyScenario)
+  : ALL_SCENARIOS;
+
+if (scenarios.length === 0) {
+  console.error(
+    `Unbekanntes Szenario "${onlyScenario}". Möglich: ${ALL_SCENARIOS.map(
+      (scenario) => scenario.id,
+    ).join(", ")}`,
+  );
+  process.exit(1);
+}
+
+/* -------------------------------- Helfer -------------------------------- */
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** RSS eines Prozesses in MB (Linux: /proc, sonst `ps`). */
+function rssMb(pid) {
+  if (!pid) return NaN;
+  try {
+    const match = /VmRSS:\s+(\d+) kB/.exec(readFileSync(`/proc/${pid}/status`, "utf8"));
+    if (match) return Number(match[1]) / 1024;
+  } catch {
+    /* kein /proc verfügbar (z. B. macOS) – Fallback unten */
+  }
+  try {
+    return Number(execSync(`ps -o rss= -p ${pid}`, { encoding: "utf8" }).trim()) / 1024;
+  } catch {
+    return NaN;
+  }
+}
+
+/** Summe aller Node-Prozesse in MB – für die Build-Messung (Worker!). */
+function allNodeRssMb() {
+  try {
+    return (
+      execSync("ps -eo rss,args --no-headers", { encoding: "utf8" })
+        .split("\n")
+        .filter((line) => /node|next/.test(line) && !line.includes("measure-ram"))
+        .reduce((sum, line) => sum + (Number(line.trim().split(/\s+/)[0]) || 0), 0) /
+      1024
+    );
+  } catch {
+    return NaN;
+  }
+}
+
+const fmt = (value) => (Number.isFinite(value) ? `${Math.round(value)} MB` : "n/a");
+
+async function waitForHealth(url, timeoutMs = 60_000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const response = await fetch(`${url}/api/health`, { cache: "no-store" });
+      if (response.ok) return response.json();
+    } catch {
+      /* Server startet noch */
+    }
+    await sleep(400);
+  }
+  return null;
+}
+
+/**
+ * Simuliert `count` Spieler, die alle 1,2 s den Lobby-Zustand pollen – exakt
+ * das Lastmuster, das die echte Oberfläche erzeugt (POLL_ACTIVE_MS).
+ */
+function startPolling(url, code, playerId, count) {
+  const target = code
+    ? `${url}/api/lobby/state?code=${encodeURIComponent(code)}&pid=${encodeURIComponent(playerId)}`
+    : `${url}/api/health`;
+  const offsets = [];
+  const intervals = [];
+  for (let index = 0; index < count; index += 1) {
+    // Versetzt starten, damit nicht alle im selben Tick feuern.
+    offsets.push(
+      setTimeout(() => {
+        fetch(target, { cache: "no-store" }).catch(() => {});
+        intervals.push(
+          setInterval(() => {
+            fetch(target, { cache: "no-store" }).catch(() => {});
+          }, POLL_INTERVAL_MS),
+        );
+      }, index * 50),
+    );
+  }
+  // Wichtig: ALLE Timer wieder abräumen – sonst läuft die Messung weiter und
+  // hält den Prozess künstlich beschäftigt (genau das Muster, das in der App
+  // selbst vermieden wird).
+  return () => {
+    offsets.forEach((timer) => clearTimeout(timer));
+    intervals.forEach((timer) => clearInterval(timer));
+  };
+}
+
+/* ------------------------------ ein Durchlauf ---------------------------- */
+
+async function measure(scenario, port) {
+  console.log(`\n── Szenario: ${scenario.label} ─────────────────────────`);
+
+  const child = spawn(
+    process.execPath,
+    [
+      `--max-old-space-size=${process.env.NODE_MAX_OLD_SPACE_MB ?? 384}`,
+      "node_modules/next/dist/bin/next",
+      "start",
+      "--hostname",
+      "127.0.0.1",
+      "--port",
+      String(port),
+    ],
+    {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        NODE_ENV: "production",
+        NEXT_TELEMETRY_DISABLED: "1",
+        ...scenario.env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+
+  const logs = [];
+  child.stdout.on("data", (chunk) => logs.push(String(chunk)));
+  child.stderr.on("data", (chunk) => logs.push(String(chunk)));
+
+  let peak = 0;
+  let samples = 0;
+  let sum = 0;
+  const sampler = setInterval(() => {
+    const value = rssMb(child.pid);
+    if (!Number.isFinite(value)) return;
+    samples += 1;
+    sum += value;
+    if (value > peak) peak = value;
+  }, 250);
+
+  const url = `http://127.0.0.1:${port}`;
+  const health = await waitForHealth(url);
+  const boot = rssMb(child.pid);
+
+  const stop = async () => {
+    clearInterval(sampler);
+    child.kill("SIGTERM");
+    await sleep(700);
+    if (child.exitCode === null) child.kill("SIGKILL");
+  };
+
+  if (!health) {
+    await stop();
+    console.log(
+      `  ❌ Server hat nicht geantwortet. Log-Auszug:\n${logs
+        .join("")
+        .split("\n")
+        .slice(-12)
+        .map((line) => `     ${line}`)
+        .join("\n")}`,
+    );
+    return null;
+  }
+
+  // Lobby anlegen – klappt nur, wenn im Szenario eine Datenbank mitspielt.
+  let code = "";
+  let playerId = "";
+  try {
+    const created = await fetch(`${url}/api/lobby/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "WERWOLF", profile: { name: "Messung" } }),
+    }).then((response) => response.json());
+    if (created?.ok) {
+      code = created.lobby?.code ?? "";
+      playerId = created.selfId ?? "";
+    }
+  } catch {
+    /* ohne erreichbare Datenbank erwartet */
+  }
+
+  const stopPolling = startPolling(url, code, playerId, players);
+  await sleep(seconds * 1000);
+  stopPolling();
+  await sleep(1500);
+
+  const steady = rssMb(child.pid);
+  const healthNow = await fetch(`${url}/api/health`, { cache: "no-store" })
+    .then((response) => response.json())
+    .catch(() => null);
+  const homepage = await fetch(`${url}/`, { cache: "no-store" })
+    .then((response) => response.status)
+    .catch(() => 0);
+
+  await stop();
+
+  const average = samples ? sum / samples : NaN;
+  const overLimit = peak > LIMIT_MB;
+
+  console.log(`  Boot-RSS:              ${fmt(boot)}`);
+  console.log(`  RSS bei ${String(players).padStart(2)} Pollern:     ${fmt(steady)}`);
+  console.log(`  RSS-Durchschnitt:      ${fmt(average)}   (${samples} Messpunkte)`);
+  console.log(
+    `  RSS-Spitze:            ${fmt(peak)}   ${
+      overLimit ? `❌ über dem Limit (${LIMIT_MB} MB)` : `✅ unter ${LIMIT_MB} MB`
+    }`,
+  );
+  console.log(
+    `  /api/health:           db=${healthNow?.db ?? "?"} provider=${
+      healthNow?.provider ?? "?"
+    } storage=${healthNow?.status?.storage ?? "?"} ok=${healthNow?.ok}`,
+  );
+  if (healthNow?.status?.notice) {
+    console.log(`  Hinweis in health:     ${healthNow.status.notice.slice(0, 150)}…`);
+  }
+  console.log(`  Startseite:            HTTP ${homepage}`);
+  console.log(
+    `  Lobby anlegen:         ${
+      code ? `ok (Code ${code})` : "nicht möglich (ohne Datenbank erwartet)"
+    }`,
+  );
+  if (scenario.lobbyErwartet && !code) {
+    console.log("  ❌ Hier hätte die Lobby funktionieren müssen!");
+  }
+
+  return {
+    scenario: scenario.id,
+    boot,
+    steady,
+    peak,
+    average,
+    overLimit,
+    homepage,
+  };
+}
+
+/* --------------------------------- Build -------------------------------- */
+
+async function measureBuild() {
+  console.log("\n── Build: npm run build ────────────────────────────────");
+  const child = spawn("npm", ["run", "build"], {
+    cwd: ROOT,
+    env: { ...process.env, NEXT_TELEMETRY_DISABLED: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let peak = 0;
+  const sampler = setInterval(() => {
+    const value = allNodeRssMb();
+    if (Number.isFinite(value) && value > peak) peak = value;
+  }, 250);
+  const exitCode = await new Promise((resolve) => child.on("close", resolve));
+  clearInterval(sampler);
+  console.log(`  Build-Spitze (alle Node-Prozesse): ${fmt(peak)}   Exit=${exitCode}`);
+  console.log(
+    "  Einordnung: Der Build läuft auf Render als eigener Schritt; das\n" +
+      "  512-MB-Limit des Laufzeitprozesses gilt dafür nicht zwangsläufig.",
+  );
+  return peak;
+}
+
+/* ---------------------------------- Main -------------------------------- */
+
+if (!existsSync(path.join(ROOT, ".next", "BUILD_ID"))) {
+  console.error(
+    "Kein Build gefunden (.next/BUILD_ID fehlt). Bitte zuerst ausführen: npm run build",
+  );
+  process.exit(1);
+}
+
+console.log(
+  `StarAFK RAM-Messung – Container-Limit ${LIMIT_MB} MB, ` +
+    `${players} simulierte Spieler, ${seconds} s pro Szenario`,
+);
+
+const buildPeak = withBuild ? await measureBuild() : null;
+const results = [];
+let port = basePort;
+for (const scenario of scenarios) {
+  const result = await measure(scenario, port);
+  if (result) results.push(result);
+  port += 1;
+  await sleep(1000);
+}
+
+console.log("\n=== Zusammenfassung ===================================");
+console.log("Szenario         Boot       Dauerlauf  Spitze     Status");
+for (const result of results) {
+  console.log(
+    `${result.scenario.padEnd(16)} ${fmt(result.boot).padEnd(10)} ${fmt(
+      result.steady,
+    ).padEnd(10)} ${fmt(result.peak).padEnd(10)} ${
+      result.overLimit ? `❌ > ${LIMIT_MB} MB` : `✅ ≤ ${LIMIT_MB} MB`
+    }`,
+  );
+}
+if (buildPeak !== null) console.log(`\nBuild-Spitze:    ${fmt(buildPeak)}`);
+console.log(
+  `\nDeutung: „Spitze“ ist der höchste RSS-Wert des Serverprozesses – genau der\n` +
+    `Wert, den Render im Dashboard anzeigt (Service → Metrics → Memory).\n` +
+    `Das Szenario "pglite" zeigt, warum die eingebettete Datenbank in Produktion\n` +
+    `blockiert wird: Sie allein braucht mehr als das gesamte 512-MB-Budget.`,
+);
+```
+
 ## Datei: `scripts/build-readme.mjs`
 
 ````js
@@ -5408,6 +6113,7 @@ const TEXT_FILES = [
   "src/components/werwolf/glass-card.tsx",
   "src/components/auth/auth-gate.tsx",
   "src/components/auth/sign-in-screen.tsx",
+  "scripts/measure-ram.mjs",
   "scripts/build-readme.mjs",
 ];
 
@@ -5465,15 +6171,22 @@ sections.push(`# Werwolf Lobby — Vollständiger Quellcode
 > 1. Leeres Next.js-Projekt anlegen (oder Dateien einfach in einen Ordner schreiben).
 > 2. ALLE Textdateien exakt wie hier abgedruckt anlegen.
 > 3. Alle Binärdateien von dieser Website herunterladen (Liste unten).
-> 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig, die App läuft
->    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne \`DATABASE_URL\` wird
->    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in \`.data/\` angelegt.
-> 5. Optional (empfohlen auf Render): \`.env\` bzw. Umgebungsvariable
->    \`DATABASE_URL=postgresql://…\` für eine externe PostgreSQL-Datenbank — die
->    Tabellen werden ebenfalls automatisch angelegt (kein \`drizzle-kit push\`).
->    Ohne \`DATABASE_URL\` läuft die App eingebettet (PGlite); auf Render-Free-
->    Instanzen ist das Dateisystem flüchtig, Lobbys sind dann nach einem
->    Neustart weg (die Lobby wird automatisch mit gleichem Code neu geöffnet).
+> 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig.
+>    **Wichtig (RAM):** \`next start\` setzt \`NODE_ENV=production\`. Dort startet die
+>    eingebettete PGlite-Datenbank NICHT mehr von selbst, weil sie als
+>    WASM-PostgreSQL im Serverprozess ~456 MB belegt (gemessen: 596 MB RSS ohne
+>    Last, 758 MB Spitze mit 6 pollenden Spielern) und eine 512-MB-Instanz damit
+>    sofort gekillt wird. Für \`npm run start\` also \`DATABASE_URL\` setzen — oder
+>    bei >= 1 GB RAM den Notausgang \`PGLITE_IN_PRODUCTION=1\`.
+>    In \`npm run dev\` (\`NODE_ENV=development\`) bleibt alles beim Alten: ohne
+>    \`DATABASE_URL\` entsteht automatisch \`.data/pglite\`.
+> 5. Externe PostgreSQL-Datenbank (auf Render Pflicht): \`.env\` bzw.
+>    Umgebungsvariable \`DATABASE_URL=postgresql://…\` — die Tabellen werden
+>    ebenfalls automatisch angelegt (kein \`drizzle-kit push\`). Auf Render wird
+>    \`AUTO_DATABASE_URL\` von der Blueprint (\`render.yaml\`) automatisch befüllt.
+>    Ohne gültige Datenbank bleibt die Seite erreichbar (Startseite, \`/api/health\`),
+>    die Lobby-API meldet einen klaren Fehler und die Ursache steht in
+>    \`/api/health\` unter \`status.notice\`.
 
 ## Projektübersicht
 
@@ -5502,6 +6215,11 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Robuste Datenbank**: Verbindung baut sich bei Fehlern automatisch neu auf
   (\`src/db/index.ts\`), PGlite fällt bei Problemen mit dem Datenordner in den
   Speicher-Modus zurück; \`/api/health\` zeigt Modus, Speicherart und Fehlerzähler.
+- **RAM-Budget 512 MB**: PGlite wird lazy geladen und in Produktion bzw. in
+  Containern unter \`PGLITE_MIN_MEMORY_MB\` (Standard 900) blockiert
+  (\`pglitePolicy()\`), der S3-Client wird nur mit konfiguriertem Bucket geladen,
+  und das \`start\`-Skript begrenzt den V8-Heap (\`NODE_MAX_OLD_SPACE_MB\`,
+  Standard 384). Nachmessen: \`node scripts/measure-ram.mjs\`.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 

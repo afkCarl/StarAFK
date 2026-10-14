@@ -183,6 +183,12 @@ async function main() {
     PORT: String(APP_A_PORT),
     PGLITE_DIR: path.join(tmp, "pglite-a"),
     DATABASE_URL: "",
+    // Phase A prüft bewusst den PGlite-Pfad. Seit der RAM-Optimierung startet
+    // PGlite in Produktion (`next start` ⇒ NODE_ENV=production) bzw. in
+    // Containern unter 900 MB nicht mehr von selbst, weil die eingebettete
+    // PostgreSQL ~456 MB RAM belegt und eine 512-MB-Instanz sofort killt.
+    // Für den Test wird sie deshalb explizit freigeschaltet.
+    PGLITE_IN_PRODUCTION: "1",
     NEON_AUTH_BASE_URL: "",
     AWS_ENDPOINT_URL_S3: "",
     NEON_AI_GATEWAY_BASE_URL: "",

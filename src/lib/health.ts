@@ -24,6 +24,7 @@ import { sql } from "drizzle-orm";
 import {
   dbStatus,
   getDb,
+  isPermanentDbError,
   noteDbFailure,
   noteDbSuccess,
   type DbMode,
@@ -93,6 +94,8 @@ interface HealthState {
   running?: Promise<void>;
   monitor?: ReturnType<typeof setInterval>;
   guardsInstalled?: boolean;
+  /** Letzter bereits geloggter Fehlertext – verhindert Dauer-Log-Spam. */
+  loggedError?: string;
 }
 
 function state(): HealthState {
@@ -148,10 +151,25 @@ async function runCheck(): Promise<void> {
     await db.execute(sql`select 1`);
     noteDbSuccess();
     g.ok = true;
+    g.loggedError = undefined;
   } catch (error) {
     // Fehler zählen + ggf. Verbindung neu aufbauen (siehe src/db/index.ts).
     noteDbFailure(error);
-    console.error("[health] Datenbankprüfung im Hintergrund fehlgeschlagen", error);
+    // Derselbe Fehler soll nicht alle 60 s erneut ins Log: Bei einem
+    // Konfigurationsfehler (z. B. PGlite-Schutz ohne DATABASE_URL) würde sonst
+    // pro Minute dieselbe Meldung auftauchen und die Render-Logs fluten.
+    const text = error instanceof Error ? error.message : String(error);
+    if (g.loggedError !== text) {
+      g.loggedError = text;
+      if (isPermanentDbError(error)) {
+        // Konfigurationsfehler (z. B. PGlite-Schutz ohne DATABASE_URL): kurz und
+        // ohne Stacktrace. Der ausführliche Text steht bereits beim Serverstart
+        // im Log und dauerhaft in `/api/health` unter `status.notice`.
+        console.error(`[health] Datenbank nicht nutzbar: ${text}`);
+      } else {
+        console.error("[health] Datenbankprüfung im Hintergrund fehlgeschlagen", error);
+      }
+    }
     g.ok = false;
   } finally {
     g.latencyMs = Date.now() - started;
