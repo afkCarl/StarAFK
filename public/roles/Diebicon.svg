@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M6 20c4-3 8-4.5 12-4.5S26 17 30 20c2-1.2 5-2 8-2-1 8-6 13-14 13S8 28 6 20z"/>
+  <circle cx="17" cy="21.5" r="1.7" fill="#ffffff" stroke="none"/>
+  <path d="M28 21c1.8.6 3.6 1.7 5 3"/>
+  <path d="M14 38c3-2.5 7-4 10-4s7 1.5 10 4" stroke-dasharray="0.5 4"/>
+</svg>
+```
+
+## Datei: `public/roles/Doktoricon.svg`
+

@@ -102,4 +102,5 @@ export interface LobbyState {
   code: string;
   players: LobbyPlayer[];
   roleCounts: Record<string, number>;
+  gameStarted: boolean;
 }

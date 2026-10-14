@@ -12,9 +12,12 @@
 > 1. Leeres Next.js-Projekt anlegen (oder Dateien einfach in einen Ordner schreiben).
 > 2. ALLE Textdateien exakt wie hier abgedruckt anlegen.
 > 3. Alle Binärdateien von dieser Website herunterladen (Liste unten).
-> 4. `.env` mit `DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/app_db` anlegen.
-> 5. `npm install` → `npx drizzle-kit push` → `npm run build` → `npm run start`.
-> 6. Fertig — die App läuft 1:1 identisch.
+> 4. `npm install` → `npm run build` → `npm run start` — fertig, die App läuft
+>    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne `DATABASE_URL` wird
+>    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in `.data/` angelegt.
+> 5. Optional: `.env` mit `DATABASE_URL=postgresql://…` für eine externe
+>    PostgreSQL-Datenbank — die Tabellen werden ebenfalls automatisch angelegt
+>    (kein `drizzle-kit push` nötig).
 
 ## Projektübersicht
 
@@ -33,7 +36,8 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
   Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: `?code=ABCDEF` öffnet das Beitreten-Feld vorausgefüllt.
 - **Realtime**: REST-Polling (1,2 s) + Heartbeat-Cleanup (15 s), automatische
-  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM.
+  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM. „Spiel starten"
+  (Host) synchronisiert den Spielstart in Echtzeit an alle Spieler.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 
@@ -56,6 +60,7 @@ tsconfig.json
 drizzle.config.json
 postcss.config.mjs
 src/db/index.ts
+src/db/migrate.ts
 src/db/schema.ts
 src/lib/game.ts
 src/lib/lobby-service.ts
@@ -68,6 +73,7 @@ src/app/api/lobby/join/route.ts
 src/app/api/lobby/state/route.ts
 src/app/api/lobby/profile/route.ts
 src/app/api/lobby/roles/route.ts
+src/app/api/lobby/start/route.ts
 src/app/api/lobby/leave/route.ts
 src/components/werwolf/werwolf-app.tsx
 src/components/werwolf/sky-background.tsx
@@ -104,36 +110,40 @@ public/frames/GrayCatWalkingTwo.png
 
 ```json
 {
-  "name": "nextjs-postgresql-template",
+  "name": "react-vite-tailwind",
   "private": true,
+  "version": "0.0.0",
+  "type": "module",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --hostname 0.0.0.0",
     "build": "next build",
-    "start": "next start",
-    "lint": "eslint .",
+    "start": "next start --hostname 0.0.0.0",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "dotenv": "17.3.1",
+    "@electric-sql/pglite": "^0.5.9",
+    "clsx": "2.1.1",
     "drizzle-orm": "0.45.2",
-    "lucide-react": "^1.55.0",
+    "lucide-react": "^1.54.0",
     "next": "16.2.6",
     "pg": "8.20.0",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "tailwind-merge": "3.4.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.1.17",
-    "@types/node": "22.19.15",
+    "@tailwindcss/vite": "4.1.17",
+    "@types/node": "22.19.17",
     "@types/pg": "8.18.0",
-    "@types/react": "19.2.14",
+    "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
-    "drizzle-kit": "0.31.10",
-    "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
+    "@vitejs/plugin-react": "5.1.1",
     "postcss": "8.5.8",
     "tailwindcss": "4.1.17",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vite": "7.3.2",
+    "vite-plugin-singlefile": "2.3.0"
   }
 }
 ```
@@ -143,7 +153,11 @@ public/frames/GrayCatWalkingTwo.png
 ```tsx
 import type { NextConfig } from "next";
 
-const nextConfig: NextConfig = {};
+const nextConfig: NextConfig = {
+  // Datenbank-Treiber nicht bundlen (stehen in node_modules und werden zur
+  // Laufzeit von Node geladen) – wichtig für eingebettetes PGlite und `pg`.
+  serverExternalPackages: ["@electric-sql/pglite", "pg"],
+};
 
 export default nextConfig;
 ```
@@ -153,29 +167,40 @@ export default nextConfig;
 ```json
 {
   "compilerOptions": {
-    "target": "ES2017",
+    "target": "ES2020",
+    "useDefineForClassFields": true,
     "lib": [
-      "dom",
-      "dom.iterable",
-      "esnext"
+      "ES2020",
+      "DOM",
+      "DOM.Iterable"
     ],
-    "allowJs": false,
+    "module": "ESNext",
     "skipLibCheck": true,
-    "strict": true,
-    "noEmit": true,
-    "esModuleInterop": true,
-    "module": "esnext",
+    "types": [
+      "node"
+    ],
+    /* Bundler mode */
     "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
+    "noEmit": true,
     "jsx": "react-jsx",
-    "incremental": true,
+    /* Path mapping */
     "baseUrl": ".",
     "paths": {
       "@/*": [
-        "./src/*"
+        "src/*"
       ]
     },
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowJs": true,
+    "incremental": true,
+    "esModuleInterop": true,
     "plugins": [
       {
         "name": "next"
@@ -184,8 +209,8 @@ export default nextConfig;
   },
   "include": [
     "next-env.d.ts",
-    "**/*.ts",
-    "**/*.tsx",
+    "src",
+    "vite.config.ts",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],
@@ -222,30 +247,138 @@ export default postcssConfig;
 ## Datei: `src/db/index.ts`
 
 ```tsx
-import { drizzle } from "drizzle-orm/node-postgres";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+
+import { PGlite } from "@electric-sql/pglite";
+import { drizzle as drizzleNodePg } from "drizzle-orm/node-postgres";
+import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { Pool } from "pg";
 
-const databaseUrl = process.env.DATABASE_URL;
+import { ensureSchema } from "@/db/migrate";
 
-if (!databaseUrl) {
-  throw new Error("DATABASE_URL is required");
-}
+type Database = ReturnType<typeof drizzleNodePg>;
+
+export type DbMode = "postgres" | "pglite";
 
 const globalForDb = globalThis as typeof globalThis & {
   __arenaNextJsPostgresqlPool?: Pool;
+  __arenaNextJsDatabase?: Database;
+  __arenaPgliteDatabase?: Database;
+  __arenaPgliteInit?: Promise<Database>;
+  __arenaSchemaReady?: WeakSet<object>;
 };
 
-export const pool =
-  globalForDb.__arenaNextJsPostgresqlPool ??
-  new Pool({
-    connectionString: databaseUrl,
-  });
-
-if (process.env.NODE_ENV !== "production") {
-  globalForDb.__arenaNextJsPostgresqlPool = pool;
+/**
+ * Welche Datenbank-Variante gerade aktiv ist:
+ * - `postgres`: externe PostgreSQL-Instanz aus `DATABASE_URL`
+ * - `pglite`: eingebettetes PostgreSQL (PGlite) im Datensatz-Ordner –
+ *   null Konfiguration nötig, ideal für einen einfachen Start.
+ */
+export function getDbMode(): DbMode {
+  return process.env.DATABASE_URL ? "postgres" : "pglite";
 }
 
-export const db = drizzle(pool);
+function pgliteDataDir(): string {
+  return (
+    process.env.PGLITE_DIR ?? path.join(process.cwd(), ".data", "pglite")
+  );
+}
+
+function getPgliteDatabase(): Promise<Database> {
+  // Singleton pro Prozess – wichtig für Next.js Dev-Hot-Reload und
+  // parallele erste Anfragen.
+  globalForDb.__arenaPgliteInit ??= (async () => {
+    const dataDir = pgliteDataDir();
+    // PGlite legt den Zielordner nicht rekursiv an – Elternordner sicherstellen.
+    mkdirSync(dataDir, { recursive: true });
+    const client = new PGlite(dataDir);
+    await client.waitReady;
+    const db = drizzlePglite(client) as unknown as Database;
+    globalForDb.__arenaPgliteDatabase = db;
+    return db;
+  })();
+  return globalForDb.__arenaPgliteInit;
+}
+
+async function initSchema(db: Database): Promise<void> {
+  globalForDb.__arenaSchemaReady ??= new WeakSet<object>();
+  if (globalForDb.__arenaSchemaReady.has(db)) return;
+  await ensureSchema(db);
+  globalForDb.__arenaSchemaReady.add(db);
+}
+
+/**
+ * Liefert die Datenbank-Verbindung und stellt beim ersten Aufruf sicher,
+ * dass alle Tabellen existieren (völlig automatisch – ohne manuelle
+ * Migrationsschritte). API-Handler rufen dies asynchron auf, weil `next build`
+ * Route-Module ohne Runtime-Secrets importiert.
+ */
+export async function getDb(): Promise<Database> {
+  const databaseUrl = process.env.DATABASE_URL;
+
+  let db: Database;
+  if (databaseUrl) {
+    const pool =
+      globalForDb.__arenaNextJsPostgresqlPool ??
+      (globalForDb.__arenaNextJsPostgresqlPool = new Pool({
+        connectionString: databaseUrl,
+      }));
+    db = globalForDb.__arenaNextJsDatabase ??= drizzleNodePg(pool);
+  } else {
+    db = await getPgliteDatabase();
+  }
+
+  await initSchema(db);
+  return db;
+}
+```
+
+## Datei: `src/db/migrate.ts`
+
+```tsx
+import { sql, type SQLWrapper } from "drizzle-orm";
+
+/**
+ * Idempente Schema-Initialisierung. Wird beim ersten Datenbank-Zugriff
+ * automatisch ausgeführt – dadurch braucht es KEIN `drizzle-kit push` und
+ * keine manuellen Migrationsschritte (egal ob eingebettete PGlite-Datenbank
+ * oder externe PostgreSQL-Instanz via DATABASE_URL).
+ */
+const SCHEMA_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS lobbies (
+    code varchar(6) PRIMARY KEY,
+    mode text NOT NULL DEFAULT 'WERWOLF',
+    role_counts jsonb NOT NULL,
+    game_started boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE TABLE IF NOT EXISTS players (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    lobby_code varchar(6) NOT NULL REFERENCES lobbies(code) ON DELETE CASCADE,
+    name text NOT NULL,
+    color text NOT NULL,
+    fade_intensity integer NOT NULL DEFAULT 50,
+    frame text NOT NULL DEFAULT 'none',
+    image text,
+    is_host boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    last_seen timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS players_lobby_code_idx ON players (lobby_code)`,
+  // Upgrades für Tabellen aus älteren Ständen (ohne game_started-Spalte):
+  `ALTER TABLE lobbies ADD COLUMN IF NOT EXISTS game_started boolean NOT NULL DEFAULT false`,
+];
+
+type Executable = {
+  execute: (query: SQLWrapper) => Promise<unknown>;
+};
+
+export async function ensureSchema(db: Executable): Promise<void> {
+  for (const statement of SCHEMA_STATEMENTS) {
+    await db.execute(sql.raw(statement));
+  }
+}
 ```
 
 ## Datei: `src/db/schema.ts`
@@ -268,6 +401,7 @@ export const lobbies = pgTable("lobbies", {
   code: varchar("code", { length: 6 }).primaryKey(),
   mode: text("mode").notNull().default("WERWOLF"),
   roleCounts: jsonb("role_counts").$type<RoleCounts>().notNull(),
+  gameStarted: boolean("game_started").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -403,6 +537,7 @@ export interface LobbyState {
   code: string;
   players: LobbyPlayer[];
   roleCounts: Record<string, number>;
+  gameStarted: boolean;
 }
 ```
 
@@ -411,7 +546,7 @@ export interface LobbyState {
 ```tsx
 import { and, asc, eq, lt } from "drizzle-orm";
 
-import { db } from "@/db";
+import { getDb } from "@/db";
 import { lobbies, players, type PlayerRow } from "@/db/schema";
 import {
   DEFAULT_COLOR,
@@ -424,6 +559,10 @@ import {
 
 const STALE_MS = 15_000;
 const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/** Maximale Spielerzahl pro Lobby. */
+export const MAX_PLAYERS = 12;
+/** Lobbys, die älter als ein Tag sind, werden automatisch aufgeräumt. */
+const LOBBY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export function sanitizeProfile(input: unknown): PlayerProfile {
   const raw = (typeof input === "object" && input !== null ? input : {}) as Record<
@@ -484,6 +623,7 @@ function toLobbyPlayer(row: PlayerRow): LobbyPlayer {
 }
 
 async function listPlayers(code: string): Promise<PlayerRow[]> {
+  const db = await getDb();
   return db
     .select()
     .from(players)
@@ -491,11 +631,23 @@ async function listPlayers(code: string): Promise<PlayerRow[]> {
     .orderBy(asc(players.createdAt));
 }
 
+/** Entfernt verwaiste Lobbys, die älter als ein Tag sind (inkl. Spieler per Cascade). */
+async function purgeOldLobbies(): Promise<void> {
+  const db = await getDb();
+  await db
+    .delete(lobbies)
+    .where(lt(lobbies.createdAt, new Date(Date.now() - LOBBY_MAX_AGE_MS)));
+}
+
 export async function createLobby(
   mode: string,
   profileInput: unknown,
 ): Promise<{ selfId: string; lobby: LobbyState }> {
+  const db = await getDb();
   const profile = sanitizeProfile(profileInput);
+
+  // Nebenbei alte/verwaiste Lobbys aufräumen.
+  await purgeOldLobbies();
 
   let code = generateCode();
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -516,19 +668,34 @@ export async function createLobby(
 
   return {
     selfId: self.id,
-    lobby: { code, players: [toLobbyPlayer(self)], roleCounts },
+    lobby: {
+      code,
+      players: [toLobbyPlayer(self)],
+      roleCounts,
+      gameStarted: false,
+    },
   };
 }
+
+export type JoinOutcome =
+  | { ok: true; selfId: string; lobby: LobbyState }
+  | { ok: false; reason: "not_found" | "full" };
 
 export async function joinLobby(
   codeInput: string,
   profileInput: unknown,
-): Promise<{ selfId: string; lobby: LobbyState } | null> {
+): Promise<JoinOutcome> {
   const code = (codeInput || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 6);
-  if (code.length !== 6) return null;
+  if (code.length !== 6) return { ok: false, reason: "not_found" };
 
+  const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
-  if (!lobby) return null;
+  if (!lobby) return { ok: false, reason: "not_found" };
+
+  const existingPlayers = await listPlayers(code);
+  if (existingPlayers.length >= MAX_PLAYERS) {
+    return { ok: false, reason: "full" };
+  }
 
   const profile = sanitizeProfile(profileInput);
   const [self] = await db
@@ -538,16 +705,19 @@ export async function joinLobby(
 
   const rows = await listPlayers(code);
   return {
+    ok: true,
     selfId: self.id,
     lobby: {
       code,
       players: rows.map(toLobbyPlayer),
       roleCounts: lobby.roleCounts,
+      gameStarted: lobby.gameStarted,
     },
   };
 }
 
 export async function touchPlayer(code: string, playerId: string): Promise<void> {
+  const db = await getDb();
   await db
     .update(players)
     .set({ lastSeen: new Date() })
@@ -562,6 +732,7 @@ export async function getLobbyState(
   const code = (codeInput || "").toUpperCase().slice(0, 6);
   if (code.length !== 6) return null;
 
+  const db = await getDb();
   const [lobby] = await db.select().from(lobbies).where(eq(lobbies.code, code));
   if (!lobby) return null;
 
@@ -595,7 +766,41 @@ export async function getLobbyState(
     code,
     players: rows.map(toLobbyPlayer),
     roleCounts: lobby.roleCounts,
+    gameStarted: lobby.gameStarted,
   };
+}
+
+/**
+ * Startet (oder beendet) das Spiel für alle Spieler der Lobby.
+ * Nur der Host darf den Status ändern.
+ */
+export async function setGameStarted(
+  codeInput: string,
+  playerId: string,
+  started: boolean,
+): Promise<boolean> {
+  const code = (codeInput || "").toUpperCase().slice(0, 6);
+  if (code.length !== 6) return false;
+
+  const db = await getDb();
+  const [host] = await db
+    .select({ id: players.id })
+    .from(players)
+    .where(
+      and(
+        eq(players.id, playerId),
+        eq(players.lobbyCode, code),
+        eq(players.isHost, true),
+      ),
+    );
+  if (!host) return false;
+
+  await db
+    .update(lobbies)
+    .set({ gameStarted: started })
+    .where(eq(lobbies.code, code));
+  await touchPlayer(code, playerId);
+  return true;
 }
 
 export async function updateProfile(
@@ -603,6 +808,7 @@ export async function updateProfile(
   playerId: string,
   profileInput: unknown,
 ): Promise<boolean> {
+  const db = await getDb();
   const profile = sanitizeProfile(profileInput);
   const updated = await db
     .update(players)
@@ -617,6 +823,7 @@ export async function updateRoleCounts(
   playerId: string,
   roleCountsInput: unknown,
 ): Promise<boolean> {
+  const db = await getDb();
   const [host] = await db
     .select({ id: players.id })
     .from(players)
@@ -638,6 +845,7 @@ export async function updateRoleCounts(
 }
 
 export async function removePlayer(code: string, playerId: string): Promise<void> {
+  const db = await getDb();
   await db
     .delete(players)
     .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
@@ -778,17 +986,22 @@ export default function HomePage() {
 ## Datei: `src/app/api/health/route.ts`
 
 ```tsx
-import { db } from "@/db";
 import { sql } from "drizzle-orm";
+
+import { getDb, getDbMode } from "@/db";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    await db.execute(sql`select 1`);
-    return Response.json({ ok: true });
-  } catch {
-    return Response.json({ ok: false }, { status: 500 });
+    await (await getDb()).execute(sql`select 1`);
+    return Response.json({ ok: true, db: getDbMode() });
+  } catch (error) {
+    console.error("health check failed", error);
+    return Response.json(
+      { ok: false, db: getDbMode() },
+      { status: 500 },
+    );
   }
 }
 ```
@@ -827,8 +1040,11 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const result = await joinLobby(String(body?.code ?? ""), body?.profile);
-    if (!result) {
-      return NextResponse.json({ ok: false });
+    if (!result.ok) {
+      return NextResponse.json(
+        { ok: false, reason: result.reason },
+        { status: result.reason === "full" ? 409 : 404 },
+      );
     }
     return NextResponse.json({ ok: true, selfId: result.selfId, lobby: result.lobby });
   } catch (error) {
@@ -913,6 +1129,31 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok });
   } catch (error) {
     console.error("lobby:updateRoles failed", error);
+    return NextResponse.json({ ok: false }, { status: 500 });
+  }
+}
+```
+
+## Datei: `src/app/api/lobby/start/route.ts`
+
+```tsx
+import { NextResponse } from "next/server";
+
+import { setGameStarted } from "@/lib/lobby-service";
+
+export const dynamic = "force-dynamic";
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const ok = await setGameStarted(
+      String(body?.code ?? ""),
+      String(body?.playerId ?? ""),
+      body?.started !== false,
+    );
+    return NextResponse.json({ ok });
+  } catch (error) {
+    console.error("lobby:start failed", error);
     return NextResponse.json({ ok: false }, { status: 500 });
   }
 }
@@ -1026,6 +1267,9 @@ export default function WerwolfApp() {
   });
   const [roleCounts, setRoleCounts] = useState<Record<string, number>>(defaultCounts);
   const [cardModalOpen, setCardModalOpen] = useState(false);
+  const [gameStarted, setGameStarted] = useState(false);
+  const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // Deterministische Initialwerte; localStorage wird nach dem Mount geladen,
   // damit Server-Render und Hydration identisch sind (Multi-Tab-sicher).
@@ -1100,6 +1344,7 @@ export default function WerwolfApp() {
     setLobbyCode(state.code);
     setPlayers(state.players);
     setRoleCounts(state.roleCounts);
+    setGameStarted(Boolean(state.gameStarted));
     setSelfId((current) => {
       if (current) {
         const self = state.players.find((p) => p.id === current);
@@ -1128,6 +1373,9 @@ export default function WerwolfApp() {
           setScreen("menu");
           setSelfId(null);
           setPlayers([]);
+          setActionError(
+            "Die Lobby ist nicht mehr verfügbar – sie wurde geschlossen oder du wurdest entfernt.",
+          );
           return;
         }
         const data = await res.json();
@@ -1253,12 +1501,14 @@ export default function WerwolfApp() {
     host: boolean,
     id: string,
     counts: Record<string, number>,
+    started: boolean,
   ) => {
     setSelfId(id);
     setLobbyCode(code);
     setIsHost(host);
     setPlayers(lobbyPlayers);
     setRoleCounts(counts);
+    setGameStarted(started);
     setScreen("menuLeaving");
     leaveTimerRef.current = setTimeout(() => {
       setScreen("lobbyEntering");
@@ -1267,47 +1517,64 @@ export default function WerwolfApp() {
   };
 
   const handleCreate = () => {
-    if (screen !== "menu" || modeLocked) return;
+    if (screen !== "menu" || modeLocked || busy) return;
     if (mode.title !== "WERWOLF") return;
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
     setJoinPanel("closed");
     setJoinCode("");
     setCopied(false);
     setRoleModalOpen(false);
+    setActionError(null);
+    setBusy("create");
     fetch("/api/lobby/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: mode.title, profile }),
     })
-      .then((res) => res.json())
-      .then((data) => {
-        if (data?.ok) {
-          enterLobby(
-            data.lobby.code,
-            data.lobby.players,
-            true,
-            data.selfId,
-            data.lobby.roleCounts,
-          );
-        }
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error("create failed");
+        enterLobby(
+          data.lobby.code,
+          data.lobby.players,
+          true,
+          data.selfId,
+          data.lobby.roleCounts,
+          Boolean(data.lobby.gameStarted),
+        );
       })
-      .catch(() => {});
+      .catch(() => {
+        setActionError(
+          "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+        );
+      })
+      .finally(() => setBusy(null));
   };
 
   const handleJoin = () => {
-    if (screen !== "menu" || modeLocked) return;
-    if (joinCode.length !== 6) return;
+    if (screen !== "menu" || modeLocked || busy) return;
+    if (joinCode.length !== 6) {
+      setActionError("Bitte gib einen 6-stelligen Lobbycode ein (A–Z).");
+      return;
+    }
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
     setCopied(false);
     setRoleModalOpen(false);
+    setActionError(null);
+    setBusy("join");
     fetch("/api/lobby/join", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code: joinCode, profile }),
     })
-      .then((res) => res.json())
-      .then((data) => {
-        if (!data?.ok) return;
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) {
+          if (data?.reason === "full") {
+            throw new Error("full");
+          }
+          throw new Error("not_found");
+        }
         const self = (data.lobby.players as LobbyPlayer[]).find(
           (p) => p.id === data.selfId,
         );
@@ -1319,9 +1586,45 @@ export default function WerwolfApp() {
           self?.isHost || false,
           data.selfId,
           data.lobby.roleCounts,
+          Boolean(data.lobby.gameStarted),
         );
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        const message =
+          error instanceof Error && error.message === "full"
+            ? "Die Lobby ist leider voll (max. 12 Spieler)."
+            : error instanceof Error && error.message === "not_found"
+              ? "Lobby mit diesem Code wurde nicht gefunden."
+              : "Beitreten fehlgeschlagen – der Server ist gerade nicht erreichbar.";
+        setActionError(message);
+      })
+      .finally(() => setBusy(null));
+  };
+
+  const handleStartGame = (started: boolean) => {
+    const code = lobbyCodeRef.current;
+    const pid = selfIdRef.current;
+    if (!code || !pid || busy) return;
+    setActionError(null);
+    setBusy("start");
+    fetch("/api/lobby/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, playerId: pid, started }),
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error("start failed");
+        setGameStarted(started);
+      })
+      .catch(() => {
+        setActionError(
+          started
+            ? "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+            : "Das Spiel konnte nicht zurückgesetzt werden.",
+        );
+      })
+      .finally(() => setBusy(null));
   };
 
   const changeRoleCount = (roleName: string, delta: number) => {
@@ -1436,6 +1739,24 @@ export default function WerwolfApp() {
     >
       <SkyBackground isActive={isDark} />
 
+      {actionError && (
+        <div
+          className="fixed inset-x-0 bottom-4 z-[60] flex justify-center px-4"
+          role="alert"
+        >
+          <div className="flex max-w-[min(36rem,92vw)] items-start gap-3 rounded-[1.2rem] border border-red-400/40 bg-red-950/90 px-4 py-3 text-sm font-semibold text-red-100 shadow-2xl backdrop-blur-md">
+            <span className="leading-relaxed">{actionError}</span>
+            <button
+              onClick={() => setActionError(null)}
+              aria-label="Fehlermeldung schließen"
+              className="mt-0.5 shrink-0 text-red-200/70 transition-colors hover:text-red-100"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+      )}
+
       {inMenu && (
         <>
           <div
@@ -1512,13 +1833,14 @@ export default function WerwolfApp() {
           >
             <button
               onClick={handleCreate}
+              disabled={busy === "create"}
               className={`w-fit text-left text-[1.75rem] font-bold uppercase transition-all duration-200 sm:text-[2.1rem] ${
                 mode.title === "WERWOLF"
                   ? "hover:translate-x-3 hover:text-neutral-400"
                   : "cursor-not-allowed opacity-30"
-              }`}
+              } ${busy === "create" ? "animate-pulse opacity-70" : ""}`}
             >
-              Lobby erstellen
+              {busy === "create" ? "Erstelle Lobby…" : "Lobby erstellen"}
             </button>
             <div className="flex w-fit flex-col">
               <button onClick={toggleJoinPanel} className={menuButtons}>
@@ -1550,9 +1872,10 @@ export default function WerwolfApp() {
                   />
                   <button
                     onClick={handleJoin}
-                    className="ml-4 shrink-0 text-[1.4rem] font-bold uppercase transition-all hover:text-neutral-400 sm:text-[1.6rem]"
+                    disabled={busy === "join"}
+                    className="ml-4 shrink-0 text-[1.4rem] font-bold uppercase transition-all hover:text-neutral-400 disabled:animate-pulse disabled:opacity-60 sm:text-[1.6rem]"
                   >
-                    Beitreten
+                    {busy === "join" ? "Trete bei…" : "Beitreten"}
                   </button>
                 </div>
               )}
@@ -1927,12 +2250,37 @@ export default function WerwolfApp() {
                   </p>
                 </GlassCard>
                 {isHost ? (
-                  <button className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black">
-                    Spiel starten
-                  </button>
+                  gameStarted ? (
+                    <div className="flex flex-col gap-2">
+                      <div className="rounded-[1.5rem] border border-green-400/40 bg-green-400/15 px-5 py-4 text-center text-[1.25rem] font-black uppercase tracking-[0.16em] text-green-200">
+                        Spiel läuft
+                      </div>
+                      <button
+                        onClick={() => handleStartGame(false)}
+                        disabled={busy === "start"}
+                        className="rounded-[1rem] border border-white/20 bg-white/5 px-4 py-2 text-xs font-bold uppercase tracking-[0.18em] text-white/60 transition-all duration-200 hover:bg-white/10 hover:text-white disabled:animate-pulse disabled:opacity-50"
+                      >
+                        Zurück zur Lobby
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => handleStartGame(true)}
+                      disabled={busy === "start"}
+                      className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:animate-pulse disabled:opacity-50"
+                    >
+                      {busy === "start" ? "Startet…" : "Spiel starten"}
+                    </button>
+                  )
                 ) : (
-                  <div className="rounded-[1.5rem] border border-white/10 bg-white/5 px-5 py-4 text-center text-sm font-bold uppercase tracking-[0.16em] text-white/40">
-                    Warte auf Host…
+                  <div
+                    className={`rounded-[1.5rem] border px-5 py-4 text-center text-sm font-bold uppercase tracking-[0.16em] ${
+                      gameStarted
+                        ? "border-green-400/40 bg-green-400/15 text-green-200"
+                        : "border-white/10 bg-white/5 text-white/40"
+                    }`}
+                  >
+                    {gameStarted ? "Das Spiel läuft!" : "Warte auf Host…"}
                   </div>
                 )}
               </aside>
@@ -2339,6 +2687,7 @@ const TEXT_FILES = [
   "drizzle.config.json",
   "postcss.config.mjs",
   "src/db/index.ts",
+  "src/db/migrate.ts",
   "src/db/schema.ts",
   "src/lib/game.ts",
   "src/lib/lobby-service.ts",
@@ -2351,6 +2700,7 @@ const TEXT_FILES = [
   "src/app/api/lobby/state/route.ts",
   "src/app/api/lobby/profile/route.ts",
   "src/app/api/lobby/roles/route.ts",
+  "src/app/api/lobby/start/route.ts",
   "src/app/api/lobby/leave/route.ts",
   "src/components/werwolf/werwolf-app.tsx",
   "src/components/werwolf/sky-background.tsx",
@@ -2414,9 +2764,12 @@ sections.push(`# Werwolf Lobby — Vollständiger Quellcode
 > 1. Leeres Next.js-Projekt anlegen (oder Dateien einfach in einen Ordner schreiben).
 > 2. ALLE Textdateien exakt wie hier abgedruckt anlegen.
 > 3. Alle Binärdateien von dieser Website herunterladen (Liste unten).
-> 4. \`.env\` mit \`DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/app_db\` anlegen.
-> 5. \`npm install\` → \`npx drizzle-kit push\` → \`npm run build\` → \`npm run start\`.
-> 6. Fertig — die App läuft 1:1 identisch.
+> 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig, die App läuft
+>    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne \`DATABASE_URL\` wird
+>    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in \`.data/\` angelegt.
+> 5. Optional: \`.env\` mit \`DATABASE_URL=postgresql://…\` für eine externe
+>    PostgreSQL-Datenbank — die Tabellen werden ebenfalls automatisch angelegt
+>    (kein \`drizzle-kit push\` nötig).
 
 ## Projektübersicht
 
@@ -2435,7 +2788,8 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
   Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: \`?code=ABCDEF\` öffnet das Beitreten-Feld vorausgefüllt.
 - **Realtime**: REST-Polling (1,2 s) + Heartbeat-Cleanup (15 s), automatische
-  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM.
+  Host-Nachfolge, Lobbys/Spieler in PostgreSQL via Drizzle ORM. „Spiel starten"
+  (Host) synchronisiert den Spielstart in Echtzeit an alle Spieler.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 
@@ -2467,7 +2821,7 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 
 ## Datei: `public/favicon-light.svg`
 
-```xml
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <circle cx="32" cy="32" r="30" fill="#0b1220"/>
   <path d="M42.5 12a21 21 0 1 0 9.4 27.6A17.5 17.5 0 0 1 42.5 12z" fill="#f1f5f9"/>
@@ -2477,8 +2831,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/favicon-dark.svg`
+````
 
-```xml
+## Datei: `public/favicon-dark.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <circle cx="32" cy="32" r="30" fill="#f1f5f9"/>
   <path d="M42.5 12a21 21 0 1 0 9.4 27.6A17.5 17.5 0 0 1 42.5 12z" fill="#0b1220"/>
@@ -2488,8 +2845,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Amoricon.svg`
+````
 
-```xml
+## Datei: `public/roles/Amoricon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M24 40S8 30 8 18.5C8 12.5 12.5 9 17 9c3 0 5.5 1.5 7 4 1.5-2.5 4-4 7-4 4.5 0 9 3.5 9 9.5C40 30 24 40 24 40z"/>
   <path d="M30 8l10-4M40 4l-3 1M40 4l-1 3" />
@@ -2498,8 +2858,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Bürgermeistericon.svg`
+````
 
-```xml
+## Datei: `public/roles/Bürgermeistericon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M16 30V12h16v18"/>
   <path d="M10 30h28"/>
@@ -2510,8 +2873,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Detektivicon.svg`
+````
 
-```xml
+## Datei: `public/roles/Detektivicon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="20" cy="20" r="11"/>
   <path d="M28 28l13 13"/>
@@ -2520,8 +2886,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Diebicon.svg`
+````
 
-```xml
+## Datei: `public/roles/Diebicon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M6 20c4-3 8-4.5 12-4.5S26 17 30 20c2-1.2 5-2 8-2-1 8-6 13-14 13S8 28 6 20z"/>
   <circle cx="17" cy="21.5" r="1.7" fill="#ffffff" stroke="none"/>
@@ -2531,8 +2900,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Doktoricon.svg`
+````
 
-```xml
+## Datei: `public/roles/Doktoricon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M24 5l14 5v11c0 10-6.5 17-14 22C16.5 38 10 31 10 21V10l14-5z"/>
   <path d="M24 17v14M17 24h14"/>
@@ -2540,8 +2912,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Dorfbewohnericon.svg`
+````
 
-```xml
+## Datei: `public/roles/Dorfbewohnericon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M8 24L24 10l16 14"/>
   <path d="M12 22v16h24V22"/>
@@ -2550,8 +2925,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Dorftrottelicon.svg`
+````
 
-```xml
+## Datei: `public/roles/Dorftrottelicon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M8 34c2-8 4-12 8-14-1-3 0-6 3-7 2 3 5 3 7 0 2 2 2 6 0 8 4 2 8 6 10 13"/>
   <circle cx="15" cy="35.5" r="2.2"/>
@@ -2562,8 +2940,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Goetheicon.svg`
+````
 
-```xml
+## Datei: `public/roles/Goetheicon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M34 6c4 0 8 3 8 8 0 9-9 20-18 26l-3-3c6-9 6-18 7-22 1-5 3-9 6-9z"/>
   <path d="M21 37l-9 5 4-10"/>
@@ -2572,8 +2953,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Hexeicon.svg`
+````
 
-```xml
+## Datei: `public/roles/Hexeicon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M18 8h12"/>
   <path d="M20 8v8L12 34c-1.4 2.6.6 6 4 6h16c3.4 0 5.4-3.4 4-6L28 16V8"/>
@@ -2584,8 +2968,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Jägericon.svg`
+````
 
-```xml
+## Datei: `public/roles/Jägericon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="24" cy="24" r="14"/>
   <circle cx="24" cy="24" r="7"/>
@@ -2595,8 +2982,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Kopfgeldjägericon.svg`
+````
 
-```xml
+## Datei: `public/roles/Kopfgeldjägericon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M24 6l4.8 9.6L40 17l-8 7.8L34 36l-10-5.2L14 36l2-11.2L8 17l11.2-1.4L24 6z"/>
   <circle cx="24" cy="22" r="3.4"/>
@@ -2604,8 +2994,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Mediumicon.svg`
+````
 
-```xml
+## Datei: `public/roles/Mediumicon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="24" cy="22" r="13"/>
   <path d="M16 40h16M19 35h10"/>
@@ -2615,8 +3008,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Sandmannicon.svg`
+````
 
-```xml
+## Datei: `public/roles/Sandmannicon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M30 8a14 14 0 1 0 8 22A12 12 0 0 1 30 8z"/>
   <path d="M34 32h7l-7 8h7"/>
@@ -2625,8 +3021,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Sehericon.svg`
+````
 
-```xml
+## Datei: `public/roles/Sehericon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M4 24c6-8 12-12 20-12s14 4 20 12c-6 8-12 12-20 12S10 32 4 24z"/>
   <circle cx="24" cy="24" r="7"/>
@@ -2635,8 +3034,11 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
 ```
 
 ## Datei: `public/roles/Werwolficon.svg`
+````
 
-```xml
+## Datei: `public/roles/Werwolficon.svg`
+
+````xml
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
   <path d="M10 6l6 8 8-3 8 3 6-8 3 12c0 2-1 4-3 5 3 2 4 5 4 8 0 7-8 11-18 11S6 38 6 31c0-3 1-6 4-8-2-1-3-3-3-5l3-12z"/>
   <circle cx="17.5" cy="27" r="1.6" fill="#ffffff" stroke="none"/>
@@ -2645,3 +3047,4 @@ console.log(`public/README.md geschrieben (${(output.length / 1024).toFixed(1)} 
   <path d="M20 38c1.5 1.2 2.7 1.8 4 1.8s2.5-.6 4-1.8"/>
 </svg>
 ```
+````
