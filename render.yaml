@@ -34,9 +34,32 @@ services:
         value: "22"
       - key: NEXT_TELEMETRY_DISABLED
         value: "1"
+      # --- RAM-Budget (512 MB auf dem Free-Plan) ---------------------------
+      # Obergrenze für den V8-Heap des Laufzeitprozesses, gesetzt vom
+      # `start`-Skript in package.json (`node --max-old-space-size=…`).
+      # Ohne diese Grenze richtet sich V8 nach dem RAM des HOSTS und lässt den
+      # Heap wachsen, bis der Container von Render hart gekillt wird (OOM,
+      # keine verwertbare Fehlermeldung im Log). Mit der Grenze mistet V8
+      # rechtzeitig aus; ein echtes Leck meldet sich stattdessen als
+      # „Reached heap limit“ in den Logs. 384 MB Heap + ~100 MB für
+      # Node/Next.js/Buffer bleiben unter 512 MB.
+      # Nur der Startprozess nutzt den Wert – der Build bleibt unberührt.
+      - key: NODE_MAX_OLD_SPACE_MB
+        value: "384"
       # Automatisch provisionierte Datenbank (siehe `databases:` unten).
       # Wird in der App nur benutzt, solange keine eigene DATABASE_URL
       # (z. B. Neon) gesetzt ist – die hat immer Vorrang.
+      #
+      # WICHTIG seit der RAM-Optimierung: Diese Variable ist auf Render PFLICHT.
+      # Die eingebettete PGlite-Datenbank (der Fallback ohne DATABASE_URL)
+      # läuft als WASM-PostgreSQL im Node-Prozess und kostet gemessen ~456 MB
+      # zusätzlich – der Server landete damit bei 596 MB RSS und wurde von
+      # Render gekillt. Ohne gültige Datenbank startet die App jetzt trotzdem,
+      # meldet die Ursache aber klar unter /api/health (`status.notice`) und in
+      # den Logs, statt die Instanz in eine OOM-Neustartschleife zu schicken.
+      # Fällt die kostenlose Render-Datenbank nach 30 Tagen weg, bitte
+      # DATABASE_URL (Neon) im Dashboard setzen – oder den Notausgang
+      # PGLITE_IN_PRODUCTION=1 (nur sinnvoll bei >= 1 GB RAM, z. B. Starter-Plan).
       - key: AUTO_DATABASE_URL
         fromDatabase:
           name: starafk-db

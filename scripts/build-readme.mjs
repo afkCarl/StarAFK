@@ -54,6 +54,7 @@ const TEXT_FILES = [
   "src/components/werwolf/glass-card.tsx",
   "src/components/auth/auth-gate.tsx",
   "src/components/auth/sign-in-screen.tsx",
+  "scripts/measure-ram.mjs",
   "scripts/build-readme.mjs",
 ];
 
@@ -111,15 +112,22 @@ sections.push(`# Werwolf Lobby — Vollständiger Quellcode
 > 1. Leeres Next.js-Projekt anlegen (oder Dateien einfach in einen Ordner schreiben).
 > 2. ALLE Textdateien exakt wie hier abgedruckt anlegen.
 > 3. Alle Binärdateien von dieser Website herunterladen (Liste unten).
-> 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig, die App läuft
->    1:1 identisch OHNE jede Datenbank-Vorbereitung: ohne \`DATABASE_URL\` wird
->    automatisch eine eingebettete PostgreSQL-Datenbank (PGlite) in \`.data/\` angelegt.
-> 5. Optional (empfohlen auf Render): \`.env\` bzw. Umgebungsvariable
->    \`DATABASE_URL=postgresql://…\` für eine externe PostgreSQL-Datenbank — die
->    Tabellen werden ebenfalls automatisch angelegt (kein \`drizzle-kit push\`).
->    Ohne \`DATABASE_URL\` läuft die App eingebettet (PGlite); auf Render-Free-
->    Instanzen ist das Dateisystem flüchtig, Lobbys sind dann nach einem
->    Neustart weg (die Lobby wird automatisch mit gleichem Code neu geöffnet).
+> 4. \`npm install\` → \`npm run build\` → \`npm run start\` — fertig.
+>    **Wichtig (RAM):** \`next start\` setzt \`NODE_ENV=production\`. Dort startet die
+>    eingebettete PGlite-Datenbank NICHT mehr von selbst, weil sie als
+>    WASM-PostgreSQL im Serverprozess ~456 MB belegt (gemessen: 596 MB RSS ohne
+>    Last, 758 MB Spitze mit 6 pollenden Spielern) und eine 512-MB-Instanz damit
+>    sofort gekillt wird. Für \`npm run start\` also \`DATABASE_URL\` setzen — oder
+>    bei >= 1 GB RAM den Notausgang \`PGLITE_IN_PRODUCTION=1\`.
+>    In \`npm run dev\` (\`NODE_ENV=development\`) bleibt alles beim Alten: ohne
+>    \`DATABASE_URL\` entsteht automatisch \`.data/pglite\`.
+> 5. Externe PostgreSQL-Datenbank (auf Render Pflicht): \`.env\` bzw.
+>    Umgebungsvariable \`DATABASE_URL=postgresql://…\` — die Tabellen werden
+>    ebenfalls automatisch angelegt (kein \`drizzle-kit push\`). Auf Render wird
+>    \`AUTO_DATABASE_URL\` von der Blueprint (\`render.yaml\`) automatisch befüllt.
+>    Ohne gültige Datenbank bleibt die Seite erreichbar (Startseite, \`/api/health\`),
+>    die Lobby-API meldet einen klaren Fehler und die Ursache steht in
+>    \`/api/health\` unter \`status.notice\`.
 
 ## Projektübersicht
 
@@ -148,6 +156,11 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Robuste Datenbank**: Verbindung baut sich bei Fehlern automatisch neu auf
   (\`src/db/index.ts\`), PGlite fällt bei Problemen mit dem Datenordner in den
   Speicher-Modus zurück; \`/api/health\` zeigt Modus, Speicherart und Fehlerzähler.
+- **RAM-Budget 512 MB**: PGlite wird lazy geladen und in Produktion bzw. in
+  Containern unter \`PGLITE_MIN_MEMORY_MB\` (Standard 900) blockiert
+  (\`pglitePolicy()\`), der S3-Client wird nur mit konfiguriertem Bucket geladen,
+  und das \`start\`-Skript begrenzt den V8-Heap (\`NODE_MAX_OLD_SPACE_MB\`,
+  Standard 384). Nachmessen: \`node scripts/measure-ram.mjs\`.
 
 ## Binärdateien (von diesem Server laden, nicht inline)
 

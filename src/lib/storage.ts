@@ -1,9 +1,4 @@
-import {
-  DeleteObjectCommand,
-  GetObjectCommand,
-  PutObjectCommand,
-  S3Client,
-} from "@aws-sdk/client-s3";
+import type { S3Client as S3ClientType } from "@aws-sdk/client-s3";
 
 /**
  * Neon Object Storage (S3-kompatibel, branch-scoped).
@@ -25,12 +20,54 @@ export const storageEnabled = Boolean(
     process.env.AWS_ENDPOINT_URL_S3,
 );
 
-let client: S3Client | null = null;
+/**
+ * SDK und S3-Client werden ERST beim ersten echten Bild-Upload/-Download geladen.
+ *
+ * Warum das RAM spart – der Mechanismus (Next.js 16, Turbopack):
+ * `@aws-sdk/client-s3` steht bereits in Next.js' eigener Liste
+ * `next/dist/lib/server-external-packages.jsonc`, wird also NICHT gebündelt,
+ * sondern im Server-Chunk als `require("@aws-sdk/client-s3-…")` referenziert.
+ * Entscheidend ist, WANN dieses `require` ausgeführt wird:
+ *   - Vorher stand der Import statisch am Dateianfang → das SDK wurde beim
+ *     Initialisieren dieses Moduls geladen. Und dieses Modul liegt im Startpfad:
+ *     `src/instrumentation.ts` → `src/lib/health.ts` → `src/lib/storage.ts`
+ *     (health.ts liest `storageEnabled`). Der SDK landete also bei JEDEM
+ *     Serverstart im Speicher, auch ganz ohne konfigurierten Bucket.
+ *   - Jetzt steht er in einem `import()`-Ausdruck, den Turbopack als lazy
+ *     Chunk-Load (`e.A(67533)`) übersetzt → ohne `AWS_*`-Variablen wird das
+ *     SDK nie geladen und kostet 0 MB.
+ *
+ * Gemessen (A/B, sonst identischer Build, 12 pollende Spieler):
+ *   statischer Import: Boot 138–139 MB, Spitze 154 MB
+ *   lazy `import()`:   Boot 131 MB,      Spitze 150 MB   → ~8 MB weniger
+ *   (isoliert in einem leeren Node-Prozess kostet `import("@aws-sdk/client-s3")`
+ *   sogar +30 MB RSS; im bereits laufenden Next-Server ist der Zuwachs kleiner,
+ *   weil sich Laufzeit-Overhead teilt.)
+ *
+ * `storageEnabled` bleibt bewusst ein synchroner Env-Check – health.ts braucht
+ * den Wert beim Start, ohne dafür ein Modul laden zu müssen.
+ */
+type S3Module = typeof import("@aws-sdk/client-s3");
 
-function s3(): S3Client | null {
-  if (!storageEnabled) return null;
-  client ??= new S3Client({ forcePathStyle: true });
-  return client;
+/** Einmal geladenes SDK + ein einziger, wiederverwendeter Client. */
+type LoadedS3 = { mod: S3Module; client: S3ClientType };
+
+let loaded: Promise<LoadedS3 | null> | null = null;
+
+function s3(): Promise<LoadedS3 | null> {
+  if (!storageEnabled) return Promise.resolve(null);
+  loaded ??= import("@aws-sdk/client-s3")
+    .then((mod) => ({
+      mod,
+      client: new mod.S3Client({ forcePathStyle: true }) as S3ClientType,
+    }))
+    .catch((error: unknown) => {
+      // Fehlschlag nicht dauerhaft cachen (sonst wäre der Bucket bis zum
+      // nächsten Neustart tot) – der nächste Versuch lädt erneut.
+      loaded = null;
+      throw error;
+    });
+  return loaded;
 }
 
 export type StoredObject = {
@@ -43,9 +80,10 @@ export async function putObject(
   bytes: Uint8Array,
   contentType: string,
 ): Promise<void> {
-  const s3Client = s3();
-  if (!s3Client) throw new Error("Object Storage ist nicht konfiguriert");
-  await s3Client.send(
+  const bucket = await s3();
+  if (!bucket) throw new Error("Object Storage ist nicht konfiguriert");
+  const { PutObjectCommand } = bucket.mod;
+  await bucket.client.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: key,
@@ -58,10 +96,11 @@ export async function putObject(
 }
 
 export async function getObject(key: string): Promise<StoredObject | null> {
-  const s3Client = s3();
-  if (!s3Client) return null;
+  const bucket = await s3();
+  if (!bucket) return null;
   try {
-    const result = await s3Client.send(
+    const { GetObjectCommand } = bucket.mod;
+    const result = await bucket.client.send(
       new GetObjectCommand({ Bucket: BUCKET, Key: key }),
     );
     const bytes = await result.Body?.transformToByteArray();
@@ -78,10 +117,11 @@ export async function getObject(key: string): Promise<StoredObject | null> {
 
 /** Alte Bildversion aufräumen – Fehler dürfen den Upload nicht scheitern lassen. */
 export async function deleteObject(key: string): Promise<void> {
-  const s3Client = s3();
-  if (!s3Client) return;
+  const bucket = await s3();
+  if (!bucket) return;
   try {
-    await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+    const { DeleteObjectCommand } = bucket.mod;
+    await bucket.client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
   } catch (error) {
     console.warn(`[storage] Objekt ${key} konnte nicht gelöscht werden`, error);
   }
