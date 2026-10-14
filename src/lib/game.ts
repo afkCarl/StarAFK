@@ -98,9 +98,19 @@ export interface LobbyPlayer extends PlayerProfile {
   isHost: boolean;
 }
 
+/** Vom AI Game Master (Neon Function `gamemaster`) erzeugter Text. */
+export interface LobbyNarration {
+  kind: string;
+  text: string;
+  model: string | null;
+  createdAt: string;
+}
+
 export interface LobbyState {
   code: string;
   players: LobbyPlayer[];
   roleCounts: Record<string, number>;
   gameStarted: boolean;
+  /** Neuester Game-Master-Text – für alle Spieler sichtbar. */
+  narration: LobbyNarration | null;
 }

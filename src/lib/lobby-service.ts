@@ -1,16 +1,18 @@
-import { and, asc, eq, lt } from "drizzle-orm";
+import { and, asc, desc, eq, lt } from "drizzle-orm";
 
 import { getDb } from "@/db";
-import { lobbies, players } from "@/db/schema";
+import { gameMasterLines, lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
   defaultRoleCounts,
+  type LobbyNarration,
   type LobbyPlayer,
   type LobbyState,
   type PlayerProfile,
   ROLES,
 } from "@/lib/game";
-import { parseImageInput } from "@/lib/image";
+import { decodeImage, parseImageInput } from "@/lib/image";
+import { deleteObject, putObject, storageEnabled } from "@/lib/storage";
 
 /**
  * Nach dieser Zeit ohne Lebenszeichen gilt ein Spieler als getrennt.
@@ -41,6 +43,7 @@ let lastPurgeAt = 0;
 /** Profilfelder, die für den Lobby-Zustand gebraucht werden (ohne Bild!). */
 const playerColumns = {
   id: players.id,
+  userId: players.userId,
   name: players.name,
   color: players.color,
   fadeIntensity: players.fadeIntensity,
@@ -53,6 +56,7 @@ const playerColumns = {
 
 type PlayerSummary = {
   id: string;
+  userId: string | null;
   name: string;
   color: string;
   fadeIntensity: number;
@@ -62,6 +66,15 @@ type PlayerSummary = {
   lastSeen: Date;
   imageUpdatedAt: Date | null;
 };
+
+/**
+ * Zusatzbedingung für Schreibzugriffe, wenn Login aktiv ist: Nur der Besitzer
+ * (Neon-Auth-Nutzer) darf die Zeile verändern. Ohne `userId` (Login aus, z. B.
+ * lokale Entwicklung) bleibt das Verhalten wie vorher.
+ */
+function ownerFilter(userId?: string | null) {
+  return userId ? eq(players.userId, userId) : undefined;
+}
 
 /** Profilbild-URL (klein, cachebar) – Bilddaten selbst liegen unter derselben Route. */
 export function avatarUrl(playerId: string, version: Date | number): string {
@@ -151,17 +164,45 @@ function toLobbyPlayer(row: PlayerSummary): LobbyPlayer {
   };
 }
 
-function toState(
+/**
+ * Neuester Game-Master-Text der Lobby (Neon Function `gamemaster` schreibt ihn).
+ * Kleiner Text → er darf problemlos im Sekunden-Polling mitfahren, damit ihn
+ * alle Spieler gleichzeitig sehen.
+ */
+async function latestNarration(code: string): Promise<LobbyNarration | null> {
+  const db = await getDb();
+  const [line] = await db
+    .select({
+      kind: gameMasterLines.kind,
+      text: gameMasterLines.text,
+      model: gameMasterLines.model,
+      createdAt: gameMasterLines.createdAt,
+    })
+    .from(gameMasterLines)
+    .where(eq(gameMasterLines.lobbyCode, code))
+    .orderBy(desc(gameMasterLines.createdAt))
+    .limit(1);
+  if (!line) return null;
+  return {
+    kind: line.kind,
+    text: line.text,
+    model: line.model,
+    createdAt: line.createdAt.toISOString(),
+  };
+}
+
+async function toState(
   code: string,
   rows: PlayerSummary[],
   roleCounts: Record<string, number>,
   gameStarted: boolean,
-): LobbyState {
+): Promise<LobbyState> {
   return {
     code,
     players: rows.map(toLobbyPlayer),
     roleCounts,
     gameStarted,
+    narration: await latestNarration(code),
   };
 }
 
@@ -199,12 +240,18 @@ async function cleanupStalePlayers(code: string): Promise<void> {
     );
 }
 
-async function touchPlayer(code: string, playerId: string): Promise<void> {
+async function touchPlayer(
+  code: string,
+  playerId: string,
+  userId?: string | null,
+): Promise<void> {
   const db = await getDb();
   await db
     .update(players)
     .set({ lastSeen: new Date() })
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 }
 
 export type CreateOptions = {
@@ -212,6 +259,8 @@ export type CreateOptions = {
   code?: string;
   /** Bevorzugte Spieler-ID, damit ein Reconnect dieselbe Identität behält. */
   playerId?: string;
+  /** Neon-Auth-Nutzer der Session (wird an die Spielerzeile gebunden). */
+  userId?: string | null;
 };
 
 export type CreateOutcome =
@@ -262,16 +311,27 @@ export async function createLobby(
 
   if (wantedId) {
     const [existing] = await db
-      .select({ id: players.id })
+      .select({ id: players.id, userId: players.userId })
       .from(players)
       .where(and(eq(players.id, wantedId), eq(players.lobbyCode, code)));
     if (existing) {
+      // Fremde Spielfigur (anderes Konto) → keine Wiederherstellung.
+      if (existing.userId && options.userId && existing.userId !== options.userId) {
+        return { ok: false, reason: "full" };
+      }
+      if (options.userId && existing.userId !== options.userId) {
+        // Zeile aus der Zeit ohne Login → dem Konto zuschreiben.
+        await db
+          .update(players)
+          .set({ userId: options.userId })
+          .where(and(eq(players.id, wantedId), eq(players.lobbyCode, code)));
+      }
       await applyProfilePatch(code, wantedId, sanitizeProfilePatch(profileInput));
       const rows = await listPlayers(code);
       return {
         ok: true,
         selfId: wantedId,
-        lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+        lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
         reused: true,
       };
     }
@@ -285,6 +345,7 @@ export async function createLobby(
   const profile = sanitizeProfile(profileInput);
   const base = {
     lobbyCode: code,
+    userId: options.userId ?? null,
     ...profile,
     imageUpdatedAt: profile.image ? new Date() : null,
     isHost: !existingPlayers.some((row) => row.isHost),
@@ -306,7 +367,7 @@ export async function createLobby(
   return {
     ok: true,
     selfId: self.id,
-    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
     reused: !created,
   };
 }
@@ -323,7 +384,7 @@ export type JoinOutcome =
 export async function joinLobby(
   codeInput: string,
   profileInput: unknown,
-  options: { playerId?: string } = {},
+  options: { playerId?: string; userId?: string | null } = {},
 ): Promise<JoinOutcome> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return { ok: false, reason: "not_found" };
@@ -337,13 +398,24 @@ export async function joinLobby(
 
   if (resumeId) {
     const [existing] = await db
-      .select({ id: players.id })
+      .select({ id: players.id, userId: players.userId })
       .from(players)
       .where(and(eq(players.id, resumeId), eq(players.lobbyCode, code)));
     if (existing) {
+      // Zeile gehört einem anderen Konto → nicht wiederherstellen.
+      if (existing.userId && options.userId && existing.userId !== options.userId) {
+        return { ok: false, reason: "not_found" };
+      }
+      if (options.userId && existing.userId !== options.userId) {
+        // Zeile aus der Zeit ohne Login → jetzt dem Konto zuschreiben.
+        await db
+          .update(players)
+          .set({ userId: options.userId })
+          .where(and(eq(players.id, resumeId), eq(players.lobbyCode, code)));
+      }
       await applyProfilePatch(code, resumeId, patch);
       const rows = await listPlayers(code);
-      const state = toState(code, rows, lobby.roleCounts, lobby.gameStarted);
+      const state = await toState(code, rows, lobby.roleCounts, lobby.gameStarted);
       return { ok: true, selfId: resumeId, lobby: state, resumed: true };
     }
 
@@ -359,6 +431,7 @@ export async function joinLobby(
           .values({
             id: resumeId,
             lobbyCode: code,
+            userId: options.userId ?? null,
             ...profile,
             imageUpdatedAt: profile.image ? new Date() : null,
             isHost: !current.some((row) => row.isHost),
@@ -370,7 +443,7 @@ export async function joinLobby(
           return {
             ok: true,
             selfId: recreated.id,
-            lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+            lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
             resumed: true,
           };
         }
@@ -388,6 +461,7 @@ export async function joinLobby(
     .insert(players)
     .values({
       lobbyCode: code,
+      userId: options.userId ?? null,
       ...profile,
       imageUpdatedAt: profile.image ? new Date() : null,
       isHost: false,
@@ -398,7 +472,7 @@ export async function joinLobby(
   return {
     ok: true,
     selfId: self.id,
-    lobby: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    lobby: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
     resumed: false,
   };
 }
@@ -408,6 +482,7 @@ async function applyProfilePatch(
   code: string,
   playerId: string,
   patch: Partial<PlayerProfile>,
+  userId?: string | null,
 ): Promise<void> {
   const db = await getDb();
   const values: Record<string, unknown> = { lastSeen: new Date() };
@@ -422,7 +497,9 @@ async function applyProfilePatch(
   await db
     .update(players)
     .set(values)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 }
 
 export type StateOutcome =
@@ -439,6 +516,7 @@ export type StateOutcome =
 export async function getLobbyState(
   codeInput: string,
   playerId?: string,
+  userId?: string | null,
 ): Promise<StateOutcome> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return { status: "not_found" };
@@ -462,7 +540,7 @@ export async function getLobbyState(
       ? { status: "not_member" }
       : {
           status: "ok",
-          state: toState(code, [], lobby.roleCounts, lobby.gameStarted),
+          state: await toState(code, [], lobby.roleCounts, lobby.gameStarted),
         };
   }
 
@@ -477,6 +555,8 @@ export async function getLobbyState(
   if (playerId) {
     const self = rows.find((row) => row.id === playerId);
     if (!self) return { status: "not_member" };
+    // Mit Login: nur die eigene Spielfigur darf abgefragt werden.
+    if (userId && self.userId !== userId) return { status: "not_member" };
     if (Date.now() - self.lastSeen.getTime() > TOUCH_INTERVAL_MS) {
       await touchPlayer(code, playerId);
     }
@@ -484,7 +564,7 @@ export async function getLobbyState(
 
   return {
     status: "ok",
-    state: toState(code, rows, lobby.roleCounts, lobby.gameStarted),
+    state: await toState(code, rows, lobby.roleCounts, lobby.gameStarted),
   };
 }
 
@@ -496,6 +576,7 @@ export async function setGameStarted(
   codeInput: string,
   playerId: string,
   started: boolean,
+  userId?: string | null,
 ): Promise<boolean> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return false;
@@ -509,6 +590,7 @@ export async function setGameStarted(
         eq(players.id, playerId),
         eq(players.lobbyCode, code),
         eq(players.isHost, true),
+        ownerFilter(userId),
       ),
     );
   if (!host) return false;
@@ -517,7 +599,7 @@ export async function setGameStarted(
     .update(lobbies)
     .set({ gameStarted: started })
     .where(eq(lobbies.code, code));
-  await touchPlayer(code, playerId);
+  await touchPlayer(code, playerId, userId);
   return true;
 }
 
@@ -526,6 +608,7 @@ export async function updateProfile(
   code: string,
   playerId: string,
   profileInput: unknown,
+  userId?: string | null,
 ): Promise<boolean> {
   const patch = sanitizeProfilePatch(profileInput);
   if (patch.image !== undefined) {
@@ -539,20 +622,37 @@ export async function updateProfile(
   const updated = await db
     .update(players)
     .set(values)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)))
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    )
     .returning({ id: players.id });
   return updated.length > 0;
 }
 
 export type AvatarOutcome =
   | { ok: true; url: string | null }
-  | { ok: false; reason: "not_member" | "unsupported" | "too_large" };
+  | { ok: false; reason: "not_member" | "unsupported" | "too_large" | "storage" };
 
-/** Profilbild setzen oder entfernen (nur wenn es sich wirklich ändert). */
+const MIME_EXTENSION: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
+
+/**
+ * Profilbild setzen oder entfernen.
+ *
+ * Mit Neon Object Storage (AWS_* gesetzt) wandern die Bilddaten in den Bucket
+ * `assets` unter `avatars/<player-id>/<uuid>.<ext>`; in Postgres steht dann nur
+ * der Schlüssel (`image_key`). Ohne Bucket (lokale Entwicklung) bleibt es beim
+ * bisherigen Weg: Data-URL in der Spalte `image`.
+ */
 export async function updateAvatar(
   codeInput: string,
   playerId: string,
   imageInput: unknown,
+  userId?: string | null,
 ): Promise<AvatarOutcome> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return { ok: false, reason: "not_member" };
@@ -562,52 +662,102 @@ export async function updateAvatar(
 
   const db = await getDb();
   const [current] = await db
-    .select({ image: players.image, imageUpdatedAt: players.imageUpdatedAt })
+    .select({
+      image: players.image,
+      imageKey: players.imageKey,
+      imageUpdatedAt: players.imageUpdatedAt,
+    })
     .from(players)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
   if (!current) return { ok: false, reason: "not_member" };
 
-  if (current.image === parsed.image) {
-    // Unverändert: nur Lebenszeichen aktualisieren, keine 200 KB schreiben.
-    await touchPlayer(code, playerId);
-    return {
-      ok: true,
-      url: parsed.image && current.imageUpdatedAt
-        ? avatarUrl(playerId, current.imageUpdatedAt)
-        : null,
-    };
+  const version = new Date();
+
+  // Bild entfernen.
+  if (!parsed.image) {
+    if (current.imageKey) void deleteObject(current.imageKey);
+    await db
+      .update(players)
+      .set({ image: null, imageKey: null, imageUpdatedAt: null, lastSeen: version })
+      .where(
+        and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+      );
+    return { ok: true, url: null };
   }
 
-  const version = new Date();
+  if (!storageEnabled) {
+    if (current.image === parsed.image) {
+      // Unverändert: nur Lebenszeichen aktualisieren, keine 200 KB schreiben.
+      await touchPlayer(code, playerId, userId);
+      return {
+        ok: true,
+        url: current.imageUpdatedAt ? avatarUrl(playerId, current.imageUpdatedAt) : null,
+      };
+    }
+    await db
+      .update(players)
+      .set({ image: parsed.image, imageKey: null, imageUpdatedAt: version, lastSeen: version })
+      .where(
+        and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+      );
+    return { ok: true, url: avatarUrl(playerId, version) };
+  }
+
+  const decoded = decodeImage(parsed.image);
+  if (!decoded) return { ok: false, reason: "unsupported" };
+
+  // Jede Version bekommt einen eigenen Key (CDN/Browser-Cache bleibt gültig).
+  const key = `avatars/${playerId}/${version.getTime()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}.${MIME_EXTENSION[decoded.mime] ?? "bin"}`;
+  try {
+    await putObject(key, decoded.bytes, decoded.mime);
+  } catch (error) {
+    console.error("[storage] Profilbild konnte nicht hochgeladen werden", error);
+    return { ok: false, reason: "storage" };
+  }
+
   await db
     .update(players)
     .set({
-      image: parsed.image,
-      imageUpdatedAt: parsed.image ? version : null,
+      image: null,
+      imageKey: key,
+      imageUpdatedAt: version,
       lastSeen: version,
     })
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 
-  return { ok: true, url: parsed.image ? avatarUrl(playerId, version) : null };
+  if (current.imageKey && current.imageKey !== key) void deleteObject(current.imageKey);
+
+  return { ok: true, url: avatarUrl(playerId, version) };
 }
 
-/** Profilbild eines Spielers (Rohdaten für `GET /api/lobby/avatar`). */
+/**
+ * Profilbild eines Spielers für `GET /api/lobby/avatar`: entweder der
+ * Bucket-Schlüssel (Neon Object Storage) oder die Data-URL (Fallback).
+ */
 export async function getAvatar(
   playerId: string,
-): Promise<{ image: string } | null> {
+): Promise<{ image: string | null; imageKey: string | null } | null> {
   if (!playerId) return null;
   const db = await getDb();
   const [row] = await db
-    .select({ image: players.image })
+    .select({ image: players.image, imageKey: players.imageKey })
     .from(players)
     .where(eq(players.id, playerId));
-  return row?.image ? { image: row.image } : null;
+  if (!row || (!row.image && !row.imageKey)) return null;
+  return { image: row.image, imageKey: row.imageKey };
 }
 
 export async function updateRoleCounts(
   codeInput: string,
   playerId: string,
   roleCountsInput: unknown,
+  userId?: string | null,
 ): Promise<boolean> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6) return false;
@@ -621,6 +771,7 @@ export async function updateRoleCounts(
         eq(players.id, playerId),
         eq(players.lobbyCode, code),
         eq(players.isHost, true),
+        ownerFilter(userId),
       ),
     );
   if (!host) return false;
@@ -629,21 +780,36 @@ export async function updateRoleCounts(
     .update(lobbies)
     .set({ roleCounts: sanitizeRoleCounts(roleCountsInput) })
     .where(eq(lobbies.code, code));
-  await touchPlayer(code, playerId);
+  await touchPlayer(code, playerId, userId);
   return true;
 }
 
 export async function removePlayer(
   codeInput: string,
   playerId: string,
+  userId?: string | null,
 ): Promise<void> {
   const code = normalizeCode(codeInput);
   if (code.length !== 6 || !playerId) return;
 
   const db = await getDb();
+
+  // Bild im Bucket mit aufräumen (best effort).
+  if (storageEnabled) {
+    const [row] = await db
+      .select({ imageKey: players.imageKey })
+      .from(players)
+      .where(
+        and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+      );
+    if (row?.imageKey) void deleteObject(row.imageKey);
+  }
+
   await db
     .delete(players)
-    .where(and(eq(players.id, playerId), eq(players.lobbyCode, code)));
+    .where(
+      and(eq(players.id, playerId), eq(players.lobbyCode, code), ownerFilter(userId)),
+    );
 
   // Promote another player if the host left.
   const rows = await db
