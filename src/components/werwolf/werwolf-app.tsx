@@ -51,9 +51,13 @@ type ConnectionState = "ok" | "reconnecting";
 
 /** Laufende Sitzung (Lobbycode + eigene Spieler-ID) – übersteht ein Neuladen. */
 const SESSION_KEY = "werwolf-lobby-session";
+/** Tab-eigenes Profil in sessionStorage – damit jeder Tab seinen eigenen Standardnamen behält. */
+const TAB_PROFILE_KEY = "werwolf-tab-profile";
+/** BroadcastChannel für sofortige Live-Synchronisation zwischen Tabs im selben Browser. */
+const SYNC_CHANNEL = "werwolf-lobby-sync";
 /** Poll-Intervalle: aktiv sichtbar / Tab im Hintergrund (Browser drosseln dort). */
 const POLL_ACTIVE_MS = 1_200;
-const POLL_HIDDEN_MS = 20_000;
+const POLL_HIDDEN_MS = 2_500;
 /** Nach so vielen Fehlversuchen in Folge gilt die Lobby als verloren. */
 const MAX_POLL_FAILURES = 8;
 /** Profilbilder werden im Browser verkleinert, damit sie schnell übertragen werden. */
@@ -77,10 +81,54 @@ function loadStoredProfile<K extends keyof PlayerProfile>(
   fallback: PlayerProfile[K],
 ): PlayerProfile[K] {
   try {
+    const tabStored = JSON.parse(sessionStorage.getItem(TAB_PROFILE_KEY) || "{}");
+    if (tabStored[key] !== undefined) return tabStored[key];
+  } catch {
+    /* ignorieren */
+  }
+  try {
     const stored = JSON.parse(localStorage.getItem(PROFILE_KEY) || "{}");
     return stored[key] ?? fallback;
   } catch {
     return fallback;
+  }
+}
+
+function saveTabProfile(profile: Partial<PlayerProfile>): void {
+  try {
+    sessionStorage.setItem(TAB_PROFILE_KEY, JSON.stringify(profile));
+  } catch {
+    /* ignorieren */
+  }
+}
+
+function notifyOtherTabs(code: string): void {
+  if (!code || typeof BroadcastChannel === "undefined") return;
+  try {
+    const channel = new BroadcastChannel(SYNC_CHANNEL);
+    channel.postMessage({ code });
+    channel.close();
+  } catch {
+    /* BroadcastChannel nicht verfügbar */
+  }
+}
+
+async function isPlayerActiveInAnotherTab(playerId: string): Promise<boolean> {
+  if (
+    !playerId ||
+    typeof navigator === "undefined" ||
+    !navigator.locks?.request
+  ) {
+    return false;
+  }
+  try {
+    return await navigator.locks.request(
+      `werwolf-player-${playerId}`,
+      { ifAvailable: true },
+      (lock) => lock === null,
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -298,11 +346,23 @@ export default function WerwolfApp() {
 
   // Gespeichertes Profil nach dem Mount laden.
   useEffect(() => {
-    setName(loadStoredProfile("name", randomName()));
-    setColor(loadStoredProfile("color", DEFAULT_COLOR));
-    setFadeIntensity(loadStoredProfile("fadeIntensity", 50));
-    setFrame(loadStoredProfile("frame", "none"));
-    setImage(loadStoredProfile("image", null));
+    const initialName = loadStoredProfile("name", randomName());
+    const initialColor = loadStoredProfile("color", DEFAULT_COLOR);
+    const initialFade = loadStoredProfile("fadeIntensity", 50);
+    const initialFrame = loadStoredProfile("frame", "none");
+    const initialImage = loadStoredProfile("image", null);
+    setName(initialName);
+    setColor(initialColor);
+    setFadeIntensity(initialFade);
+    setFrame(initialFrame);
+    setImage(initialImage);
+    saveTabProfile({
+      name: initialName,
+      color: initialColor,
+      fadeIntensity: initialFade,
+      frame: initialFrame,
+      image: initialImage,
+    });
     setProfileLoaded(true);
   }, []);
 
@@ -329,17 +389,23 @@ export default function WerwolfApp() {
     }
   }, []);
 
-  const skipInitialPersist = useRef(true);
+  const persistReadyRef = useRef(false);
   useEffect(() => {
-    if (skipInitialPersist.current) {
-      skipInitialPersist.current = false;
+    if (!profileLoaded) return;
+    saveTabProfile({ name, color, fadeIntensity, frame, image });
+    if (!persistReadyRef.current) {
+      persistReadyRef.current = true;
       return;
     }
-    localStorage.setItem(
-      PROFILE_KEY,
-      JSON.stringify({ name, color, fadeIntensity, frame, image }),
-    );
-  }, [name, color, fadeIntensity, frame, image]);
+    try {
+      localStorage.setItem(
+        PROFILE_KEY,
+        JSON.stringify({ name, color, fadeIntensity, frame, image }),
+      );
+    } catch {
+      /* Privater Modus / Speicher voll */
+    }
+  }, [profileLoaded, name, color, fadeIntensity, frame, image]);
 
   const profile = useMemo<PlayerProfile>(
     () => ({
@@ -521,13 +587,48 @@ export default function WerwolfApp() {
     };
     document.addEventListener("visibilitychange", onVisibility);
 
+    // Sofortige Synchronisation zwischen mehreren Tabs im selben Browser.
+    let syncChannel: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== "undefined") {
+        syncChannel = new BroadcastChannel(SYNC_CHANNEL);
+        syncChannel.onmessage = (event: MessageEvent<{ code?: string }>) => {
+          if (event.data?.code === lobbyCodeRef.current) {
+            void run();
+          }
+        };
+      }
+    } catch {
+      /* BroadcastChannel optional */
+    }
+
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibility);
+      syncChannel?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
+
+  // Exklusiven Web-Lock für die eigene Spieler-ID halten: So erkennt ein
+  // duplizierter Tab sofort, dass diese Spieler-ID bereits in Tab 1 aktiv ist
+  // (während ein Neuladen desselben Tabs den Lock vorher freigibt).
+  useEffect(() => {
+    if (!selfId || typeof navigator === "undefined" || !navigator.locks?.request) {
+      return;
+    }
+    let releaseLock: (() => void) | null = null;
+    const holdPromise = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    void navigator.locks
+      .request(`werwolf-player-${selfId}`, { mode: "exclusive" }, () => holdPromise)
+      .catch(() => {});
+    return () => {
+      releaseLock?.();
+    };
+  }, [selfId]);
 
   // Profiländerungen (Name, Farbe, Rahmen) gebündelt übertragen – absichtlich
   // OHNE Bild: das läuft über /api/lobby/avatar, damit die Payload pro
@@ -554,7 +655,9 @@ export default function WerwolfApp() {
           }),
         },
         12_000,
-      );
+      ).then((res) => {
+        if (res.ok) notifyOtherTabs(code);
+      });
     }, 250);
     return () => clearTimeout(timeout);
   }, [profile, screen]);
@@ -573,6 +676,7 @@ export default function WerwolfApp() {
       ).then((res) => {
         if (res.ok && res.data.ok) {
           lastAvatarRef.current = image;
+          notifyOtherTabs(code);
         } else if (!res.ok && res.reason !== "not_member") {
           setActionError(
             "Profilbild konnte nicht gespeichert werden. Bitte versuche es erneut.",
@@ -585,12 +689,33 @@ export default function WerwolfApp() {
 
   // Sitzung wiederherstellen: Nach einem Neuladen (Handy-Tab, versehentliches
   // Aktualisieren) landet man automatisch wieder in derselben Lobby.
+  // Wurde der Tab hingegen dupliziert (Tab 1 hält die Spieler-ID noch), bleibt
+  // Tab 2 als eigenständiger zweiter Spieler im Menü.
   useEffect(() => {
     if (!profileLoaded) return;
     const session = loadSession();
     if (!session || lobbyCodeRef.current || selfIdRef.current) return;
     let cancelled = false;
     void (async () => {
+      const activeElsewhere = await isPlayerActiveInAnotherTab(session.playerId);
+      if (cancelled) return;
+      if (activeElsewhere) {
+        clearSession();
+        const freshName = randomName();
+        setName(freshName);
+        saveTabProfile({
+          name: freshName,
+          color,
+          fadeIntensity,
+          frame,
+          image,
+        });
+        setJoinCode(session.code);
+        setJoinPanel("opening");
+        joinTimerRef.current = setTimeout(() => setJoinPanel("open"), 20);
+        return;
+      }
+
       const res = await apiRequest<LobbyResponse>(
         "/api/lobby/join",
         {
@@ -625,23 +750,6 @@ export default function WerwolfApp() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profileLoaded]);
-
-  // Beim Schließen des Tabs abmelden. Die Lobby selbst bleibt bestehen –
-  // ein versehentliches Neuladen kann so wieder in dieselbe Runde finden.
-  useEffect(() => {
-    const handler = (event: PageTransitionEvent) => {
-      if (event.persisted) return; // nur bfcache – Seite lebt weiter
-      const code = lobbyCodeRef.current;
-      const pid = selfIdRef.current;
-      if (!code || !pid) return;
-      const body = new Blob([JSON.stringify({ code, playerId: pid })], {
-        type: "application/json",
-      });
-      navigator.sendBeacon("/api/lobby/leave", body);
-    };
-    window.addEventListener("pagehide", handler);
-    return () => window.removeEventListener("pagehide", handler);
-  }, []);
 
   useEffect(
     () => () => {
@@ -729,6 +837,9 @@ export default function WerwolfApp() {
     counts: Record<string, number>,
     started: boolean,
   ) => {
+    lobbyCodeRef.current = code;
+    selfIdRef.current = id;
+    isHostRef.current = host;
     setSelfId(id);
     setLobbyCode(code);
     setIsHost(host);
@@ -742,6 +853,7 @@ export default function WerwolfApp() {
     // übertragen markieren.
     saveSession(code, id);
     lastAvatarRef.current = profileRef.current?.image ?? null;
+    notifyOtherTabs(code);
     setScreen("menuLeaving");
     leaveTimerRef.current = setTimeout(() => {
       setScreen("lobbyEntering");
@@ -795,10 +907,11 @@ export default function WerwolfApp() {
       if (!res.ok || !res.data.ok) {
         throw new Error(res.ok ? "server" : res.reason);
       }
+      const self = res.data.lobby.players.find((p) => p.id === res.data.selfId);
       enterLobby(
         res.data.lobby.code,
         res.data.lobby.players,
-        true,
+        self?.isHost ?? true,
         res.data.selfId,
         res.data.lobby.roleCounts,
         Boolean(res.data.lobby.gameStarted),
@@ -891,6 +1004,7 @@ export default function WerwolfApp() {
       );
       if (!res.ok) throw new Error(res.reason);
       setGameStarted(started);
+      notifyOtherTabs(code);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
@@ -914,6 +1028,8 @@ export default function WerwolfApp() {
     if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current);
     enterTimerRef.current = null;
     leaveTimerRef.current = null;
+    lobbyCodeRef.current = "";
+    selfIdRef.current = null;
     setScreen("menu");
     setSelfId(null);
     setLobbyCode("");
@@ -922,15 +1038,12 @@ export default function WerwolfApp() {
     pollFailuresRef.current = 0;
     lastAvatarRef.current = null;
     if (code && pid) {
-      const body = new Blob([JSON.stringify({ code, playerId: pid })], {
-        type: "application/json",
+      void apiRequest("/api/lobby/leave", {
+        method: "POST",
+        body: JSON.stringify({ code, playerId: pid }),
+      }).finally(() => {
+        notifyOtherTabs(code);
       });
-      if (!navigator.sendBeacon?.("/api/lobby/leave", body)) {
-        void apiRequest("/api/lobby/leave", {
-          method: "POST",
-          body: JSON.stringify({ code, playerId: pid }),
-        });
-      }
     }
   };
 
@@ -944,19 +1057,20 @@ export default function WerwolfApp() {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid) return;
-    const res = await apiRequest(
+    let res = await apiRequest(
       "/api/lobby/roles",
       { method: "POST", body: JSON.stringify({ code, playerId: pid, roleCounts: next }) },
       12_000,
     );
     if (!res.ok && isTransient(res.reason)) {
       // Einmal nachfassen – kurze Hänger der Free-Instanz sind normal.
-      await apiRequest(
+      res = await apiRequest(
         "/api/lobby/roles",
         { method: "POST", body: JSON.stringify({ code, playerId: pid, roleCounts: next }) },
         12_000,
       );
     }
+    if (res.ok) notifyOtherTabs(code);
   };
 
   // --- animation helpers -------------------------------------------------
@@ -1527,11 +1641,9 @@ export default function WerwolfApp() {
                           <p className="relative z-10 mt-4 break-all text-[1.6rem] font-black uppercase leading-none text-white drop-shadow-md sm:text-[1.9rem]">
                             {displayName}
                           </p>
-                          {player.isHost && (
-                            <p className="relative z-10 mt-2 text-xs font-bold uppercase tracking-[0.3em] text-white/50">
-                              Host
-                            </p>
-                          )}
+                          <p className="relative z-10 mt-2 text-xs font-bold uppercase tracking-[0.3em] text-white/50">
+                            {player.isHost ? "Host" : "Player"}
+                          </p>
                         </div>
                       );
                     })}
