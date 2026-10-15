@@ -54,6 +54,7 @@ const TEXT_FILES = [
   "src/components/werwolf/glass-card.tsx",
   "src/components/auth/auth-gate.tsx",
   "src/components/auth/sign-in-screen.tsx",
+  "src/components/system/boot-guard.tsx",
   "scripts/measure-ram.mjs",
   "scripts/build-readme.mjs",
 ];

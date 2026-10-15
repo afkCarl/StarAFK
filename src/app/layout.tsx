@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+
+import { BOOT_WATCHDOG_SCRIPT, BootGuard } from "@/components/system/boot-guard";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -30,7 +32,16 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="de">
-      <body className="antialiased">{children}</body>
+      <head>
+        {/* Läuft sofort und ohne eigenes JS-Bundle: meldet (und heilt einmal
+            automatisch), wenn die Seite sichtbar ist, aber der Client-Code
+            fehlt – dann reagieren die Buttons nämlich gar nicht. */}
+        <script dangerouslySetInnerHTML={{ __html: BOOT_WATCHDOG_SCRIPT }} />
+      </head>
+      <body className="antialiased">
+        <BootGuard />
+        {children}
+      </body>
     </html>
   );
 }

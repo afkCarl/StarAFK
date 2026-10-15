@@ -156,6 +156,15 @@ export function pglitePolicy(): PglitePolicy {
   return { allowed: true };
 }
 
+/**
+ * Welche eingebettete Datenbank ohne `DATABASE_URL` genutzt wird – nur für
+ * Logs/Health. Standard ist das native `node:sqlite`, PGlite muss explizit
+ * über `PGLITE_IN_PRODUCTION=1` angefordert werden.
+ */
+export function embeddedEngine(): "pglite" | "sqlite" {
+  return envFlag("PGLITE_IN_PRODUCTION") ? "pglite" : "sqlite";
+}
+
 export interface DbStatus {
   mode: DbMode;
   /** Konkreter Anbieter: `neon`, sonstiges externes `postgres` oder `pglite`. */
