@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#f1f5f9"/>
+  <path d="M42.5 12a21 21 0 1 0 9.4 27.6A17.5 17.5 0 0 1 42.5 12z" fill="#0b1220"/>
+  <circle cx="24" cy="30" r="2.4" fill="#f1f5f9"/>
+  <path d="M16 44c3-5 8-8 13-8" stroke="#f1f5f9" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+</svg>
+```
+
+## Datei: `public/roles/Amoricon.svg`
+
