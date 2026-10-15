@@ -118,6 +118,7 @@ src/components/werwolf/role-icon.tsx
 src/components/werwolf/glass-card.tsx
 src/components/auth/auth-gate.tsx
 src/components/auth/sign-in-screen.tsx
+src/components/system/boot-guard.tsx
 scripts/measure-ram.mjs
 public/favicon-light.svg
 public/favicon-dark.svg
@@ -206,6 +207,26 @@ const nextConfig: NextConfig = {
   // dann blockt Next 16 den HMR-WebSocket der Vorschau, die Seite wird nie
   // hydriert und bleibt dauerhaft auf „Laden…“ stehen.
   allowedDevOrigins: ["*.e2b.app", "localhost", "127.0.0.1"],
+
+  /**
+   * Das HTML-Dokument darf nicht „frisch“ zwischengespeichert werden.
+   *
+   * Next liefert die vorgerenderte Startseite mit `Cache-Control:
+   * s-maxage=31536000` aus. Die JS-Dateien, auf die dieses HTML verweist,
+   * heißen aber nach JEDEM Deploy anders. Bekommt ein Browser (oder ein
+   * CDN/Proxy davor) nach einem Deploy das alte HTML aus dem Cache, lädt die
+   * Seite zwar sichtbar, findet ihre Chunks nicht mehr und bleibt ohne
+   * Interaktivität: „Lobby erstellen“ tut dann einfach nichts. Mit `no-cache`
+   * muss jede Antwort erst geprüft werden (ETag → 304, kostet kaum etwas).
+   */
+  async headers() {
+    return [
+      {
+        source: "/",
+        headers: [{ key: "Cache-Control", value: "no-cache, must-revalidate" }],
+      },
+    ];
+  },
 };
 
 export default nextConfig;
@@ -440,14 +461,16 @@ export async function register(): Promise<void> {
  */
 async function logDatabasePlan(): Promise<void> {
   try {
-    const { getDbMode, getDbProvider, pglitePolicy } = await import("@/db");
+    const { embeddedEngine, getDbMode, getDbProvider, pglitePolicy } = await import("@/db");
     if (getDbMode() === "postgres") {
       console.log(`[start] Datenbank: extern (${getDbProvider()}).`);
       return;
     }
     const policy = pglitePolicy();
     if (policy.allowed) {
-      console.log("[start] Datenbank: eingebettetes PGlite (ohne DATABASE_URL).");
+      console.log(
+        `[start] Datenbank: eingebettetes ${embeddedEngine()} (ohne DATABASE_URL).`,
+      );
       return;
     }
     console.error(
@@ -662,6 +685,15 @@ export type PglitePolicy =
  */
 export function pglitePolicy(): PglitePolicy {
   return { allowed: true };
+}
+
+/**
+ * Welche eingebettete Datenbank ohne `DATABASE_URL` genutzt wird – nur für
+ * Logs/Health. Standard ist das native `node:sqlite`, PGlite muss explizit
+ * über `PGLITE_IN_PRODUCTION=1` angefordert werden.
+ */
+export function embeddedEngine(): "pglite" | "sqlite" {
+  return envFlag("PGLITE_IN_PRODUCTION") ? "pglite" : "sqlite";
 }
 
 export interface DbStatus {
@@ -2910,13 +2942,43 @@ export type SessionUser = {
 };
 
 /**
+ * So lange darf die Session-Prüfung höchstens dauern.
+ *
+ * Ohne Grenze hängt `auth.getSession()` bei einem nicht erreichbaren
+ * Auth-Server so lange, wie das Netzwerk braucht – und da JEDER Lobby-Aufruf
+ * die Session prüft, würde „Lobby erstellen“ minutenlang scheinbar nichts tun.
+ */
+const SESSION_TIMEOUT_MS = Number(process.env.AUTH_SESSION_TIMEOUT_MS ?? 5_000);
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`${label} nach ${ms} ms abgebrochen`)),
+        ms,
+      );
+      timer.unref?.();
+    }),
+  ]);
+}
+
+/**
  * Aktuelle Session (oder `null`). Wichtig: Nicht `{ user }` aus dem Ergebnis
  * destrukturieren – der Nutzer steckt in `data.user`.
  */
 export async function getSessionUser(): Promise<SessionUser | null> {
   if (!auth) return null;
   try {
-    const { data } = await auth.getSession();
+    const { data } = await withTimeout(
+      auth.getSession(),
+      SESSION_TIMEOUT_MS,
+      "Auth-Session-Prüfung",
+    );
     const user = data?.user;
     if (!user?.id) return null;
     return {
@@ -2926,6 +2988,7 @@ export async function getSessionUser(): Promise<SessionUser | null> {
     };
   } catch (error) {
     // Auth-Server nicht erreichbar o. Ä. → gilt als „nicht angemeldet“.
+    // Wichtig: schnell antworten (401) statt die Lobby-API hängen zu lassen.
     console.warn("[auth] getSession fehlgeschlagen", error);
     return null;
   }
@@ -2995,6 +3058,8 @@ export const authClient = createAuthClient();
 ```tsx
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+
+import { BOOT_WATCHDOG_SCRIPT, BootGuard } from "@/components/system/boot-guard";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -3025,7 +3090,16 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="de">
-      <body className="antialiased">{children}</body>
+      <head>
+        {/* Läuft sofort und ohne eigenes JS-Bundle: meldet (und heilt einmal
+            automatisch), wenn die Seite sichtbar ist, aber der Client-Code
+            fehlt – dann reagieren die Buttons nämlich gar nicht. */}
+        <script dangerouslySetInnerHTML={{ __html: BOOT_WATCHDOG_SCRIPT }} />
+      </head>
+      <body className="antialiased">
+        <BootGuard />
+        {children}
+      </body>
     </html>
   );
 }
@@ -3730,6 +3804,26 @@ function isTransient(reason: string): boolean {
 }
 
 /**
+ * Verständliche Meldung für eine fehlgeschlagene Aktion.
+ *
+ * Wichtig: `unauthorized` (nicht angemeldet bzw. Session abgelaufen) ist KEIN
+ * Serverfehler. Die pauschale Meldung „Server oder Datenbank nicht erreichbar“
+ * führte in die völlig falsche Richtung – deshalb wird sie hier unterschieden.
+ */
+function describeFailure(reason: string, fallback: string): string {
+  if (reason === "unauthorized") {
+    return "Deine Anmeldung fehlt oder ist abgelaufen. Bitte lade die Seite neu und melde dich dann erneut an.";
+  }
+  if (isTransient(reason)) {
+    return (
+      "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). " +
+      "Bitte warte ein paar Sekunden und versuche es noch einmal."
+    );
+  }
+  return fallback;
+}
+
+/**
  * Auf Render braucht die erste Anfrage nach dem Einschlafen deutlich länger
  * (oder läuft in einen 502, während der Server noch startet). Deshalb werden
  * vorübergehende Fehler automatisch wiederholt – der Spieler merkt nur, dass
@@ -4391,7 +4485,14 @@ export default function WerwolfApp() {
 
   const handleCreate = async () => {
     if (screen !== "menu" || modeLocked || busy) return;
-    if (mode.title !== "WERWOLF") return;
+    if (mode.title !== "WERWOLF") {
+      // Kein stummer Abbruch: Der Button ist im zweiten Modus ausgegraut, aber
+      // wer ihn trotzdem drückt, muss erfahren, WARUM nichts passiert.
+      setActionError(
+        `„${mode.title}“ ist noch nicht spielbar. Bitte wechsle mit dem Pfeil links zurück zu WERWOLF – dann kannst du eine Lobby erstellen.`,
+      );
+      return;
+    }
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
     setJoinPanel("closed");
     setJoinCode("");
@@ -4432,9 +4533,10 @@ export default function WerwolfApp() {
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
-        isTransient(reason)
-          ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
-          : "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+        describeFailure(
+          reason,
+          "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+        ),
       );
     } finally {
       setBusy(null);
@@ -4491,9 +4593,7 @@ export default function WerwolfApp() {
           ? "Die Lobby ist leider voll (max. 12 Spieler)."
           : reason === "not_found"
             ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
-            : isTransient(reason)
-              ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
-              : "Beitreten fehlgeschlagen – bitte versuche es erneut.",
+            : describeFailure(reason, "Beitreten fehlgeschlagen – bitte versuche es erneut."),
       );
     } finally {
       setBusy(null);
@@ -4522,9 +4622,7 @@ export default function WerwolfApp() {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         started
-          ? isTransient(reason)
-            ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
-            : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+          ? describeFailure(reason, "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut.")
           : "Das Spiel konnte nicht zurückgesetzt werden.",
       );
     } finally {
@@ -5877,6 +5975,151 @@ export function SignInScreen({ onDone }: { onDone?: () => void }) {
 }
 ```
 
+## Datei: `src/components/system/boot-guard.tsx`
+
+```tsx
+"use client";
+
+import { useEffect } from "react";
+
+/** Schlüssel für den einmaligen automatischen Neulade-Versuch (siehe layout.tsx). */
+const BOOT_RELOAD_KEY = "starafk-boot-reload";
+/** Schlüssel für den Neulade-Versuch nach einem Chunk-Ladefehler. */
+const CHUNK_RELOAD_KEY = "starafk-chunk-reload";
+
+function reloadOnce(key: string): boolean {
+  try {
+    if (sessionStorage.getItem(key) === "1") return false;
+    sessionStorage.setItem(key, "1");
+  } catch {
+    /* Privater Modus – dann eben ohne Schutz vor einer zweiten Runde. */
+  }
+  window.location.reload();
+  return true;
+}
+
+/**
+ * Start-Wächter der App.
+ *
+ * Zwei Aufgaben, beide gegen dasselbe Fehlerbild: Die Seite ist sichtbar
+ * (serverseitig gerendert), aber die Buttons reagieren nicht, weil der
+ * Client-Code fehlt.
+ *
+ * 1. **Bereitschaft markieren**: `data-app-ready="1"` am <html>-Element. Das
+ *    inline Watchdog-Skript in `layout.tsx` (läuft auch dann, wenn KEIN Chunk
+ *    geladen werden konnte) prüft darauf und lädt die Seite einmal neu bzw.
+ *    zeigt eine Meldung mit „Neu laden“-Button.
+ * 2. **Chunk-Ladefehler abfangen**: Nach einem Deploy heißen die JS-Dateien
+ *    anders. Ein noch offener Tab (oder ein zwischengespeicherter HTML-Stand)
+ *    verlangt dann Dateien, die es nicht mehr gibt – React hängt mitten im
+ *    Laden fest und die Oberfläche wirkt „tot“. Ein gezielter Neulade-Versuch
+ *    holt genau dann den aktuellen Stand.
+ */
+export function BootGuard() {
+  useEffect(() => {
+    document.documentElement.setAttribute("data-app-ready", "1");
+    // Erfolgreich gestartet: Den Zähler für den automatischen Neustart
+    // zurücksetzen, damit ein späterer Fehler wieder einmal heilen darf.
+    try {
+      sessionStorage.removeItem(BOOT_RELOAD_KEY);
+      sessionStorage.removeItem(CHUNK_RELOAD_KEY);
+    } catch {
+      /* egal */
+    }
+
+    const onResourceError = (event: Event) => {
+      const target = event.target as
+        | { tagName?: string; src?: string; href?: string }
+        | null;
+      if (!target || typeof target.tagName !== "string") return;
+      const tag = target.tagName.toUpperCase();
+      if (tag !== "SCRIPT" && tag !== "LINK") return;
+      const url = target.src ?? target.href ?? "";
+      // Nur fehlgeschlagene Next.js-Chunks neu laden lassen, nicht z. B. ein
+      // kaputtes Rollen-Icon.
+      if (!url.includes("/_next/")) return;
+      reloadOnce(CHUNK_RELOAD_KEY);
+    };
+
+    const onRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason as { name?: string; message?: string } | null;
+      const message = `${reason?.name ?? ""} ${reason?.message ?? String(event.reason ?? "")}`;
+      if (/ChunkLoadError|Loading chunk [\w~.-]+ failed|Failed to fetch dynamically imported module/i.test(message)) {
+        reloadOnce(CHUNK_RELOAD_KEY);
+      }
+    };
+
+    // `true` (Capture-Phase): Fehler beim Laden von <script>/<link> bubble’n
+    // nicht – nur so bekommt man sie überhaupt mit.
+    window.addEventListener("error", onResourceError, true);
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => {
+      window.removeEventListener("error", onResourceError, true);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
+  }, []);
+
+  return null;
+}
+
+/**
+ * Inline-Skript (OHNE eigenes Chunk) für den Fall, dass gar kein Client-Code
+ * ankommt. Bewusst als String in `layout.tsx` eingebunden: Ein eigener
+ * JS-Bundle würde zusammen mit den anderen Chunks fehlen – genau dann, wenn
+ * der Wächter gebraucht wird.
+ */
+export const BOOT_WATCHDOG_SCRIPT = `(function () {
+  var KEY = "starafk-boot-reload";
+  var LIMIT_MS = 12000;
+  function isReady() {
+    return document.documentElement.getAttribute("data-app-ready") === "1";
+  }
+  function showBanner(text) {
+    if (document.getElementById("starafk-boot-banner")) return;
+    var bar = document.createElement("div");
+    bar.id = "starafk-boot-banner";
+    bar.setAttribute("role", "alert");
+    bar.style.cssText =
+      "position:fixed;left:0;right:0;bottom:0;z-index:2147483000;display:flex;" +
+      "flex-wrap:wrap;gap:12px;align-items:center;justify-content:center;" +
+      "padding:12px 16px;background:#450a0a;color:#fee2e2;text-align:center;" +
+      "font:600 14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif";
+    var message = document.createElement("span");
+    message.textContent = text;
+    var button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Neu laden";
+    button.style.cssText =
+      "border:1px solid #fca5a5;border-radius:10px;background:#7f1d1d;color:#fff;" +
+      "padding:6px 12px;font:700 13px system-ui,sans-serif;cursor:pointer";
+    button.onclick = function () {
+      window.location.reload();
+    };
+    bar.appendChild(message);
+    bar.appendChild(button);
+    (document.body || document.documentElement).appendChild(bar);
+  }
+  setTimeout(function () {
+    if (isReady()) return;
+    var retried = false;
+    try {
+      retried = sessionStorage.getItem(KEY) === "1";
+      if (!retried) sessionStorage.setItem(KEY, "1");
+    } catch (error) {
+      retried = false;
+    }
+    if (!retried) {
+      window.location.reload();
+      return;
+    }
+    showBanner(
+      "Die Seite konnte nicht vollständig geladen werden – die Buttons " +
+        "reagieren sonst nicht. Bitte einmal neu laden."
+    );
+  }, LIMIT_MS);
+})();`;
+```
+
 ## Datei: `scripts/measure-ram.mjs`
 
 ```js
@@ -6318,6 +6561,7 @@ const TEXT_FILES = [
   "src/components/werwolf/glass-card.tsx",
   "src/components/auth/auth-gate.tsx",
   "src/components/auth/sign-in-screen.tsx",
+  "src/components/system/boot-guard.tsx",
   "scripts/measure-ram.mjs",
   "scripts/build-readme.mjs",
 ];

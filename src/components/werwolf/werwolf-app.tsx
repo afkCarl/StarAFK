@@ -217,6 +217,26 @@ function isTransient(reason: string): boolean {
 }
 
 /**
+ * Verständliche Meldung für eine fehlgeschlagene Aktion.
+ *
+ * Wichtig: `unauthorized` (nicht angemeldet bzw. Session abgelaufen) ist KEIN
+ * Serverfehler. Die pauschale Meldung „Server oder Datenbank nicht erreichbar“
+ * führte in die völlig falsche Richtung – deshalb wird sie hier unterschieden.
+ */
+function describeFailure(reason: string, fallback: string): string {
+  if (reason === "unauthorized") {
+    return "Deine Anmeldung fehlt oder ist abgelaufen. Bitte lade die Seite neu und melde dich dann erneut an.";
+  }
+  if (isTransient(reason)) {
+    return (
+      "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). " +
+      "Bitte warte ein paar Sekunden und versuche es noch einmal."
+    );
+  }
+  return fallback;
+}
+
+/**
  * Auf Render braucht die erste Anfrage nach dem Einschlafen deutlich länger
  * (oder läuft in einen 502, während der Server noch startet). Deshalb werden
  * vorübergehende Fehler automatisch wiederholt – der Spieler merkt nur, dass
@@ -878,7 +898,14 @@ export default function WerwolfApp() {
 
   const handleCreate = async () => {
     if (screen !== "menu" || modeLocked || busy) return;
-    if (mode.title !== "WERWOLF") return;
+    if (mode.title !== "WERWOLF") {
+      // Kein stummer Abbruch: Der Button ist im zweiten Modus ausgegraut, aber
+      // wer ihn trotzdem drückt, muss erfahren, WARUM nichts passiert.
+      setActionError(
+        `„${mode.title}“ ist noch nicht spielbar. Bitte wechsle mit dem Pfeil links zurück zu WERWOLF – dann kannst du eine Lobby erstellen.`,
+      );
+      return;
+    }
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
     setJoinPanel("closed");
     setJoinCode("");
@@ -919,9 +946,10 @@ export default function WerwolfApp() {
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
-        isTransient(reason)
-          ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
-          : "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+        describeFailure(
+          reason,
+          "Lobby konnte nicht erstellt werden – Server oder Datenbank nicht erreichbar. Bitte versuche es gleich noch einmal.",
+        ),
       );
     } finally {
       setBusy(null);
@@ -978,9 +1006,7 @@ export default function WerwolfApp() {
           ? "Die Lobby ist leider voll (max. 12 Spieler)."
           : reason === "not_found"
             ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
-            : isTransient(reason)
-              ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
-              : "Beitreten fehlgeschlagen – bitte versuche es erneut.",
+            : describeFailure(reason, "Beitreten fehlgeschlagen – bitte versuche es erneut."),
       );
     } finally {
       setBusy(null);
@@ -1009,9 +1035,7 @@ export default function WerwolfApp() {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         started
-          ? isTransient(reason)
-            ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
-            : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+          ? describeFailure(reason, "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut.")
           : "Das Spiel konnte nicht zurückgesetzt werden.",
       );
     } finally {

@@ -57,14 +57,16 @@ export async function register(): Promise<void> {
  */
 async function logDatabasePlan(): Promise<void> {
   try {
-    const { getDbMode, getDbProvider, pglitePolicy } = await import("@/db");
+    const { embeddedEngine, getDbMode, getDbProvider, pglitePolicy } = await import("@/db");
     if (getDbMode() === "postgres") {
       console.log(`[start] Datenbank: extern (${getDbProvider()}).`);
       return;
     }
     const policy = pglitePolicy();
     if (policy.allowed) {
-      console.log("[start] Datenbank: eingebettetes PGlite (ohne DATABASE_URL).");
+      console.log(
+        `[start] Datenbank: eingebettetes ${embeddedEngine()} (ohne DATABASE_URL).`,
+      );
       return;
     }
     console.error(

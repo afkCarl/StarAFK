@@ -48,13 +48,43 @@ export type SessionUser = {
 };
 
 /**
+ * So lange darf die Session-Prüfung höchstens dauern.
+ *
+ * Ohne Grenze hängt `auth.getSession()` bei einem nicht erreichbaren
+ * Auth-Server so lange, wie das Netzwerk braucht – und da JEDER Lobby-Aufruf
+ * die Session prüft, würde „Lobby erstellen“ minutenlang scheinbar nichts tun.
+ */
+const SESSION_TIMEOUT_MS = Number(process.env.AUTH_SESSION_TIMEOUT_MS ?? 5_000);
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`${label} nach ${ms} ms abgebrochen`)),
+        ms,
+      );
+      timer.unref?.();
+    }),
+  ]);
+}
+
+/**
  * Aktuelle Session (oder `null`). Wichtig: Nicht `{ user }` aus dem Ergebnis
  * destrukturieren – der Nutzer steckt in `data.user`.
  */
 export async function getSessionUser(): Promise<SessionUser | null> {
   if (!auth) return null;
   try {
-    const { data } = await auth.getSession();
+    const { data } = await withTimeout(
+      auth.getSession(),
+      SESSION_TIMEOUT_MS,
+      "Auth-Session-Prüfung",
+    );
     const user = data?.user;
     if (!user?.id) return null;
     return {
@@ -64,6 +94,7 @@ export async function getSessionUser(): Promise<SessionUser | null> {
     };
   } catch (error) {
     // Auth-Server nicht erreichbar o. Ä. → gilt als „nicht angemeldet“.
+    // Wichtig: schnell antworten (401) statt die Lobby-API hängen zu lassen.
     console.warn("[auth] getSession fehlgeschlagen", error);
     return null;
   }
