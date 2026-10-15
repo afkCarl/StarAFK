@@ -866,7 +866,4 @@ export async function removePlayer(
   if (rows.length > 0 && !rows.some((row) => row.isHost)) {
     await db.update(players).set({ isHost: true }).where(eq(players.id, rows[0].id));
   }
-  if (rows.length === 0) {
-    await db.delete(lobbies).where(eq(lobbies.code, code));
-  }
 }
