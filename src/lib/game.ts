@@ -35,7 +35,7 @@ export const MODES: GameMode[] = [
       "Finde die Werwölfe im Dorf und rette die Bewohner. Nutze deine Fähigkeiten weise, um die unschuldigen Dorfbewohner vor den Gefahren der Nacht zu beschützen und die versteckten Feinde zu enttarnen, bevor es zu spät ist und die Werwölfe die Überhand gewinnen.",
   },
   {
-    title: "HÖHLE DER LÖWEN",
+    title: "???",
     description:
       "Präsentiere deine Idee vor der Runde und gewinne die Investoren für dich. Stelle dein innovatives Geschäftsmodell vor, verhandle hart und überzeuge die Löwen davon, dass dein Unternehmen das nächste große Ding auf dem Markt wird, um dir das nötige Kapital zu sichern.",
   },

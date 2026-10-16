@@ -322,6 +322,7 @@ export default function WerwolfApp() {
   const [frame, setFrame] = useState<string>("none");
   const [image, setImage] = useState<string | null>(null);
   const [failedFrames, setFailedFrames] = useState<Record<string, boolean>>({});
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const switchStartRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -340,6 +341,156 @@ export default function WerwolfApp() {
 
   lobbyCodeRef.current = lobbyCode;
   selfIdRef.current = selfId;
+
+  // Mikrofon-Erkennung: Sobald man spricht, leuchtet die eigene Spielerkarte
+  // grün auf, solange man redet.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let cancelled = false;
+    let stream: MediaStream | null = null;
+    let audioCtx: AudioContext | null = null;
+    let rafId: number | null = null;
+    let starting = false;
+    let speakingNow = false;
+    let holdUntil = 0;
+
+    const cleanupAudio = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      if (audioCtx) {
+        void audioCtx.close().catch(() => {});
+        audioCtx = null;
+      }
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+        stream = null;
+      }
+      if (speakingNow) {
+        speakingNow = false;
+        setIsSpeaking(false);
+      }
+    };
+
+    const startMic = async () => {
+      if (cancelled || starting) return;
+      if (
+        stream &&
+        stream.getAudioTracks().some((track) => track.readyState === "live")
+      ) {
+        if (audioCtx?.state === "suspended") {
+          void audioCtx.resume().catch(() => {});
+        }
+        return;
+      }
+      if (!navigator.mediaDevices?.getUserMedia) return;
+      starting = true;
+      try {
+        const mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        if (cancelled) {
+          mediaStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        cleanupAudio();
+        stream = mediaStream;
+        const AudioContextClass =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext })
+            .webkitAudioContext;
+        if (!AudioContextClass) return;
+        const ctx = new AudioContextClass();
+        audioCtx = ctx;
+        if (ctx.state === "suspended") {
+          void ctx.resume().catch(() => {});
+        }
+        const source = ctx.createMediaStreamSource(mediaStream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.4;
+        source.connect(analyser);
+        const data = new Uint8Array(analyser.fftSize);
+
+        mediaStream.getAudioTracks().forEach((track) => {
+          track.addEventListener("ended", () => {
+            if (!cancelled) cleanupAudio();
+          });
+        });
+
+        const tick = () => {
+          if (cancelled) return;
+          if (ctx.state === "suspended") {
+            if (speakingNow) {
+              speakingNow = false;
+              setIsSpeaking(false);
+            }
+            rafId = requestAnimationFrame(tick);
+            return;
+          }
+          analyser.getByteTimeDomainData(data);
+          let mean = 0;
+          for (let i = 0; i < data.length; i += 1) {
+            mean += (data[i] - 128) / 128;
+          }
+          mean /= data.length;
+          let sum = 0;
+          for (let i = 0; i < data.length; i += 1) {
+            const sample = (data[i] - 128) / 128 - mean;
+            sum += sample * sample;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          const now = performance.now();
+          const threshold = speakingNow ? 0.01 : 0.015;
+          if (rms > threshold) {
+            holdUntil = now + 220;
+          }
+          const active = now < holdUntil;
+          if (active !== speakingNow) {
+            speakingNow = active;
+            setIsSpeaking(active);
+          }
+          rafId = requestAnimationFrame(tick);
+        };
+        rafId = requestAnimationFrame(tick);
+      } catch {
+        /* Zugriff noch nicht erlaubt oder kein Mikrofon verfügbar */
+      } finally {
+        starting = false;
+      }
+    };
+
+    void startMic();
+
+    const onUserInteraction = () => {
+      if (audioCtx?.state === "suspended") {
+        void audioCtx.resume().catch(() => {});
+      }
+      if (
+        !stream ||
+        !stream.getAudioTracks().some((track) => track.readyState === "live")
+      ) {
+        void startMic();
+      }
+    };
+
+    window.addEventListener("pointerdown", onUserInteraction, { passive: true });
+    window.addEventListener("keydown", onUserInteraction, { passive: true });
+    window.addEventListener("touchstart", onUserInteraction, { passive: true });
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("pointerdown", onUserInteraction);
+      window.removeEventListener("keydown", onUserInteraction);
+      window.removeEventListener("touchstart", onUserInteraction);
+      cleanupAudio();
+    };
+  }, []);
 
   // Gespeichertes Profil nach dem Mount laden.
   useEffect(() => {
@@ -785,6 +936,11 @@ export default function WerwolfApp() {
 
   const switchMode = (nextIndex: number, dir: Direction) => {
     if (modeLocked || screen !== "menu") return;
+    if (MODES[nextIndex]?.title !== "WERWOLF" && joinPanel !== "closed") {
+      if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
+      setJoinPanel("closed");
+      setJoinCode("");
+    }
     setModeLocked(true);
     setDirection(dir);
     setPrevModeIndex(modeIndex);
@@ -802,7 +958,7 @@ export default function WerwolfApp() {
     switchMode((modeIndex - 1 + MODES.length) % MODES.length, "left");
 
   const toggleJoinPanel = () => {
-    if (screen !== "menu") return;
+    if (screen !== "menu" || mode.title !== "WERWOLF") return;
     if (joinTimerRef.current) clearTimeout(joinTimerRef.current);
     if (joinPanel === "closed") {
       setJoinPanel("opening");
@@ -1282,11 +1438,22 @@ export default function WerwolfApp() {
                   : "cursor-not-allowed opacity-30"
               } ${busy === "create" ? "animate-pulse opacity-70" : ""}`}
             >
-              {busy === "create" ? "Erstelle Lobby…" : "Lobby erstellen"}
+              {mode.title === "WERWOLF"
+                ? busy === "create"
+                  ? "Erstelle Lobby…"
+                  : "Lobby erstellen"
+                : "@!=$!)"}
             </button>
             <div className="flex w-fit flex-col">
-              <button onClick={toggleJoinPanel} className={menuButtons}>
-                Lobby beitreten
+              <button
+                onClick={toggleJoinPanel}
+                className={`w-fit text-left text-[1.75rem] font-bold uppercase transition-all duration-200 sm:text-[2.1rem] ${
+                  mode.title === "WERWOLF"
+                    ? "hover:translate-x-3 hover:text-neutral-400"
+                    : "cursor-not-allowed opacity-30"
+                }`}
+              >
+                {mode.title === "WERWOLF" ? "Lobby beitreten" : "@!=$!)"}
               </button>
               {joinPanel !== "closed" && (
                 <div
@@ -1502,7 +1669,11 @@ export default function WerwolfApp() {
                 </div>
                 <div className="hidden shrink-0 items-center justify-center md:flex">
                   <div
-                    className="relative flex flex-col items-center justify-center overflow-hidden rounded-[2rem] border border-white/15 bg-[#172033] text-center"
+                    className={`relative flex flex-col items-center justify-center overflow-hidden rounded-[2rem] border-2 bg-[#172033] text-center transition-all duration-150 ${
+                      isSpeaking
+                        ? "border-[#4ade80] shadow-[0_0_24px_rgba(34,197,94,0.95),0_0_56px_rgba(34,197,94,0.55),inset_0_0_24px_rgba(34,197,94,0.4)] ring-2 ring-[#4ade80]"
+                        : "border-white/15"
+                    }`}
                     style={{ width: "703px", height: "400.6px" }}
                   >
                     {color !== DEFAULT_COLOR && (
@@ -1600,19 +1771,25 @@ export default function WerwolfApp() {
                   </div>
                 </GlassCard>
                 <GlassCard className="flex min-h-0 flex-1 flex-col p-3 sm:p-4">
-                  <div className="custom-scroll grid auto-rows-[minmax(11rem,1fr)] grid-cols-1 gap-3 overflow-y-auto md:grid-cols-2 2xl:grid-cols-3">
+                  <div className="custom-scroll grid auto-rows-[minmax(11rem,1fr)] grid-cols-1 gap-3 overflow-y-auto p-2 md:grid-cols-2 2xl:grid-cols-3">
                     {players.map((player) => {
+                      const isSelf = player.id === selfId;
                       const displayName =
-                        player.id === selfId ? name || "NAME" : player.name;
-                      const displayColor = player.id === selfId ? color : player.color;
+                        isSelf ? name || "NAME" : player.name;
+                      const displayColor = isSelf ? color : player.color;
                       const displayIntensity =
-                        player.id === selfId ? fadeIntensity : player.fadeIntensity;
-                      const displayImage = player.id === selfId ? image : player.image;
-                      const displayFrame = player.id === selfId ? frame : player.frame;
+                        isSelf ? fadeIntensity : player.fadeIntensity;
+                      const displayImage = isSelf ? image : player.image;
+                      const displayFrame = isSelf ? frame : player.frame;
+                      const playerSpeaking = isSelf && isSpeaking;
                       return (
                         <div
                           key={player.id || player.name}
-                          className="relative flex min-h-[11rem] flex-col items-center justify-center overflow-hidden rounded-[1.4rem] border border-white/15 bg-[#172033] px-4 py-5 text-center"
+                          className={`relative flex min-h-[11rem] flex-col items-center justify-center overflow-hidden rounded-[1.4rem] border-2 bg-[#172033] px-4 py-5 text-center transition-all duration-150 ${
+                            playerSpeaking
+                              ? "border-[#4ade80] shadow-[0_0_20px_rgba(34,197,94,0.95),0_0_44px_rgba(34,197,94,0.55),inset_0_0_20px_rgba(34,197,94,0.4)] ring-2 ring-[#4ade80]"
+                              : "border-white/15"
+                          }`}
                         >
                           {displayColor && displayColor !== DEFAULT_COLOR && (
                             <div
