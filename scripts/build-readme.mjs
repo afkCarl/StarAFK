@@ -49,6 +49,7 @@ const TEXT_FILES = [
   "src/app/api/lobby/avatar/route.ts",
   "src/components/werwolf/werwolf-app.tsx",
   "src/components/werwolf/sky-background.tsx",
+  "src/components/werwolf/game-table.tsx",
   "src/components/werwolf/walking-cat.tsx",
   "src/components/werwolf/role-icon.tsx",
   "src/components/werwolf/glass-card.tsx",

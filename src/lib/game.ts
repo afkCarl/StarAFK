@@ -41,6 +41,13 @@ export const MODES: GameMode[] = [
   },
 ];
 
+/** Maximale Teilnehmerzahl pro Lobby – inklusive Host (12 Spieler + Host). */
+export const MAX_LOBBY_PLAYERS = 13;
+/** Mindestanzahl Teilnehmer (inklusive Host), damit das Spiel starten kann. */
+export const MIN_PLAYERS_TO_START = 4;
+/** Anzahl der Sitzplätze am Spieltisch (ohne Host). */
+export const SEAT_COUNT = MAX_LOBBY_PLAYERS - 1;
+
 export const DEFAULT_COLOR = "#6b7280";
 
 export function randomName(): string {
