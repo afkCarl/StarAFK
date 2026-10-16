@@ -226,6 +226,21 @@ async function main() {
     const code = host.body?.lobby?.code;
     const hostId = host.body?.selfId;
 
+    // Dieselben Rollennamen wie im Client, inklusive Umlauten: jedes Symbol
+    // muss unter /roles/<Rollenname>icon.png als echtes PNG ausgeliefert werden.
+    const roleNames = Object.keys(host.body?.lobby?.roleCounts ?? {});
+    check("Rollen-Setup enthält alle 15 Rollen", roleNames.length === 15);
+    for (const name of roleNames) {
+      const icon = await fetch(`${appUrlA}/roles/${encodeURIComponent(name)}icon.png`);
+      const bytes = Buffer.from(await icon.arrayBuffer());
+      check(
+        `PNG-Rollen-Icon: ${name}`,
+        icon.status === 200 &&
+          icon.headers.get("content-type") === "image/png" &&
+          bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")),
+      );
+    }
+
     const guest = await postJson(`${appUrlA}/api/lobby/join`, {
       code,
       profile: { name: "Gast", color: "#00ff00" },
@@ -265,6 +280,34 @@ async function main() {
     check("Zustand abfragen", state.body?.ok === true && state.body?.state?.gameStarted === true);
     const leave = await postJson(`${appUrlA}/api/lobby/leave`, { code, playerId: guest.body?.selfId });
     check("Lobby verlassen", leave.body?.ok === true);
+    const afterGuestLeave = await getJson(`${appUrlA}/api/lobby/state?code=${code}&pid=${hostId}`);
+    check(
+      "Verlassener Gast ist nicht mehr in der Lobby",
+      afterGuestLeave.body?.state?.players?.length === 1 &&
+        afterGuestLeave.body?.state?.players?.[0]?.id === hostId,
+    );
+
+    const successor = await postJson(`${appUrlA}/api/lobby/join`, {
+      code,
+      profile: { name: "Nachfolger" },
+    });
+    check("Erneutes Beitreten nach Verlassen", successor.body?.ok === true);
+    const hostLeave = await postJson(`${appUrlA}/api/lobby/leave`, { code, playerId: hostId });
+    check("Host kann die Lobby verlassen", hostLeave.body?.ok === true);
+    const afterHostLeave = await getJson(
+      `${appUrlA}/api/lobby/state?code=${code}&pid=${successor.body?.selfId}`,
+    );
+    check(
+      "Verbleibender Spieler übernimmt die Host-Rolle",
+      afterHostLeave.body?.state?.players?.length === 1 &&
+        afterHostLeave.body?.state?.players?.[0]?.id === successor.body?.selfId &&
+        afterHostLeave.body?.state?.players?.[0]?.isHost === true,
+    );
+    const formerHost = await getJson(`${appUrlA}/api/lobby/state?code=${code}&pid=${hostId}`);
+    check(
+      "Ehemaliger Host ist kein Lobby-Mitglied mehr",
+      formerHost.status === 409 && formerHost.body?.reason === "not_member",
+    );
   } finally {
     await appA.stop();
   }

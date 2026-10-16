@@ -39,11 +39,13 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Spielerkarte**: Name (max. 12 Zeichen), Farbe + Intensität (135°-Farbverlauf),
   Profilbild-Upload (Data-URL), Rahmenwahl (Rahmen 1 = laufende Katze `Cd`/`WalkingCat`).
   Persistenz in `localStorage` unter `werwolf-player-profile`.
-- **Lobby**: kopierbarer Lobbycode, Glaskarten-Grid der Spieler (Farbe/Avatar/Host-Badge),
-  Seitenleiste mit Spielmodus, „Rollen für diese Runde", „Sonstige Regeln",
+- **Lobby**: kopierbarer Lobbycode mit „Lobby verlassen" direkt unter „Kopieren",
+  deckende Spielerkarten (Farbe/Avatar/Host-Badge), Seitenleiste mit
+  „Rollen für diese Runde" oben und vergrößertem Bereich „Sonstige Regeln",
   „Spiel starten" (Host) bzw. „Warte auf Host…" (Gäste).
-- **15 Rollen** (Teams gut/böse/neutral) mit Beschreibung, Gewinnkondition und
-  Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
+- **15 Rollen** (Teams gut/böse/neutral) mit PNG-Symbolen aus
+  `/roles/<Rollenname>icon.png`, Beschreibung, Gewinnkondition und Host-Zählern;
+  Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: `?code=ABCDEF` öffnet das Beitreten-Feld vorausgefüllt.
 - **Realtime**: REST-Polling (1,2 s sichtbar / 20 s im Hintergrund-Tab),
   Lebenszeichen-Fenster 120 s, automatischer **Reconnect/Resume** (gleiche
@@ -69,6 +71,21 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - `/foreground.png` → speichern als `public/foreground.png`
 - `/frames/GrayCatWalkingOne.png` → speichern als `public/frames/GrayCatWalkingOne.png`
 - `/frames/GrayCatWalkingTwo.png` → speichern als `public/frames/GrayCatWalkingTwo.png`
+- `/roles/Amoricon.png` → speichern als `public/roles/Amoricon.png`
+- `/roles/Bürgermeistericon.png` → speichern als `public/roles/Bürgermeistericon.png`
+- `/roles/Detektivicon.png` → speichern als `public/roles/Detektivicon.png`
+- `/roles/Diebicon.png` → speichern als `public/roles/Diebicon.png`
+- `/roles/Doktoricon.png` → speichern als `public/roles/Doktoricon.png`
+- `/roles/Dorfbewohnericon.png` → speichern als `public/roles/Dorfbewohnericon.png`
+- `/roles/Dorftrottelicon.png` → speichern als `public/roles/Dorftrottelicon.png`
+- `/roles/Goetheicon.png` → speichern als `public/roles/Goetheicon.png`
+- `/roles/Hexeicon.png` → speichern als `public/roles/Hexeicon.png`
+- `/roles/Jägericon.png` → speichern als `public/roles/Jägericon.png`
+- `/roles/Kopfgeldjägericon.png` → speichern als `public/roles/Kopfgeldjägericon.png`
+- `/roles/Mediumicon.png` → speichern als `public/roles/Mediumicon.png`
+- `/roles/Sandmannicon.png` → speichern als `public/roles/Sandmannicon.png`
+- `/roles/Sehericon.png` → speichern als `public/roles/Sehericon.png`
+- `/roles/Werwolficon.png` → speichern als `public/roles/Werwolficon.png`
 
 Falls ein Asset nicht mehr lädt: beliebige dunkle Nachthimmel-/Wolken-/Dorfsilhouetten-
 Grafiken erzeugen ein nahezu identisches Bild; die Katzen-Sprites sind zwei Laufphasen
@@ -141,6 +158,21 @@ public/clouds.png
 public/foreground.png
 public/frames/GrayCatWalkingOne.png
 public/frames/GrayCatWalkingTwo.png
+public/roles/Amoricon.png
+public/roles/Bürgermeistericon.png
+public/roles/Detektivicon.png
+public/roles/Diebicon.png
+public/roles/Doktoricon.png
+public/roles/Dorfbewohnericon.png
+public/roles/Dorftrottelicon.png
+public/roles/Goetheicon.png
+public/roles/Hexeicon.png
+public/roles/Jägericon.png
+public/roles/Kopfgeldjägericon.png
+public/roles/Mediumicon.png
+public/roles/Sandmannicon.png
+public/roles/Sehericon.png
+public/roles/Werwolficon.png
 ```
 
 ---
@@ -3519,6 +3551,7 @@ import {
   ChevronRight,
   Copy,
   Info,
+  LogOut,
   Minus,
   Plus,
   Trash2,
@@ -3526,7 +3559,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { GameMasterCard } from "@/components/werwolf/game-master-card";
 import { GlassCard } from "@/components/werwolf/glass-card";
 import { RoleIcon } from "@/components/werwolf/role-icon";
 import { SkyBackground } from "@/components/werwolf/sky-background";
@@ -3538,7 +3570,6 @@ import {
   colorWash,
   randomName,
   winCondition,
-  type LobbyNarration,
   type LobbyPlayer,
   type LobbyState,
   type PlayerProfile,
@@ -3821,8 +3852,6 @@ export default function WerwolfApp() {
   const [roleCounts, setRoleCounts] = useState<Record<string, number>>(defaultCounts);
   const [cardModalOpen, setCardModalOpen] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
-  /** Neuester AI-Game-Master-Text (kommt über das Lobby-Polling zu allen Spielern). */
-  const [narration, setNarration] = useState<LobbyNarration | null>(null);
   const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [slowHint, setSlowHint] = useState<string | null>(null);
@@ -3937,7 +3966,6 @@ export default function WerwolfApp() {
     setPlayers(state.players);
     setRoleCounts(state.roleCounts);
     setGameStarted(Boolean(state.gameStarted));
-    setNarration(state.narration ?? null);
     setSelfId((current) => {
       if (current) {
         const self = state.players.find((p) => p.id === current);
@@ -4295,8 +4323,6 @@ export default function WerwolfApp() {
   modeRef.current = mode;
   isHostRef.current = isHost;
   const prevMode = prevModeIndex !== null ? MODES[prevModeIndex] : null;
-  const modeLabel = mode.title === "WERWOLF" ? "Werwolf (Standard)" : mode.title;
-  const modeShort = mode.title === "WERWOLF" ? "WW" : mode.title.slice(0, 2);
   const inMenu = screen === "menu" || screen === "menuLeaving";
   const inLobby = screen === "lobbyEntering" || screen === "lobby";
   const isDark = (inMenu && mode.title === "WERWOLF") || inLobby;
@@ -4547,6 +4573,13 @@ export default function WerwolfApp() {
     setSelfId(null);
     setLobbyCode("");
     setPlayers([]);
+    setIsHost(false);
+    setGameStarted(false);
+    setRoleCounts(defaultCounts);
+    setRoleModalOpen(false);
+    setRoleDetail(null);
+    setCopied(false);
+    setActionError(null);
     setConnection("ok");
     pollFailuresRef.current = 0;
     lastAvatarRef.current = null;
@@ -4846,7 +4879,7 @@ export default function WerwolfApp() {
                 onClick={(e) => e.stopPropagation()}
               >
                 <div
-                  className="custom-scroll flex max-h-[85vh] shrink-0 flex-col overflow-y-auto rounded-[2rem] border border-white/10 bg-[#0c1525]/95 p-6 shadow-[0_18px_80px_rgba(0,0,0,0.6)] backdrop-blur-2xl sm:p-8"
+                  className="custom-scroll flex max-h-[85vh] shrink-0 flex-col overflow-y-auto rounded-[2rem] border border-white/10 bg-[#0c1525] p-6 shadow-[0_18px_80px_rgba(0,0,0,0.6)] sm:p-8"
                   style={{ width: "780px" }}
                 >
                   <div className="flex shrink-0 items-center justify-between gap-4 border-b border-white/10 pb-3">
@@ -5014,7 +5047,7 @@ export default function WerwolfApp() {
                 </div>
                 <div className="hidden shrink-0 items-center justify-center md:flex">
                   <div
-                    className="relative flex flex-col items-center justify-center overflow-hidden rounded-[2rem] border border-white/15 bg-white/[0.06] text-center backdrop-blur-sm"
+                    className="relative flex flex-col items-center justify-center overflow-hidden rounded-[2rem] border border-white/15 bg-[#172033] text-center"
                     style={{ width: "703px", height: "400.6px" }}
                   >
                     {color !== DEFAULT_COLOR && (
@@ -5057,55 +5090,59 @@ export default function WerwolfApp() {
           className="absolute inset-0 z-20 px-4 py-4 text-white sm:px-6 sm:py-6 md:px-8 md:py-8"
           style={lobbyEnterStyle()}
         >
-          <div className="mx-auto flex h-full w-full max-w-[96rem] flex-col">
-            <div className="grid h-full min-h-0 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,2.4fr)_minmax(22rem,1fr)]">
+          <div className="custom-scroll mx-auto h-full w-full max-w-[96rem] overflow-y-auto">
+            <div className="grid min-h-full grid-cols-1 gap-4 xl:h-full xl:min-h-0 xl:grid-cols-[minmax(0,2.4fr)_minmax(22rem,1fr)]">
               <div className="flex min-h-0 flex-col gap-4">
-                <GlassCard className="relative px-5 py-5 sm:px-6 sm:py-6">
-                  <p className="text-sm font-black uppercase tracking-[0.32em] text-white/50">
-                    Lobbycode
-                  </p>
-                  <p className="mt-3 font-mono text-[clamp(2.3rem,6vw,4.8rem)] font-black uppercase tracking-[0.28em] text-white">
-                    {lobbyCode}
-                  </p>
-                  <div className="mt-4 flex flex-wrap items-center gap-3">
-                    <span
-                      className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] ${
-                        connection === "ok"
-                          ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
-                          : "border-amber-400/50 bg-amber-400/15 text-amber-100"
-                      }`}
-                      title={
-                        connection === "ok"
-                          ? "Lobby wird live synchronisiert"
-                          : "Kurzer Hänger – die Verbindung wird automatisch wiederhergestellt"
-                      }
-                    >
+                <GlassCard className="grid shrink-0 gap-4 px-5 py-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:px-6 sm:py-6">
+                  <div className="min-w-0">
+                    <p className="text-sm font-black uppercase tracking-[0.32em] text-white/50">
+                      Lobbycode
+                    </p>
+                    <p className="mt-3 font-mono text-[clamp(2.3rem,6vw,4.8rem)] font-black uppercase tracking-[0.28em] text-white">
+                      {lobbyCode}
+                    </p>
+                    <div className="mt-4 flex flex-wrap items-center gap-3">
                       <span
-                        className={`h-2 w-2 rounded-full ${
+                        className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] ${
                           connection === "ok"
-                            ? "bg-emerald-400"
-                            : "animate-pulse bg-amber-300"
+                            ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
+                            : "border-amber-400/50 bg-amber-400/15 text-amber-100"
                         }`}
-                      />
-                      {connection === "ok"
-                        ? "Live verbunden"
-                        : "Verbindung wird wiederhergestellt …"}
-                    </span>
+                        title={
+                          connection === "ok"
+                            ? "Lobby wird live synchronisiert"
+                            : "Kurzer Hänger – die Verbindung wird automatisch wiederhergestellt"
+                        }
+                      >
+                        <span
+                          className={`h-2 w-2 rounded-full ${
+                            connection === "ok"
+                              ? "bg-emerald-400"
+                              : "animate-pulse bg-amber-300"
+                          }`}
+                        />
+                        {connection === "ok"
+                          ? "Live verbunden"
+                          : "Verbindung wird wiederhergestellt …"}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 self-start">
+                    <button
+                      onClick={copyCode}
+                      className="flex items-center justify-center gap-2 rounded-[1rem] border border-white/30 bg-white/10 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/70"
+                    >
+                      {copied ? <Check size={18} /> : <Copy size={18} />}
+                      {copied ? "Kopiert" : "Kopieren"}
+                    </button>
                     <button
                       onClick={handleLeaveLobby}
-                      className="flex items-center gap-2 rounded-full border border-white/25 bg-white/5 px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] text-white/70 transition-all duration-200 hover:border-red-400/50 hover:bg-red-500/15 hover:text-red-100"
+                      className="flex items-center justify-center gap-2 rounded-[1rem] border border-white/25 bg-white/5 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white/70 transition-all duration-200 hover:border-red-400/50 hover:bg-red-500/15 hover:text-red-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/70"
                     >
-                      <X size={13} />
+                      <LogOut size={18} />
                       Lobby verlassen
                     </button>
                   </div>
-                  <button
-                    onClick={copyCode}
-                    className="absolute right-4 top-4 flex items-center gap-2 rounded-[1rem] border border-white/30 bg-white/10 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/20 sm:right-5 sm:top-5"
-                  >
-                    {copied ? <Check size={18} /> : <Copy size={18} />}
-                    {copied ? "Kopiert" : "Kopieren"}
-                  </button>
                 </GlassCard>
                 <GlassCard className="flex min-h-0 flex-1 flex-col p-3 sm:p-4">
                   <div className="custom-scroll grid auto-rows-[minmax(11rem,1fr)] grid-cols-1 gap-3 overflow-y-auto md:grid-cols-2 2xl:grid-cols-3">
@@ -5120,7 +5157,7 @@ export default function WerwolfApp() {
                       return (
                         <div
                           key={player.id || player.name}
-                          className="relative flex min-h-[11rem] flex-col items-center justify-center overflow-hidden rounded-[1.4rem] border border-white/15 bg-white/[0.06] px-4 py-5 text-center backdrop-blur-sm"
+                          className="relative flex min-h-[11rem] flex-col items-center justify-center overflow-hidden rounded-[1.4rem] border border-white/15 bg-[#172033] px-4 py-5 text-center"
                         >
                           {displayColor && displayColor !== DEFAULT_COLOR && (
                             <div
@@ -5167,29 +5204,11 @@ export default function WerwolfApp() {
                 </GlassCard>
               </div>
               <aside className="flex min-h-0 flex-col gap-4">
-                <GlassCard className="p-4">
-                  <p className="text-xs font-black uppercase tracking-[0.28em] text-white/50">
-                    Spielmodus
-                  </p>
-                  <div className="mt-3 flex items-center gap-4 rounded-[1.3rem] border border-white/15 bg-white/[0.06] px-3 py-3">
-                    <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-[1rem] border border-white/30 text-xl font-black uppercase text-white">
-                      {modeShort}
-                    </div>
-                    <div>
-                      <p className="text-[1.75rem] font-black uppercase leading-tight text-white">
-                        {modeLabel}
-                      </p>
-                      <p className="mt-1 text-sm font-semibold uppercase tracking-[0.2em] text-white/50">
-                        Privatlobby · {players.length} Spieler verbunden
-                      </p>
-                    </div>
-                  </div>
-                </GlassCard>
-                <GlassCard className="flex min-h-0 flex-1 flex-col p-4">
+                <GlassCard className="flex min-h-0 flex-col p-4 xl:flex-[3]">
                   <p className="shrink-0 text-xs font-black uppercase tracking-[0.28em] text-white/50">
                     Rollen für diese Runde
                   </p>
-                  <div className="custom-scroll mt-4 flex-1 space-y-2 overflow-y-auto pr-1">
+                  <div className="custom-scroll mt-4 max-h-80 space-y-2 overflow-y-auto pr-1 xl:max-h-none xl:flex-1">
                     {selectedRoles.length > 0 ? (
                       selectedRoles.map((role) => (
                         <button
@@ -5225,7 +5244,7 @@ export default function WerwolfApp() {
                     </button>
                   )}
                 </GlassCard>
-                <GlassCard className="p-4">
+                <GlassCard className="min-h-[10rem] p-5 xl:flex-[2]">
                   <p className="text-xs font-black uppercase tracking-[0.28em] text-white/50">
                     Sonstige Regeln
                   </p>
@@ -5233,13 +5252,6 @@ export default function WerwolfApp() {
                     Keine besonderen Regeln festgelegt.
                   </p>
                 </GlassCard>
-                <GameMasterCard
-                  code={lobbyCode}
-                  playerId={selfId}
-                  gameStarted={gameStarted}
-                  narration={narration}
-                  onNarration={setNarration}
-                />
                 {isHost ? (
                   gameStarted ? (
                     <div className="flex flex-col gap-2">
@@ -5622,7 +5634,7 @@ export function RoleIcon({
   return (
     // eslint-disable-next-line @next/next/no-img-element
     <img
-      src={`/roles/${encodeURIComponent(name)}icon.svg`}
+      src={`/roles/${encodeURIComponent(name)}icon.png`}
       alt={name}
       onError={() => setFailed(true)}
       className={`h-full w-full object-contain ${className}`}
@@ -6329,6 +6341,10 @@ const BINARY_FILES = [
   "public/foreground.png",
   "public/frames/GrayCatWalkingOne.png",
   "public/frames/GrayCatWalkingTwo.png",
+  ...readdirSync(join(ROOT, "public/roles"))
+    .filter((file) => file.endsWith(".png"))
+    .sort()
+    .map((file) => `public/roles/${file}`),
 ];
 
 function langFor(path) {
@@ -6403,11 +6419,13 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Spielerkarte**: Name (max. 12 Zeichen), Farbe + Intensität (135°-Farbverlauf),
   Profilbild-Upload (Data-URL), Rahmenwahl (Rahmen 1 = laufende Katze \`Cd\`/\`WalkingCat\`).
   Persistenz in \`localStorage\` unter \`werwolf-player-profile\`.
-- **Lobby**: kopierbarer Lobbycode, Glaskarten-Grid der Spieler (Farbe/Avatar/Host-Badge),
-  Seitenleiste mit Spielmodus, „Rollen für diese Runde", „Sonstige Regeln",
+- **Lobby**: kopierbarer Lobbycode mit „Lobby verlassen" direkt unter „Kopieren",
+  deckende Spielerkarten (Farbe/Avatar/Host-Badge), Seitenleiste mit
+  „Rollen für diese Runde" oben und vergrößertem Bereich „Sonstige Regeln",
   „Spiel starten" (Host) bzw. „Warte auf Host…" (Gäste).
-- **15 Rollen** (Teams gut/böse/neutral) mit Beschreibung, Gewinnkondition und
-  Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
+- **15 Rollen** (Teams gut/böse/neutral) mit PNG-Symbolen aus
+  \`/roles/<Rollenname>icon.png\`, Beschreibung, Gewinnkondition und Host-Zählern;
+  Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: \`?code=ABCDEF\` öffnet das Beitreten-Feld vorausgefüllt.
 - **Realtime**: REST-Polling (1,2 s sichtbar / 20 s im Hintergrund-Tab),
   Lebenszeichen-Fenster 120 s, automatischer **Reconnect/Resume** (gleiche

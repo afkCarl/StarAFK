@@ -65,6 +65,10 @@ const BINARY_FILES = [
   "public/foreground.png",
   "public/frames/GrayCatWalkingOne.png",
   "public/frames/GrayCatWalkingTwo.png",
+  ...readdirSync(join(ROOT, "public/roles"))
+    .filter((file) => file.endsWith(".png"))
+    .sort()
+    .map((file) => `public/roles/${file}`),
 ];
 
 function langFor(path) {
@@ -139,11 +143,13 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Spielerkarte**: Name (max. 12 Zeichen), Farbe + Intensität (135°-Farbverlauf),
   Profilbild-Upload (Data-URL), Rahmenwahl (Rahmen 1 = laufende Katze \`Cd\`/\`WalkingCat\`).
   Persistenz in \`localStorage\` unter \`werwolf-player-profile\`.
-- **Lobby**: kopierbarer Lobbycode, Glaskarten-Grid der Spieler (Farbe/Avatar/Host-Badge),
-  Seitenleiste mit Spielmodus, „Rollen für diese Runde", „Sonstige Regeln",
+- **Lobby**: kopierbarer Lobbycode mit „Lobby verlassen" direkt unter „Kopieren",
+  deckende Spielerkarten (Farbe/Avatar/Host-Badge), Seitenleiste mit
+  „Rollen für diese Runde" oben und vergrößertem Bereich „Sonstige Regeln",
   „Spiel starten" (Host) bzw. „Warte auf Host…" (Gäste).
-- **15 Rollen** (Teams gut/böse/neutral) mit Beschreibung, Gewinnkondition und
-  Host-Zählern; Standard: 1× Werwolf, 2× Dorfbewohner.
+- **15 Rollen** (Teams gut/böse/neutral) mit PNG-Symbolen aus
+  \`/roles/<Rollenname>icon.png\`, Beschreibung, Gewinnkondition und Host-Zählern;
+  Standard: 1× Werwolf, 2× Dorfbewohner.
 - **Einladungslink**: \`?code=ABCDEF\` öffnet das Beitreten-Feld vorausgefüllt.
 - **Realtime**: REST-Polling (1,2 s sichtbar / 20 s im Hintergrund-Tab),
   Lebenszeichen-Fenster 120 s, automatischer **Reconnect/Resume** (gleiche

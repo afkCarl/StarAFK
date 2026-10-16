@@ -26,7 +26,7 @@ export function RoleIcon({
   return (
     // eslint-disable-next-line @next/next/no-img-element
     <img
-      src={`/roles/${encodeURIComponent(name)}icon.svg`}
+      src={`/roles/${encodeURIComponent(name)}icon.png`}
       alt={name}
       onError={() => setFailed(true)}
       className={`h-full w-full object-contain ${className}`}
