@@ -52,6 +52,7 @@ const TEXT_FILES = [
   "src/components/werwolf/walking-cat.tsx",
   "src/components/werwolf/role-icon.tsx",
   "src/components/werwolf/glass-card.tsx",
+  "src/components/werwolf/lobby-stage.tsx",
   "src/components/auth/auth-gate.tsx",
   "src/components/auth/sign-in-screen.tsx",
   "scripts/measure-ram.mjs",
@@ -143,10 +144,12 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Spielerkarte**: Name (max. 12 Zeichen), Farbe + Intensität (135°-Farbverlauf),
   Profilbild-Upload (Data-URL), Rahmenwahl (Rahmen 1 = laufende Katze \`Cd\`/\`WalkingCat\`).
   Persistenz in \`localStorage\` unter \`werwolf-player-profile\`.
-- **Lobby**: kopierbarer Lobbycode mit „Lobby verlassen" direkt unter „Kopieren",
-  deckende Spielerkarten (Farbe/Avatar/Host-Badge), Seitenleiste mit
-  „Rollen für diese Runde" oben und vergrößertem Bereich „Sonstige Regeln",
-  „Spiel starten" (Host) bzw. „Warte auf Host…" (Gäste).
+- **Lobby**: kurzer schwarzer Fade-Übergang in eine neue blaue Lobby-Ansicht,
+  kopierbarer Lobbycode, Live-Status und responsive 13er-Sitzordnung (Host oben
+  mittig, bis zu zwölf Gäste spiegelbildlich an den Seiten und neben dem Host).
+  Spielerkarten zeigen Profilfarbe, Avatar und Host-Badge. Mindestens vier Spieler
+  inklusive Host sind zum Start erforderlich; maximal 13 Personen passen in eine Lobby.
+  Rollen-Konfiguration und Lobby verlassen bleiben direkt erreichbar.
 - **15 Rollen** (Teams gut/böse/neutral) mit PNG-Symbolen aus
   \`/roles/<Rollenname>icon.png\`, Beschreibung, Gewinnkondition und Host-Zählern;
   Standard: 1× Werwolf, 2× Dorfbewohner.

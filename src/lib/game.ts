@@ -41,6 +41,10 @@ export const MODES: GameMode[] = [
   },
 ];
 
+export const MIN_PLAYERS = 4;
+/** The host is one of the 13 lobby seats. */
+export const MAX_PLAYERS = 13;
+
 export const DEFAULT_COLOR = "#6b7280";
 
 export function randomName(): string {

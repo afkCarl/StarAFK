@@ -39,10 +39,12 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Spielerkarte**: Name (max. 12 Zeichen), Farbe + Intensität (135°-Farbverlauf),
   Profilbild-Upload (Data-URL), Rahmenwahl (Rahmen 1 = laufende Katze `Cd`/`WalkingCat`).
   Persistenz in `localStorage` unter `werwolf-player-profile`.
-- **Lobby**: kopierbarer Lobbycode mit „Lobby verlassen" direkt unter „Kopieren",
-  deckende Spielerkarten (Farbe/Avatar/Host-Badge), Seitenleiste mit
-  „Rollen für diese Runde" oben und vergrößertem Bereich „Sonstige Regeln",
-  „Spiel starten" (Host) bzw. „Warte auf Host…" (Gäste).
+- **Lobby**: kurzer schwarzer Fade-Übergang in eine neue blaue Lobby-Ansicht,
+  kopierbarer Lobbycode, Live-Status und responsive 13er-Sitzordnung (Host oben
+  mittig, bis zu zwölf Gäste spiegelbildlich an den Seiten und neben dem Host).
+  Spielerkarten zeigen Profilfarbe, Avatar und Host-Badge. Mindestens vier Spieler
+  inklusive Host sind zum Start erforderlich; maximal 13 Personen passen in eine Lobby.
+  Rollen-Konfiguration und Lobby verlassen bleiben direkt erreichbar.
 - **15 Rollen** (Teams gut/böse/neutral) mit PNG-Symbolen aus
   `/roles/<Rollenname>icon.png`, Beschreibung, Gewinnkondition und Host-Zählern;
   Standard: 1× Werwolf, 2× Dorfbewohner.
@@ -133,6 +135,7 @@ src/components/werwolf/sky-background.tsx
 src/components/werwolf/walking-cat.tsx
 src/components/werwolf/role-icon.tsx
 src/components/werwolf/glass-card.tsx
+src/components/werwolf/lobby-stage.tsx
 src/components/auth/auth-gate.tsx
 src/components/auth/sign-in-screen.tsx
 scripts/measure-ram.mjs
@@ -1744,6 +1747,10 @@ export const MODES: GameMode[] = [
   },
 ];
 
+export const MIN_PLAYERS = 4;
+/** The host is one of the 13 lobby seats. */
+export const MAX_PLAYERS = 13;
+
 export const DEFAULT_COLOR = "#6b7280";
 
 export function randomName(): string {
@@ -1872,6 +1879,8 @@ import { gameMasterLines, lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
   defaultRoleCounts,
+  MAX_PLAYERS,
+  MIN_PLAYERS,
   type LobbyNarration,
   type LobbyPlayer,
   type LobbyState,
@@ -1900,9 +1909,6 @@ const EMPTY_LOBBY_GRACE_MS = 10 * 60_000;
 const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 /** Spieler-IDs sind UUIDs (Postgres `gen_random_uuid()`). */
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-
-/** Maximale Spielerzahl pro Lobby. */
-export const MAX_PLAYERS = 12;
 
 let lastCleanupAt = 0;
 let lastPurgeAt = 0;
@@ -2483,16 +2489,21 @@ export async function getLobbyState(
 
 /**
  * Startet (oder beendet) das Spiel für alle Spieler der Lobby.
- * Nur der Host darf den Status ändern.
+ * Nur der Host darf den Status ändern; zum Starten müssen mindestens vier
+ * Spieler (einschließlich Host) in der Lobby sein.
  */
+export type StartGameOutcome =
+  | { ok: true }
+  | { ok: false; reason: "not_host" | "too_few" };
+
 export async function setGameStarted(
   codeInput: string,
   playerId: string,
   started: boolean,
   userId?: string | null,
-): Promise<boolean> {
+): Promise<StartGameOutcome> {
   const code = normalizeCode(codeInput);
-  if (code.length !== 6) return false;
+  if (code.length !== 6) return { ok: false, reason: "not_host" };
 
   const db = await getDb();
   const [host] = await db
@@ -2506,14 +2517,24 @@ export async function setGameStarted(
         ownerFilter(userId),
       ),
     );
-  if (!host) return false;
+  if (!host) return { ok: false, reason: "not_host" };
+
+  if (started) {
+    const currentPlayers = await db
+      .select({ id: players.id })
+      .from(players)
+      .where(eq(players.lobbyCode, code));
+    if (currentPlayers.length < MIN_PLAYERS) {
+      return { ok: false, reason: "too_few" };
+    }
+  }
 
   await db
     .update(lobbies)
     .set({ gameStarted: started })
     .where(eq(lobbies.code, code));
   await touchPlayer(code, playerId, userId);
-  return true;
+  return { ok: true };
 }
 
 /** Profil aktualisieren (Name, Farbe, Verlauf, Rahmen – Bild separat). */
@@ -3156,6 +3177,431 @@ export default function HomePage() {
   height: 20px;
   box-shadow: 0 4px 12px #00000059;
 }
+
+@keyframes lobbyBlackFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes lobbyBlackFadeOut {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.lobby-transition-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+.lobby-transition-overlay--loading {
+  animation: lobbyBlackFadeIn 240ms ease-out both;
+}
+
+.lobby-transition-overlay--revealing {
+  pointer-events: none;
+  animation: lobbyBlackFadeOut 460ms ease-in both;
+}
+
+.lobby-scene {
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse at 50% -12%, rgb(145 218 255 / 42%), transparent 49%),
+    radial-gradient(ellipse at 8% 88%, rgb(35 157 226 / 24%), transparent 42%),
+    linear-gradient(148deg, #247fbd 0%, #155a91 52%, #0c3b69 100%);
+}
+
+.lobby-scene::after {
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(rgb(255 255 255 / 2.2%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 2.2%) 1px, transparent 1px);
+  background-size: 72px 72px;
+  content: "";
+  mask-image: linear-gradient(to bottom, black, transparent 90%);
+  pointer-events: none;
+}
+
+.lobby-stage {
+  position: absolute;
+  z-index: 10;
+  top: 5.25rem;
+  right: 1.25rem;
+  bottom: 6.8rem;
+  left: 1.25rem;
+  margin-inline: auto;
+  max-width: 112rem;
+}
+
+.lobby-stage--desktop {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1.1fr)
+    minmax(0, 0.95fr)
+    minmax(15rem, 1.2fr)
+    minmax(0, 0.95fr)
+    minmax(0, 1.1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: clamp(0.5rem, 1vw, 0.95rem);
+}
+
+.lobby-stage--mobile {
+  display: none;
+}
+
+.lobby-stage__side {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: repeat(var(--seat-count, 1), minmax(0, 1fr));
+  gap: clamp(0.45rem, 1.15vh, 0.75rem);
+}
+
+.lobby-stage__side--left {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.lobby-stage__side--right {
+  grid-column: 5;
+  grid-row: 1;
+}
+
+.lobby-stage__inner {
+  display: flex;
+  min-width: 0;
+  justify-content: center;
+  align-items: flex-start;
+}
+
+.lobby-stage__inner--left {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.lobby-stage__inner--right {
+  grid-column: 4;
+  grid-row: 1;
+}
+
+.lobby-stage__host {
+  display: flex;
+  min-width: 0;
+  justify-content: center;
+  align-items: flex-start;
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.lobby-stage__empty-host {
+  display: flex;
+  width: 100%;
+  height: clamp(11rem, 27vh, 13rem);
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / 20%);
+  border-radius: 1.4rem;
+  background: rgb(5 22 42 / 60%);
+  color: rgb(255 255 255 / 75%);
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.lobby-stage__empty-guests {
+  z-index: 1;
+  align-self: center;
+  justify-self: center;
+  grid-column: 2 / 5;
+  grid-row: 1;
+  margin-top: 3rem;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 999px;
+  background: rgb(6 29 52 / 40%);
+  padding: 0.8rem 1.2rem;
+  color: rgb(255 255 255 / 66%);
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-align: center;
+  backdrop-filter: blur(12px);
+}
+
+.lobby-player-card {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  max-height: 9.2rem;
+  min-width: 0;
+  align-self: center;
+  overflow: hidden;
+  align-items: center;
+  border: 1px solid rgb(224 242 254 / 24%);
+  border-radius: 1.15rem;
+  background: rgb(5 22 42 / 76%);
+  box-shadow: 0 12px 30px rgb(3 15 30 / 24%), inset 0 1px rgb(255 255 255 / 6%);
+  backdrop-filter: blur(14px);
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+.lobby-player-card--host {
+  height: clamp(11rem, 27vh, 13rem);
+  max-height: none;
+  justify-content: center;
+  border: 2px solid rgb(219 242 255 / 55%);
+  border-radius: 1.55rem;
+  background: rgb(5 22 42 / 82%);
+  box-shadow: 0 18px 45px rgb(3 15 30 / 32%), 0 0 36px rgb(142 211 255 / 16%);
+}
+
+.lobby-player-card--speaking {
+  border-color: #4ade80;
+  box-shadow:
+    0 0 20px rgb(34 197 94 / 72%),
+    0 0 42px rgb(34 197 94 / 34%),
+    inset 0 0 18px rgb(34 197 94 / 22%);
+}
+
+.lobby-player-card__wash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.72;
+}
+
+.lobby-player-card__seat {
+  position: absolute;
+  z-index: 2;
+  top: 0.45rem;
+  right: 0.55rem;
+  display: flex;
+  width: 1.55rem;
+  height: 1.55rem;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 999px;
+  background: rgb(1 14 28 / 50%);
+  color: rgb(255 255 255 / 72%);
+  font-size: 0.57rem;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+
+.lobby-player-card__content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: clamp(0.5rem, 0.8vw, 0.85rem);
+  padding: 0.65rem 0.75rem;
+}
+
+.lobby-player-card__avatar {
+  display: flex;
+  width: clamp(2.55rem, 4.2vw, 3.35rem);
+  height: clamp(2.55rem, 4.2vw, 3.35rem);
+  flex: 0 0 auto;
+  overflow: hidden;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / 22%);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 11%);
+  color: white;
+  font-size: 1.25rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.lobby-player-card__avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.lobby-player-card__identity {
+  min-width: 0;
+  padding-right: 1.35rem;
+  text-align: left;
+}
+
+.lobby-player-card__name {
+  overflow: hidden;
+  color: white;
+  font-size: clamp(0.78rem, 1.05vw, 1.02rem);
+  font-weight: 900;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  text-shadow: 0 2px 12px rgb(0 0 0 / 40%);
+}
+
+.lobby-player-card__role {
+  margin-top: 0.35rem;
+  color: rgb(220 239 255 / 64%);
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.22em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.lobby-player-card--host .lobby-player-card__content {
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 0.8rem;
+  text-align: center;
+}
+
+.lobby-player-card--host .lobby-player-card__avatar {
+  width: clamp(3.6rem, 7.2vh, 5rem);
+  height: clamp(3.6rem, 7.2vh, 5rem);
+  font-size: 1.75rem;
+}
+
+.lobby-player-card--host .lobby-player-card__identity {
+  max-width: 100%;
+  padding: 0;
+  text-align: center;
+}
+
+.lobby-player-card--host .lobby-player-card__name {
+  max-width: 100%;
+  font-size: clamp(1.05rem, 1.4vw, 1.35rem);
+}
+
+.lobby-player-card--host .lobby-player-card__role {
+  margin-top: 0.42rem;
+  color: #bae6fd;
+  letter-spacing: 0.3em;
+}
+
+.lobby-stage__mobile-host {
+  width: min(100%, 24rem);
+  margin-inline: auto;
+}
+
+.lobby-stage__mobile-guests {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  gap: 0.7rem;
+}
+
+.lobby-stage__mobile-empty {
+  margin: 0.5rem auto 0;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 1rem;
+  background: rgb(6 29 52 / 40%);
+  padding: 0.8rem 1rem;
+  color: rgb(255 255 255 / 68%);
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+@media (max-width: 1023px) {
+  .lobby-stage--desktop {
+    display: none;
+  }
+
+  .lobby-stage--mobile {
+    display: flex;
+    top: 5.65rem;
+    right: 1rem;
+    bottom: 8.2rem;
+    left: 1rem;
+    flex-direction: column;
+    gap: 0.85rem;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding: 0 0.1rem 0.75rem;
+    scrollbar-width: thin;
+    scrollbar-color: rgb(255 255 255 / 26%) transparent;
+  }
+
+  .lobby-player-card--host {
+    height: 10.5rem;
+  }
+
+  .lobby-player-card--host .lobby-player-card__avatar {
+    width: 4rem;
+    height: 4rem;
+  }
+
+  .lobby-player-card--mobile:not(.lobby-player-card--host) {
+    height: 6.25rem;
+    max-height: none;
+  }
+
+  .lobby-player-card--mobile:not(.lobby-player-card--host) .lobby-player-card__content {
+    gap: 0.55rem;
+    padding: 0.5rem;
+  }
+
+  .lobby-player-card--mobile:not(.lobby-player-card--host) .lobby-player-card__avatar {
+    width: 2.55rem;
+    height: 2.55rem;
+    font-size: 1rem;
+  }
+
+  .lobby-player-card--mobile .lobby-player-card__name {
+    font-size: clamp(0.7rem, 2vw, 0.9rem);
+  }
+}
+
+@media (max-width: 640px) {
+  .lobby-stage--mobile {
+    top: 6.1rem;
+    right: 0.75rem;
+    bottom: 10rem;
+    left: 0.75rem;
+  }
+
+  .lobby-stage__mobile-guests {
+    gap: 0.5rem;
+  }
+
+  .lobby-player-card--mobile:not(.lobby-player-card--host) {
+    height: 5.8rem;
+  }
+
+  .lobby-player-card--mobile:not(.lobby-player-card--host) .lobby-player-card__avatar {
+    width: 2.25rem;
+    height: 2.25rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lobby-transition-overlay--loading {
+    animation: none;
+    opacity: 1;
+  }
+
+  .lobby-transition-overlay--revealing {
+    animation: none;
+    opacity: 0;
+  }
+}
 ```
 
 ## Datei: `src/app/api/health/route.ts`
@@ -3426,14 +3872,17 @@ export const POST = route("lobby:start", async (request) => {
   if (!guard.ok) return guard.response;
 
   const body = await readJson(request);
-  const ok = await setGameStarted(
+  const result = await setGameStarted(
     String(body.code ?? ""),
     String(body.playerId ?? ""),
     body.started !== false,
     guard.userId,
   );
-  if (!ok) {
-    return json({ ok: false, reason: "not_host" }, 403);
+  if (!result.ok) {
+    return json(
+      { ok: false, reason: result.reason },
+      result.reason === "not_host" ? 403 : 409,
+    );
   }
   return json({ ok: true });
 });
@@ -3573,11 +4022,14 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { GlassCard } from "@/components/werwolf/glass-card";
+import { LobbyStage } from "@/components/werwolf/lobby-stage";
 import { RoleIcon } from "@/components/werwolf/role-icon";
 import { SkyBackground } from "@/components/werwolf/sky-background";
 import { WalkingCat } from "@/components/werwolf/walking-cat";
 import {
   DEFAULT_COLOR,
+  MAX_PLAYERS,
+  MIN_PLAYERS,
   MODES,
   ROLES,
   colorWash,
@@ -3600,7 +4052,7 @@ const FRAME_OPTIONS = [
   { id: "frame5", name: "Rahmen 5" },
 ];
 
-type Screen = "menu" | "menuLeaving" | "lobbyEntering" | "lobby";
+type Screen = "menu" | "lobbyLoading" | "lobbyEntering" | "lobby";
 type SlidePhase = "idle" | "start" | "go";
 type JoinPanel = "closed" | "opening" | "open" | "closing";
 type Direction = "left" | "right";
@@ -3620,6 +4072,8 @@ const MAX_POLL_FAILURES = 8;
 /** Profilbilder werden im Browser verkleinert, damit sie schnell übertragen werden. */
 const AVATAR_MAX_SIZE = 256;
 const AVATAR_MAX_CHARS = 380_000;
+const MIN_LOBBY_LOADING_MS = 520;
+const LOBBY_REVEAL_MS = 460;
 
 type ApiResult<T> =
   | { ok: true; status: number; data: T }
@@ -3886,8 +4340,8 @@ export default function WerwolfApp() {
   const switchStartRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const switchEndRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const joinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lobbyTransitionStartedAtRef = useRef<number | null>(null);
   const lobbyCodeRef = useRef("");
   const selfIdRef = useRef<string | null>(null);
   const pollFailuresRef = useRef(0);
@@ -4458,7 +4912,7 @@ export default function WerwolfApp() {
 
   useEffect(
     () => () => {
-      [switchStartRef, switchEndRef, joinTimerRef, leaveTimerRef, enterTimerRef].forEach(
+      [switchStartRef, switchEndRef, joinTimerRef, enterTimerRef].forEach(
         (ref) => {
           if (ref.current) clearTimeout(ref.current);
         },
@@ -4487,10 +4941,11 @@ export default function WerwolfApp() {
   modeRef.current = mode;
   isHostRef.current = isHost;
   const prevMode = prevModeIndex !== null ? MODES[prevModeIndex] : null;
-  const inMenu = screen === "menu" || screen === "menuLeaving";
+  const inMenu = screen === "menu" || screen === "lobbyLoading";
   const inLobby = screen === "lobbyEntering" || screen === "lobby";
   const isDark = (inMenu && mode.title === "WERWOLF") || inLobby;
   const selectedRoles = ROLES.filter((role) => roleCounts[role.name] > 0);
+  const canStartGame = players.length >= MIN_PLAYERS;
 
   const switchMode = (nextIndex: number, dir: Direction) => {
     if (modeLocked || screen !== "menu") return;
@@ -4537,6 +4992,20 @@ export default function WerwolfApp() {
     });
   };
 
+  const beginLobbyTransition = () => {
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    enterTimerRef.current = null;
+    lobbyTransitionStartedAtRef.current = Date.now();
+    setScreen("lobbyLoading");
+  };
+
+  const cancelLobbyTransition = () => {
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    enterTimerRef.current = null;
+    lobbyTransitionStartedAtRef.current = null;
+    setScreen("menu");
+  };
+
   const enterLobby = (
     code: string,
     lobbyPlayers: LobbyPlayer[],
@@ -4562,11 +5031,16 @@ export default function WerwolfApp() {
     saveSession(code, id);
     lastAvatarRef.current = profileRef.current?.image ?? null;
     notifyOtherTabs(code);
-    setScreen("menuLeaving");
-    leaveTimerRef.current = setTimeout(() => {
+
+    if (lobbyTransitionStartedAtRef.current === null) beginLobbyTransition();
+    const elapsed = Date.now() - (lobbyTransitionStartedAtRef.current ?? Date.now());
+    const holdRemaining = Math.max(0, MIN_LOBBY_LOADING_MS - elapsed);
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    enterTimerRef.current = setTimeout(() => {
+      lobbyTransitionStartedAtRef.current = null;
       setScreen("lobbyEntering");
-      enterTimerRef.current = setTimeout(() => setScreen("lobby"), 20);
-    }, 440);
+      enterTimerRef.current = setTimeout(() => setScreen("lobby"), LOBBY_REVEAL_MS);
+    }, holdRemaining);
   };
 
   /** Langsame Free-Instanzen: nach ein paar Sekunden einen Hinweis zeigen. */
@@ -4593,6 +5067,7 @@ export default function WerwolfApp() {
     setCopied(false);
     setRoleModalOpen(false);
     setActionError(null);
+    beginLobbyTransition();
     setBusy("create");
     try {
       const res = await withSlowHint(
@@ -4626,6 +5101,7 @@ export default function WerwolfApp() {
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
+      cancelLobbyTransition();
       setActionError(
         isTransient(reason)
           ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
@@ -4646,6 +5122,7 @@ export default function WerwolfApp() {
     setCopied(false);
     setRoleModalOpen(false);
     setActionError(null);
+    beginLobbyTransition();
     setBusy("join");
     try {
       const res = await withSlowHint(
@@ -4681,9 +5158,10 @@ export default function WerwolfApp() {
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
+      cancelLobbyTransition();
       setActionError(
         reason === "full"
-          ? "Die Lobby ist leider voll (max. 12 Spieler)."
+          ? "Die Lobby ist leider voll (max. 13 Spieler inklusive Host)."
           : reason === "not_found"
             ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
             : isTransient(reason)
@@ -4699,10 +5177,14 @@ export default function WerwolfApp() {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid || busy) return;
+    if (started && players.length < MIN_PLAYERS) {
+      setActionError(`Zum Starten müssen mindestens ${MIN_PLAYERS} Spieler in der Lobby sein.`);
+      return;
+    }
     setActionError(null);
     setBusy("start");
     try {
-      const res = await apiRequest(
+      const res = await apiRequest<{ ok: boolean; reason?: string }>(
         "/api/lobby/start",
         {
           method: "POST",
@@ -4711,15 +5193,18 @@ export default function WerwolfApp() {
         15_000,
       );
       if (!res.ok) throw new Error(res.reason);
+      if (!res.data.ok) throw new Error(res.data.reason ?? "server");
       setGameStarted(started);
       notifyOtherTabs(code);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         started
-          ? isTransient(reason)
-            ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
-            : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+          ? reason === "too_few"
+            ? `Zum Starten müssen mindestens ${MIN_PLAYERS} Spieler in der Lobby sein.`
+            : isTransient(reason)
+              ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
+              : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
           : "Das Spiel konnte nicht zurückgesetzt werden.",
       );
     } finally {
@@ -4733,9 +5218,8 @@ export default function WerwolfApp() {
     const pid = selfIdRef.current;
     clearSession();
     if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
-    if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current);
     enterTimerRef.current = null;
-    leaveTimerRef.current = null;
+    lobbyTransitionStartedAtRef.current = null;
     lobbyCodeRef.current = "";
     selfIdRef.current = null;
     setScreen("menu");
@@ -4836,38 +5320,6 @@ export default function WerwolfApp() {
             }
           : {};
 
-  const leftExitStyle = (): React.CSSProperties =>
-    screen === "menuLeaving"
-      ? {
-          transform: "translateX(-110vw)",
-          opacity: 0,
-          transition:
-            "transform 440ms cubic-bezier(0.4,0,0.2,1), opacity 300ms ease",
-        }
-      : { transform: "translateX(0)", opacity: 1 };
-
-  const rightExitStyle = (): React.CSSProperties =>
-    screen === "menuLeaving"
-      ? {
-          transform: "translateX(110vw)",
-          opacity: 0,
-          transition:
-            "transform 440ms cubic-bezier(0.4,0,0.2,1), opacity 300ms ease",
-        }
-      : { transform: "translateX(0)", opacity: 1 };
-
-  const lobbyEnterStyle = (): React.CSSProperties =>
-    screen === "lobbyEntering"
-      ? { transform: "translateY(110%)", opacity: 0, transition: "none" }
-      : screen === "lobby"
-        ? {
-            transform: "translateY(0)",
-            opacity: 1,
-            transition:
-              "transform 520ms cubic-bezier(0.22,1,0.36,1), opacity 520ms ease",
-          }
-        : {};
-
   const menuButtons =
     "w-fit text-left text-[1.75rem] font-bold uppercase transition-all duration-200 hover:translate-x-3 hover:text-neutral-400 sm:text-[2.1rem]";
 
@@ -4878,10 +5330,14 @@ export default function WerwolfApp() {
   return (
     <div
       className={`relative min-h-screen w-full overflow-hidden transition-colors duration-700 ${
-        isDark ? "bg-[#0b1220] text-white" : "bg-white text-black"
+        inLobby
+          ? "bg-[#155a91] text-white"
+          : isDark
+            ? "bg-[#0b1220] text-white"
+            : "bg-white text-black"
       }`}
     >
-      <SkyBackground isActive={isDark} />
+      <SkyBackground isActive={isDark && !inLobby} />
 
       {actionError && (
         <div
@@ -4915,10 +5371,7 @@ export default function WerwolfApp() {
 
       {inMenu && (
         <>
-          <div
-            className="relative z-10 flex min-h-screen flex-col px-4 py-3 sm:px-6 sm:py-4 md:px-8 md:py-5"
-            style={leftExitStyle()}
-          >
+          <div className="relative z-10 flex min-h-screen flex-col px-4 py-3 sm:px-6 sm:py-4 md:px-8 md:py-5">
             <div className="relative flex flex-col pt-0.5">
               <p className="text-[1.4rem] font-black uppercase tracking-wide sm:text-[1.6rem]">
                 SPIELMODUS {modeIndex + 1}/{MODES.length}
@@ -4970,7 +5423,6 @@ export default function WerwolfApp() {
             onClick={prevModeFn}
             className="absolute left-1 top-[42%] z-20 -translate-y-1/2 p-3 transition-all duration-200 hover:-translate-x-1 hover:scale-110 hover:text-neutral-400 sm:left-2 md:left-3"
             aria-label="Vorheriger Gamemode"
-            style={leftExitStyle()}
           >
             <ChevronLeft size={72} strokeWidth={1.5} />
           </button>
@@ -4978,15 +5430,11 @@ export default function WerwolfApp() {
             onClick={nextMode}
             className="absolute right-1 top-[42%] z-20 -translate-y-1/2 p-3 transition-all duration-200 hover:translate-x-1 hover:scale-110 hover:text-neutral-400 sm:right-2 md:right-3"
             aria-label="Nächster Gamemode"
-            style={rightExitStyle()}
           >
             <ChevronRight size={72} strokeWidth={1.5} />
           </button>
 
-          <div
-            className="absolute left-4 top-[calc(42%+120px)] z-20 flex flex-col gap-3 sm:left-6 md:left-8"
-            style={leftExitStyle()}
-          >
+          <div className="absolute left-4 top-[calc(42%+120px)] z-20 flex flex-col gap-3 sm:left-6 md:left-8">
             <button
               onClick={handleCreate}
               disabled={busy === "create"}
@@ -5270,215 +5718,181 @@ export default function WerwolfApp() {
       )}
 
       {inLobby && (
-        <div
-          className="absolute inset-0 z-20 px-4 py-4 text-white sm:px-6 sm:py-6 md:px-8 md:py-8"
-          style={lobbyEnterStyle()}
-        >
-          <div className="custom-scroll mx-auto h-full w-full max-w-[96rem] overflow-y-auto">
-            <div className="grid min-h-full grid-cols-1 gap-4 xl:h-full xl:min-h-0 xl:grid-cols-[minmax(0,2.4fr)_minmax(22rem,1fr)]">
-              <div className="flex min-h-0 flex-col gap-4">
-                <GlassCard className="grid shrink-0 gap-4 px-5 py-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:px-6 sm:py-6">
-                  <div className="min-w-0">
-                    <p className="text-sm font-black uppercase tracking-[0.32em] text-white/50">
-                      Lobbycode
-                    </p>
-                    <p className="mt-3 font-mono text-[clamp(2.3rem,6vw,4.8rem)] font-black uppercase tracking-[0.28em] text-white">
-                      {lobbyCode}
-                    </p>
-                    <div className="mt-4 flex flex-wrap items-center gap-3">
-                      <span
-                        className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] ${
-                          connection === "ok"
-                            ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
-                            : "border-amber-400/50 bg-amber-400/15 text-amber-100"
-                        }`}
-                        title={
-                          connection === "ok"
-                            ? "Lobby wird live synchronisiert"
-                            : "Kurzer Hänger – die Verbindung wird automatisch wiederhergestellt"
-                        }
-                      >
-                        <span
-                          className={`h-2 w-2 rounded-full ${
-                            connection === "ok"
-                              ? "bg-emerald-400"
-                              : "animate-pulse bg-amber-300"
-                          }`}
-                        />
-                        {connection === "ok"
-                          ? "Live verbunden"
-                          : "Verbindung wird wiederhergestellt …"}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="flex flex-col gap-2 self-start">
-                    <button
-                      onClick={copyCode}
-                      className="flex items-center justify-center gap-2 rounded-[1rem] border border-white/30 bg-white/10 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/70"
-                    >
-                      {copied ? <Check size={18} /> : <Copy size={18} />}
-                      {copied ? "Kopiert" : "Kopieren"}
-                    </button>
-                    <button
-                      onClick={handleLeaveLobby}
-                      className="flex items-center justify-center gap-2 rounded-[1rem] border border-white/25 bg-white/5 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white/70 transition-all duration-200 hover:border-red-400/50 hover:bg-red-500/15 hover:text-red-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/70"
-                    >
-                      <LogOut size={18} />
-                      Lobby verlassen
-                    </button>
-                  </div>
-                </GlassCard>
-                <GlassCard className="flex min-h-0 flex-1 flex-col p-3 sm:p-4">
-                  <div className="custom-scroll grid auto-rows-[minmax(11rem,1fr)] grid-cols-1 gap-3 overflow-y-auto p-2 md:grid-cols-2 2xl:grid-cols-3">
-                    {players.map((player) => {
-                      const isSelf = player.id === selfId;
-                      const displayName =
-                        isSelf ? name || "NAME" : player.name;
-                      const displayColor = isSelf ? color : player.color;
-                      const displayIntensity =
-                        isSelf ? fadeIntensity : player.fadeIntensity;
-                      const displayImage = isSelf ? image : player.image;
-                      const displayFrame = isSelf ? frame : player.frame;
-                      const playerSpeaking = isSelf && isSpeaking;
-                      return (
-                        <div
-                          key={player.id || player.name}
-                          className={`relative flex min-h-[11rem] flex-col items-center justify-center overflow-hidden rounded-[1.4rem] border-2 bg-[#172033] px-4 py-5 text-center transition-all duration-150 ${
-                            playerSpeaking
-                              ? "border-[#4ade80] shadow-[0_0_20px_rgba(34,197,94,0.95),0_0_44px_rgba(34,197,94,0.55),inset_0_0_20px_rgba(34,197,94,0.4)] ring-2 ring-[#4ade80]"
-                              : "border-white/15"
-                          }`}
-                        >
-                          {displayColor && displayColor !== DEFAULT_COLOR && (
-                            <div
-                              className="pointer-events-none absolute inset-0"
-                              style={{
-                                background: colorWash(
-                                  displayColor,
-                                  displayIntensity ?? 50,
-                                  70,
-                                ),
-                              }}
-                            />
-                          )}
-                          <div className="relative z-10 flex h-20 w-20 items-center justify-center overflow-hidden rounded-full text-xl font-black uppercase text-white drop-shadow-md">
-                            {displayImage ? (
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img
-                                src={displayImage}
-                                alt="Profile"
-                                className="h-full w-full object-cover"
-                              />
-                            ) : (
-                              <div className="flex h-full w-full items-center justify-center bg-white/10">
-                                {displayName.slice(0, 1) || "?"}
-                              </div>
-                            )}
-                          </div>
-                          {displayFrame === "frame1" && (
-                            <WalkingCat cardWidth={280} />
-                          )}
-                          <p className="relative z-10 mt-4 break-all text-[1.6rem] font-black uppercase leading-none text-white drop-shadow-md sm:text-[1.9rem]">
-                            {displayName}
-                          </p>
-                          <p className="relative z-10 mt-2 text-xs font-bold uppercase tracking-[0.3em] text-white/50">
-                            {player.isHost ? "Host" : "Player"}
-                          </p>
-                        </div>
-                      );
-                    })}
-                    <div className="min-h-[11rem] rounded-[1.4rem] border border-dashed border-white/20" />
-                    <div className="hidden min-h-[11rem] rounded-[1.4rem] border border-dashed border-white/20 md:block" />
-                    <div className="hidden min-h-[11rem] rounded-[1.4rem] border border-dashed border-white/20 2xl:block" />
-                  </div>
-                </GlassCard>
-              </div>
-              <aside className="flex min-h-0 flex-col gap-4">
-                <GlassCard className="flex min-h-0 flex-col p-4 xl:flex-[3]">
-                  <p className="shrink-0 text-xs font-black uppercase tracking-[0.28em] text-white/50">
-                    Rollen für diese Runde
+        <div className="absolute inset-0 z-20 text-white">
+          <div className="lobby-scene absolute inset-0" aria-hidden="true" />
+          <header className="absolute inset-x-3 top-3 z-30 flex flex-wrap items-center justify-between gap-2 sm:inset-x-5 sm:top-4 sm:gap-4">
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+              <GlassCard className="flex shrink-0 items-center gap-3 rounded-[1.15rem] px-3 py-2 sm:rounded-[1.4rem] sm:px-4 sm:py-2.5">
+                <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-sky-200/30 bg-sky-200/10 text-[0.7rem] font-black tracking-tight text-sky-50 sm:h-10 sm:w-10">
+                  W
+                </div>
+                <div>
+                  <p className="text-[0.6rem] font-black uppercase tracking-[0.24em] text-white/55 sm:text-[0.65rem]">
+                    Werwolf-Lobby
                   </p>
-                  <div className="custom-scroll mt-4 max-h-80 space-y-2 overflow-y-auto pr-1 xl:max-h-none xl:flex-1">
+                  <p className="text-sm font-black text-white sm:text-base">
+                    {players.length} / {MAX_PLAYERS} Spieler
+                  </p>
+                </div>
+              </GlassCard>
+              <div className="hidden flex-col gap-1.5 md:flex">
+                <span
+                  className={`flex items-center gap-2 text-xs font-bold ${
+                    connection === "ok" ? "text-emerald-100" : "text-amber-100"
+                  }`}
+                  title={
+                    connection === "ok"
+                      ? "Lobby wird live synchronisiert"
+                      : "Verbindung wird automatisch wiederhergestellt"
+                  }
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      connection === "ok"
+                        ? "bg-emerald-300"
+                        : "animate-pulse bg-amber-300"
+                    }`}
+                  />
+                  {connection === "ok" ? "Live verbunden" : "Verbindung wird wiederhergestellt …"}
+                </span>
+                <span className="text-[0.7rem] font-semibold text-white/65">
+                  {canStartGame
+                    ? "Genug Spieler — ihr könnt starten."
+                    : `Noch ${MIN_PLAYERS - players.length} Spieler bis zum Start.`}
+                </span>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+              <GlassCard className="flex items-center gap-2 rounded-[1.1rem] px-3 py-2 sm:gap-3 sm:rounded-[1.3rem] sm:px-4">
+                <span className="hidden text-[0.6rem] font-black uppercase tracking-[0.22em] text-white/45 sm:inline">
+                  Lobbycode
+                </span>
+                <span className="font-mono text-sm font-black tracking-[0.18em] text-white sm:text-base sm:tracking-[0.24em]">
+                  {lobbyCode}
+                </span>
+              </GlassCard>
+              <button
+                onClick={copyCode}
+                aria-label={copied ? "Lobbycode kopiert" : "Lobbycode kopieren"}
+                title={copied ? "Kopiert" : "Lobbycode kopieren"}
+                className="flex h-10 w-10 items-center justify-center rounded-[1rem] border border-white/25 bg-white/10 text-white transition hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/80 sm:h-11 sm:w-11"
+              >
+                {copied ? <Check size={18} /> : <Copy size={18} />}
+              </button>
+              <button
+                onClick={handleLeaveLobby}
+                aria-label="Lobby verlassen"
+                title="Lobby verlassen"
+                className="flex h-10 w-10 items-center justify-center rounded-[1rem] border border-white/25 bg-white/10 text-white/80 transition hover:border-red-200/50 hover:bg-red-400/20 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/80 sm:h-11 sm:w-11"
+              >
+                <LogOut size={18} />
+              </button>
+            </div>
+          </header>
+
+          <LobbyStage
+            players={players}
+            selfId={selfId}
+            profile={profile}
+            isSpeaking={isSpeaking}
+          />
+
+          <footer className="absolute inset-x-3 bottom-3 z-30 mx-auto max-w-6xl sm:inset-x-5 sm:bottom-4">
+            <GlassCard className="rounded-[1.35rem] border-white/20 bg-[#071a2c]/70 p-3 shadow-[0_16px_50px_rgba(0,0,0,0.28)] sm:rounded-[1.6rem] sm:px-4 sm:py-3">
+              <div className="flex flex-col gap-3 sm:gap-2 lg:flex-row lg:items-center lg:justify-between">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                    <p className="text-[0.62rem] font-black uppercase tracking-[0.24em] text-white/55">
+                      Rollen für diese Runde
+                    </p>
+                    <p className="text-[0.65rem] font-semibold text-white/40">
+                      Sonstige Regeln: keine besonderen Regeln
+                    </p>
+                  </div>
+                  <div className="custom-scroll mt-2 flex max-w-full gap-2 overflow-x-auto pb-1">
                     {selectedRoles.length > 0 ? (
                       selectedRoles.map((role) => (
                         <button
                           key={role.name}
                           onClick={() => setRoleDetail(role.name)}
-                          className="flex w-full items-center justify-between rounded-[1rem] border border-white/15 bg-white/5 px-3 py-2 text-left transition-all duration-150 hover:border-white/30 hover:bg-white/10"
+                          className="flex shrink-0 items-center gap-2 rounded-full border border-white/15 bg-white/[0.07] px-3 py-1.5 text-left transition hover:border-white/30 hover:bg-white/15"
+                          title={`${role.name} – Details anzeigen`}
                         >
-                          <div className="flex items-center gap-3">
-                            <div className="flex h-9 w-9 shrink-0 items-center justify-center text-[0.8rem] text-white/70">
-                              <RoleIcon name={role.name} short={role.short} />
-                            </div>
-                            <span className="text-[1.05rem] font-bold uppercase text-white">
-                              {role.name}
-                            </span>
-                          </div>
-                          <span className="text-[1.1rem] font-black text-white">
-                            {roleCounts[role.name]}
+                          <span className="flex h-5 w-5 items-center justify-center text-white/75">
+                            <RoleIcon name={role.name} short={role.short} />
+                          </span>
+                          <span className="text-[0.7rem] font-bold uppercase tracking-wide text-white/90">
+                            {role.name}
+                          </span>
+                          <span className="text-xs font-black text-sky-100">
+                            ×{roleCounts[role.name]}
                           </span>
                         </button>
                       ))
                     ) : (
-                      <div className="rounded-[1rem] border border-dashed border-white/20 bg-white/5 px-3 py-4 text-sm font-semibold text-white/45">
+                      <span className="py-1.5 text-xs font-semibold text-white/45">
                         Keine Rollen ausgewählt.
-                      </div>
+                      </span>
                     )}
                   </div>
+                </div>
+                <div className="flex shrink-0 flex-col gap-2 sm:flex-row sm:items-center">
                   {isHost && (
                     <button
                       onClick={() => setRoleModalOpen(true)}
-                      className="mt-4 rounded-[1rem] border border-white/30 bg-white/10 px-4 py-3 text-sm font-black uppercase tracking-[0.18em] text-white transition-all duration-200 hover:bg-white/20"
+                      className="rounded-[1rem] border border-white/25 bg-white/[0.07] px-4 py-2.5 text-xs font-black uppercase tracking-[0.15em] text-white transition hover:bg-white/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/80"
                     >
                       Rollen auswählen
                     </button>
                   )}
-                </GlassCard>
-                <GlassCard className="min-h-[10rem] p-5 xl:flex-[2]">
-                  <p className="text-xs font-black uppercase tracking-[0.28em] text-white/50">
-                    Sonstige Regeln
-                  </p>
-                  <p className="mt-3 text-sm font-semibold text-white/30">
-                    Keine besonderen Regeln festgelegt.
-                  </p>
-                </GlassCard>
-                {isHost ? (
-                  gameStarted ? (
-                    <div className="flex flex-col gap-2">
-                      <div className="rounded-[1.5rem] border border-green-400/40 bg-green-400/15 px-5 py-4 text-center text-[1.25rem] font-black uppercase tracking-[0.16em] text-green-200">
-                        Spiel läuft
+                  {isHost ? (
+                    gameStarted ? (
+                      <div className="flex items-center gap-2">
+                        <span className="rounded-full border border-emerald-300/35 bg-emerald-300/10 px-3 py-2 text-xs font-black uppercase tracking-wider text-emerald-100">
+                          Spiel läuft
+                        </span>
+                        <button
+                          onClick={() => handleStartGame(false)}
+                          disabled={busy === "start"}
+                          className="rounded-[1rem] border border-white/20 bg-white/5 px-3 py-2 text-xs font-bold uppercase tracking-wide text-white/75 transition hover:bg-white/15 disabled:opacity-50"
+                        >
+                          Zurück zur Lobby
+                        </button>
                       </div>
-                      <button
-                        onClick={() => handleStartGame(false)}
-                        disabled={busy === "start"}
-                        className="rounded-[1rem] border border-white/20 bg-white/5 px-4 py-2 text-xs font-bold uppercase tracking-[0.18em] text-white/60 transition-all duration-200 hover:bg-white/10 hover:text-white disabled:animate-pulse disabled:opacity-50"
-                      >
-                        Zurück zur Lobby
-                      </button>
-                    </div>
+                    ) : (
+                      <div className="flex flex-col gap-1.5">
+                        <button
+                          onClick={() => handleStartGame(true)}
+                          disabled={busy === "start" || !canStartGame}
+                          title={
+                            canStartGame
+                              ? "Spiel starten"
+                              : `Mindestens ${MIN_PLAYERS} Spieler erforderlich`
+                          }
+                          className="rounded-[1rem] border border-white/35 bg-white/15 px-5 py-2.5 text-sm font-black uppercase tracking-[0.13em] text-white backdrop-blur-sm transition hover:-translate-y-0.5 hover:bg-white hover:text-[#113b5b] disabled:cursor-not-allowed disabled:border-white/15 disabled:bg-white/[0.06] disabled:text-white/40 disabled:hover:translate-y-0 disabled:hover:bg-white/[0.06]"
+                        >
+                          {busy === "start" ? "Startet…" : "Spiel starten"}
+                        </button>
+                        {!canStartGame && (
+                          <p className="text-center text-[0.62rem] font-semibold text-white/55">
+                            Noch {MIN_PLAYERS - players.length} Spieler nötig
+                          </p>
+                        )}
+                      </div>
+                    )
                   ) : (
-                    <button
-                      onClick={() => handleStartGame(true)}
-                      disabled={busy === "start"}
-                      className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:animate-pulse disabled:opacity-50"
-                    >
-                      {busy === "start" ? "Startet…" : "Spiel starten"}
-                    </button>
-                  )
-                ) : (
-                  <div
-                    className={`rounded-[1.5rem] border px-5 py-4 text-center text-sm font-bold uppercase tracking-[0.16em] ${
-                      gameStarted
-                        ? "border-green-400/40 bg-green-400/15 text-green-200"
-                        : "border-white/10 bg-white/5 text-white/40"
-                    }`}
-                  >
-                    {gameStarted ? "Das Spiel läuft!" : "Warte auf Host…"}
-                  </div>
-                )}
-              </aside>
-            </div>
-          </div>
+                    <div className="rounded-[1rem] border border-white/15 bg-white/[0.05] px-4 py-2.5 text-center text-xs font-bold uppercase tracking-[0.12em] text-white/65">
+                      {gameStarted
+                        ? "Das Spiel läuft!"
+                        : canStartGame
+                          ? "Warte auf Host …"
+                          : `Noch ${MIN_PLAYERS - players.length} Spieler bis zum Start`}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </GlassCard>
+          </footer>
 
           {detailRole &&
             (() => {
@@ -5686,6 +6100,32 @@ export default function WerwolfApp() {
           )}
         </div>
       )}
+
+      {(screen === "lobbyLoading" || screen === "lobbyEntering") && (
+        <div
+          className={`lobby-transition-overlay ${
+            screen === "lobbyLoading"
+              ? "lobby-transition-overlay--loading"
+              : "lobby-transition-overlay--revealing"
+          }`}
+          role={screen === "lobbyLoading" ? "status" : undefined}
+          aria-live={screen === "lobbyLoading" ? "polite" : undefined}
+        >
+          {screen === "lobbyLoading" && (
+            <div className="flex flex-col items-center gap-4 px-6 text-center">
+              <span className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-sky-300" />
+              <p className="text-xs font-black uppercase tracking-[0.34em] text-white/80">
+                Lobby wird vorbereitet
+              </p>
+              {slowHint && (
+                <p className="max-w-md text-sm font-medium leading-6 text-white/50">
+                  {slowHint}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -5852,6 +6292,194 @@ export function GlassCard({
     >
       {children}
     </div>
+  );
+}
+```
+
+## Datei: `src/components/werwolf/lobby-stage.tsx`
+
+```tsx
+"use client";
+
+import type { CSSProperties } from "react";
+
+import { WalkingCat } from "@/components/werwolf/walking-cat";
+import {
+  colorWash,
+  DEFAULT_COLOR,
+  type LobbyPlayer,
+  type PlayerProfile,
+} from "@/lib/game";
+
+type SeatCardProps = {
+  player: LobbyPlayer;
+  profile: PlayerProfile;
+  selfId: string | null;
+  isSpeaking: boolean;
+  seatNumber?: number;
+  host?: boolean;
+  mobile?: boolean;
+};
+
+function SeatCard({
+  player,
+  profile,
+  selfId,
+  isSpeaking,
+  seatNumber,
+  host = false,
+  mobile = false,
+}: SeatCardProps) {
+  const isSelf = player.id === selfId;
+  const displayPlayer = isSelf ? { ...player, ...profile } : player;
+  const displayName = displayPlayer.name || "NAME";
+  const displayImage = displayPlayer.image;
+  const displayColor = displayPlayer.color;
+  const displayIntensity = displayPlayer.fadeIntensity;
+  const displayFrame = displayPlayer.frame;
+
+  return (
+    <article
+      className={`lobby-player-card ${host ? "lobby-player-card--host" : ""} ${
+        mobile ? "lobby-player-card--mobile" : ""
+      } ${isSpeaking && isSelf ? "lobby-player-card--speaking" : ""}`}
+      aria-label={host ? `${displayName}, Host` : `${displayName}, Spieler ${seatNumber ?? ""}`}
+    >
+      {displayColor && displayColor !== DEFAULT_COLOR && (
+        <div
+          className="lobby-player-card__wash"
+          style={{ background: colorWash(displayColor, displayIntensity ?? 50, 70) }}
+        />
+      )}
+      {!host && seatNumber !== undefined && (
+        <span className="lobby-player-card__seat" aria-hidden="true">
+          {String(seatNumber).padStart(2, "0")}
+        </span>
+      )}
+      <div className="lobby-player-card__content">
+        <div className="lobby-player-card__avatar">
+          {displayImage ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={displayImage} alt={`${displayName} Profilbild`} />
+          ) : (
+            <span>{displayName.slice(0, 1)}</span>
+          )}
+        </div>
+        <div className="lobby-player-card__identity">
+          <p className="lobby-player-card__name">{displayName}</p>
+          <p className="lobby-player-card__role">{host ? "Host" : "Spieler"}</p>
+        </div>
+      </div>
+      {displayFrame === "frame1" && (
+        <WalkingCat cardWidth={host ? 300 : mobile ? 250 : 220} />
+      )}
+    </article>
+  );
+}
+
+export function LobbyStage({
+  players,
+  selfId,
+  profile,
+  isSpeaking,
+}: {
+  players: LobbyPlayer[];
+  selfId: string | null;
+  profile: PlayerProfile;
+  isSpeaking: boolean;
+}) {
+  const hostPlayer = players.find((player) => player.isHost) ?? players[0] ?? null;
+  const guestPlayers = hostPlayer
+    ? players.filter((player) => player.id !== hostPlayer.id)
+    : [];
+  // The first ten guests alternate between the left and right edges (1, 3, 5…
+  // on the left; 2, 4, 6… on the right). Guests eleven and twelve sit beside
+  // the host, matching the 13-seat reference layout.
+  const edgePlayers = guestPlayers.slice(0, 10);
+  const leftPlayers = edgePlayers.filter((_, index) => index % 2 === 0);
+  const rightPlayers = edgePlayers.filter((_, index) => index % 2 === 1);
+  const topPlayers = guestPlayers.slice(10, 12);
+  const leftStyle = { "--seat-count": Math.max(1, leftPlayers.length) } as CSSProperties;
+  const rightStyle = { "--seat-count": Math.max(1, rightPlayers.length) } as CSSProperties;
+
+  const cardProps = {
+    profile,
+    selfId,
+    isSpeaking,
+  };
+
+  return (
+    <>
+      <section className="lobby-stage lobby-stage--desktop" aria-label="Spielerplätze">
+        <div className="lobby-stage__side lobby-stage__side--left" style={leftStyle}>
+          {leftPlayers.map((player, index) => (
+            <SeatCard
+              key={player.id}
+              {...cardProps}
+              player={player}
+              seatNumber={index * 2 + 1}
+            />
+          ))}
+        </div>
+        <div className="lobby-stage__inner lobby-stage__inner--left">
+          {topPlayers[0] && (
+            <SeatCard {...cardProps} player={topPlayers[0]} seatNumber={11} />
+          )}
+        </div>
+        <div className="lobby-stage__host">
+          {hostPlayer ? (
+            <SeatCard {...cardProps} player={hostPlayer} host />
+          ) : (
+            <div className="lobby-stage__empty-host">Host</div>
+          )}
+        </div>
+        <div className="lobby-stage__inner lobby-stage__inner--right">
+          {topPlayers[1] && (
+            <SeatCard {...cardProps} player={topPlayers[1]} seatNumber={12} />
+          )}
+        </div>
+        <div className="lobby-stage__side lobby-stage__side--right" style={rightStyle}>
+          {rightPlayers.map((player, index) => (
+            <SeatCard
+              key={player.id}
+              {...cardProps}
+              player={player}
+              seatNumber={index * 2 + 2}
+            />
+          ))}
+        </div>
+        {guestPlayers.length === 0 && (
+          <div className="lobby-stage__empty-guests">
+            Teile den Lobbycode und warte auf deine Mitspieler.
+          </div>
+        )}
+      </section>
+
+      <section className="lobby-stage lobby-stage--mobile" aria-label="Spielerplätze">
+        {hostPlayer && (
+          <div className="lobby-stage__mobile-host">
+            <SeatCard {...cardProps} player={hostPlayer} host mobile />
+          </div>
+        )}
+        {guestPlayers.length > 0 ? (
+          <div className="lobby-stage__mobile-guests">
+            {guestPlayers.map((player, index) => (
+              <SeatCard
+                key={player.id}
+                {...cardProps}
+                player={player}
+                seatNumber={index + 1}
+                mobile
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="lobby-stage__mobile-empty">
+            Teile den Lobbycode und warte auf deine Mitspieler.
+          </div>
+        )}
+      </section>
+    </>
   );
 }
 ```
@@ -6518,6 +7146,7 @@ const TEXT_FILES = [
   "src/components/werwolf/walking-cat.tsx",
   "src/components/werwolf/role-icon.tsx",
   "src/components/werwolf/glass-card.tsx",
+  "src/components/werwolf/lobby-stage.tsx",
   "src/components/auth/auth-gate.tsx",
   "src/components/auth/sign-in-screen.tsx",
   "scripts/measure-ram.mjs",
@@ -6609,10 +7238,12 @@ Mehrspieler-Lobby für das Partyspiel **Werwolf** (Bonus-Modus: **Höhle der Lö
 - **Spielerkarte**: Name (max. 12 Zeichen), Farbe + Intensität (135°-Farbverlauf),
   Profilbild-Upload (Data-URL), Rahmenwahl (Rahmen 1 = laufende Katze \`Cd\`/\`WalkingCat\`).
   Persistenz in \`localStorage\` unter \`werwolf-player-profile\`.
-- **Lobby**: kopierbarer Lobbycode mit „Lobby verlassen" direkt unter „Kopieren",
-  deckende Spielerkarten (Farbe/Avatar/Host-Badge), Seitenleiste mit
-  „Rollen für diese Runde" oben und vergrößertem Bereich „Sonstige Regeln",
-  „Spiel starten" (Host) bzw. „Warte auf Host…" (Gäste).
+- **Lobby**: kurzer schwarzer Fade-Übergang in eine neue blaue Lobby-Ansicht,
+  kopierbarer Lobbycode, Live-Status und responsive 13er-Sitzordnung (Host oben
+  mittig, bis zu zwölf Gäste spiegelbildlich an den Seiten und neben dem Host).
+  Spielerkarten zeigen Profilfarbe, Avatar und Host-Badge. Mindestens vier Spieler
+  inklusive Host sind zum Start erforderlich; maximal 13 Personen passen in eine Lobby.
+  Rollen-Konfiguration und Lobby verlassen bleiben direkt erreichbar.
 - **15 Rollen** (Teams gut/böse/neutral) mit PNG-Symbolen aus
   \`/roles/<Rollenname>icon.png\`, Beschreibung, Gewinnkondition und Host-Zählern;
   Standard: 1× Werwolf, 2× Dorfbewohner.

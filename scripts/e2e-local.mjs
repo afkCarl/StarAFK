@@ -270,14 +270,37 @@ async function main() {
       roleCounts: { Werwolf: 1, Seher: 1, Dorfbewohner: 2 },
     });
     check("Rollen-Setup speichern (Host)", roles.body?.ok === true);
+    const earlyStart = await postJson(`${appUrlA}/api/lobby/start`, {
+      code,
+      playerId: hostId,
+      started: true,
+    });
+    check(
+      "Spielstart unter vier Spielern wird abgelehnt",
+      earlyStart.status === 409 && earlyStart.body?.reason === "too_few",
+    );
+    const extraGuests = [];
+    for (const name of ["Gast 2", "Gast 3"]) {
+      const extra = await postJson(`${appUrlA}/api/lobby/join`, {
+        code,
+        profile: { name },
+      });
+      if (extra.body?.ok) extraGuests.push(extra.body.selfId);
+    }
+    check("Mindestens vier Spieler können der Lobby beitreten", extraGuests.length === 2);
+    const readyState = await getJson(`${appUrlA}/api/lobby/state?code=${code}&pid=${hostId}`);
+    check("Vier Spieler im Zustand", readyState.body?.state?.players?.length === 4);
     const start = await postJson(`${appUrlA}/api/lobby/start`, {
       code,
       playerId: hostId,
       started: true,
     });
-    check("Spiel starten (Host)", start.body?.ok === true);
+    check("Spiel starten (Host, vier Spieler)", start.body?.ok === true);
     const state = await getJson(`${appUrlA}/api/lobby/state?code=${code}&pid=${hostId}`);
     check("Zustand abfragen", state.body?.ok === true && state.body?.state?.gameStarted === true);
+    for (const playerId of extraGuests) {
+      await postJson(`${appUrlA}/api/lobby/leave`, { code, playerId });
+    }
     const leave = await postJson(`${appUrlA}/api/lobby/leave`, { code, playerId: guest.body?.selfId });
     check("Lobby verlassen", leave.body?.ok === true);
     const afterGuestLeave = await getJson(`${appUrlA}/api/lobby/state?code=${code}&pid=${hostId}`);
@@ -308,6 +331,26 @@ async function main() {
       "Ehemaliger Host ist kein Lobby-Mitglied mehr",
       formerHost.status === 409 && formerHost.body?.reason === "not_member",
     );
+
+    const limitHost = await postJson(`${appUrlA}/api/lobby/create`, {
+      mode: "WERWOLF",
+      profile: { name: "Limit-Host" },
+    });
+    const limitCode = limitHost.body?.lobby?.code;
+    let joinedGuests = 0;
+    for (let index = 1; index <= 12; index += 1) {
+      const joined = await postJson(`${appUrlA}/api/lobby/join`, {
+        code: limitCode,
+        profile: { name: `Limit ${index}` },
+      });
+      if (joined.body?.ok) joinedGuests += 1;
+    }
+    check("Lobby fasst zwölf Gäste zusätzlich zum Host", joinedGuests === 12);
+    const overflow = await postJson(`${appUrlA}/api/lobby/join`, {
+      code: limitCode,
+      profile: { name: "Zu viel" },
+    });
+    check("Vierzehnter Spieler wird abgewiesen", overflow.status === 409 && overflow.body?.reason === "full");
   } finally {
     await appA.stop();
   }
