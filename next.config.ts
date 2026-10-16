@@ -11,6 +11,19 @@ const nextConfig: NextConfig = {
   // dann blockt Next 16 den HMR-WebSocket der Vorschau, die Seite wird nie
   // hydriert und bleibt dauerhaft auf „Laden…“ stehen.
   allowedDevOrigins: ["*.e2b.app", "localhost", "127.0.0.1"],
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          {
+            key: "Permissions-Policy",
+            value: "microphone=*",
+          },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;
