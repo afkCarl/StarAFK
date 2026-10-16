@@ -14,12 +14,15 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { GameTable } from "@/components/werwolf/game-table";
 import { GlassCard } from "@/components/werwolf/glass-card";
 import { RoleIcon } from "@/components/werwolf/role-icon";
 import { SkyBackground } from "@/components/werwolf/sky-background";
 import { WalkingCat } from "@/components/werwolf/walking-cat";
 import {
   DEFAULT_COLOR,
+  MAX_LOBBY_PLAYERS,
+  MIN_PLAYERS_TO_START,
   MODES,
   ROLES,
   colorWash,
@@ -47,6 +50,13 @@ type SlidePhase = "idle" | "start" | "go";
 type JoinPanel = "closed" | "opening" | "open" | "closing";
 type Direction = "left" | "right";
 type ConnectionState = "ok" | "reconnecting";
+/** Ansicht innerhalb der Lobby: Wartezimmer oder Spieltisch nach Spielstart. */
+type GameView = "lobby" | "game";
+
+/** Schwarzer Vorhang beim Wechsel Lobby ⇄ Spieltisch: einblenden, kurz halten, ausblenden. */
+const CURTAIN_FADE_IN_MS = 600;
+const CURTAIN_HOLD_MS = 200;
+const CURTAIN_FADE_OUT_MS = 700;
 
 /** Laufende Sitzung (Lobbycode + eigene Spieler-ID) – übersteht ein Neuladen. */
 const SESSION_KEY = "werwolf-lobby-session";
@@ -307,6 +317,8 @@ export default function WerwolfApp() {
   const [roleCounts, setRoleCounts] = useState<Record<string, number>>(defaultCounts);
   const [cardModalOpen, setCardModalOpen] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
+  const [gameView, setGameView] = useState<GameView>("lobby");
+  const [curtain, setCurtain] = useState(false);
   const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [slowHint, setSlowHint] = useState<string | null>(null);
@@ -933,6 +945,36 @@ export default function WerwolfApp() {
   const inLobby = screen === "lobbyEntering" || screen === "lobby";
   const isDark = (inMenu && mode.title === "WERWOLF") || inLobby;
   const selectedRoles = ROLES.filter((role) => roleCounts[role.name] > 0);
+  const canStartGame = players.length >= MIN_PLAYERS_TO_START;
+  // Eigener Eintrag mit den lokalen (sofort sichtbaren) Profildaten.
+  const tablePlayers = players.map((player) =>
+    player.id === selfId
+      ? { ...player, name: name || "NAME", color, fadeIntensity, image, frame }
+      : player,
+  );
+
+  // Spielstart/-ende: Ändert sich `gameStarted`, blendet ein schwarzer Vorhang
+  // ein, die Ansicht wird getauscht und der Vorhang blendet wieder aus. Bei
+  // erneuter Änderung während des Übergangs räumt der Cleanup den Timer ab und
+  // der Effekt läuft mit dem neuesten Zustand weiter.
+  useEffect(() => {
+    if (!inLobby) {
+      setGameView("lobby");
+      setCurtain(false);
+      return;
+    }
+    const target: GameView = gameStarted ? "game" : "lobby";
+    if (target === gameView) {
+      setCurtain(false);
+      return;
+    }
+    setCurtain(true);
+    const timer = setTimeout(
+      () => setGameView(target),
+      CURTAIN_FADE_IN_MS + CURTAIN_HOLD_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [gameStarted, gameView, inLobby]);
 
   const switchMode = (nextIndex: number, dir: Direction) => {
     if (modeLocked || screen !== "menu") return;
@@ -1125,7 +1167,7 @@ export default function WerwolfApp() {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         reason === "full"
-          ? "Die Lobby ist leider voll (max. 12 Spieler)."
+          ? `Die Lobby ist leider voll (max. ${MAX_LOBBY_PLAYERS - 1} Spieler + Host).`
           : reason === "not_found"
             ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
             : isTransient(reason)
@@ -1141,6 +1183,12 @@ export default function WerwolfApp() {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid || busy) return;
+    if (started && players.length < MIN_PLAYERS_TO_START) {
+      setActionError(
+        `Zum Start braucht es mindestens ${MIN_PLAYERS_TO_START} Teilnehmer (inklusive Host).`,
+      );
+      return;
+    }
     setActionError(null);
     setBusy("start");
     try {
@@ -1159,7 +1207,9 @@ export default function WerwolfApp() {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         started
-          ? isTransient(reason)
+          ? reason === "not_enough_players"
+            ? `Zum Start braucht es mindestens ${MIN_PLAYERS_TO_START} Teilnehmer (inklusive Host).`
+            : isTransient(reason)
             ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
             : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
           : "Das Spiel konnte nicht zurückgesetzt werden.",
@@ -1711,7 +1761,18 @@ export default function WerwolfApp() {
         </>
       )}
 
-      {inLobby && (
+      {inLobby && gameView === "game" && (
+        <GameTable
+          players={tablePlayers}
+          speakingId={isSpeaking ? selfId : null}
+          isHost={isHost}
+          busy={busy === "start"}
+          onBackToLobby={() => handleStartGame(false)}
+          onLeave={handleLeaveLobby}
+        />
+      )}
+
+      {inLobby && gameView === "lobby" && (
         <div
           className="absolute inset-0 z-20 px-4 py-4 text-white sm:px-6 sm:py-6 md:px-8 md:py-8"
           style={lobbyEnterStyle()}
@@ -1899,13 +1960,23 @@ export default function WerwolfApp() {
                       </button>
                     </div>
                   ) : (
-                    <button
-                      onClick={() => handleStartGame(true)}
-                      disabled={busy === "start"}
-                      className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:animate-pulse disabled:opacity-50"
-                    >
-                      {busy === "start" ? "Startet…" : "Spiel starten"}
-                    </button>
+                    <div className="flex flex-col gap-2">
+                      <button
+                        onClick={() => handleStartGame(true)}
+                        disabled={busy === "start" || !canStartGame}
+                        className={`rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:bg-white/15 disabled:hover:text-white ${
+                          busy === "start" ? "animate-pulse" : ""
+                        } ${canStartGame ? "" : "opacity-40"}`}
+                      >
+                        {busy === "start" ? "Startet…" : "Spiel starten"}
+                      </button>
+                      {!canStartGame && (
+                        <p className="text-center text-xs font-bold uppercase tracking-[0.14em] text-white/50">
+                          Mindestens {MIN_PLAYERS_TO_START} Teilnehmer nötig ({players.length}/
+                          {MIN_PLAYERS_TO_START})
+                        </p>
+                      )}
+                    </div>
                   )
                 ) : (
                   <div
@@ -2128,6 +2199,18 @@ export default function WerwolfApp() {
           )}
         </div>
       )}
+      {/* Schwarzer Vorhang für den Spielstart – fängt Eingaben ab, solange er liegt. */}
+      <div
+        aria-hidden
+        className={`fixed inset-0 z-[70] bg-black ease-in-out ${
+          curtain ? "pointer-events-auto" : "pointer-events-none"
+        }`}
+        style={{
+          opacity: curtain ? 1 : 0,
+          transitionProperty: "opacity",
+          transitionDuration: `${curtain ? CURTAIN_FADE_IN_MS : CURTAIN_FADE_OUT_MS}ms`,
+        }}
+      />
     </div>
   );
 }

@@ -4,6 +4,8 @@ import { getDb } from "@/db";
 import { gameMasterLines, lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
+  MAX_LOBBY_PLAYERS,
+  MIN_PLAYERS_TO_START,
   defaultRoleCounts,
   type LobbyNarration,
   type LobbyPlayer,
@@ -34,8 +36,8 @@ const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 /** Spieler-IDs sind UUIDs (Postgres `gen_random_uuid()`). */
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-/** Maximale Spielerzahl pro Lobby. */
-export const MAX_PLAYERS = 12;
+/** Maximale Teilnehmerzahl pro Lobby (inklusive Host). */
+export const MAX_PLAYERS = MAX_LOBBY_PLAYERS;
 
 let lastCleanupAt = 0;
 let lastPurgeAt = 0;
@@ -614,18 +616,23 @@ export async function getLobbyState(
   };
 }
 
+export type GameStartOutcome =
+  | { ok: true }
+  | { ok: false; reason: "not_host" | "not_enough_players" | "not_found" };
+
 /**
  * Startet (oder beendet) das Spiel für alle Spieler der Lobby.
- * Nur der Host darf den Status ändern.
+ * Nur der Host darf den Status ändern, und zum Start braucht es mindestens
+ * `MIN_PLAYERS_TO_START` Teilnehmer (inklusive Host).
  */
 export async function setGameStarted(
   codeInput: string,
   playerId: string,
   started: boolean,
   userId?: string | null,
-): Promise<boolean> {
+): Promise<GameStartOutcome> {
   const code = normalizeCode(codeInput);
-  if (code.length !== 6) return false;
+  if (code.length !== 6) return { ok: false, reason: "not_found" };
 
   const db = await getDb();
   const [host] = await db
@@ -639,14 +646,21 @@ export async function setGameStarted(
         ownerFilter(userId),
       ),
     );
-  if (!host) return false;
+  if (!host) return { ok: false, reason: "not_host" };
+
+  if (started) {
+    const current = await listPlayers(code);
+    if (current.length < MIN_PLAYERS_TO_START) {
+      return { ok: false, reason: "not_enough_players" };
+    }
+  }
 
   await db
     .update(lobbies)
     .set({ gameStarted: started })
     .where(eq(lobbies.code, code));
   await touchPlayer(code, playerId, userId);
-  return true;
+  return { ok: true };
 }
 
 /** Profil aktualisieren (Name, Farbe, Verlauf, Rahmen – Bild separat). */

@@ -130,6 +130,7 @@ src/app/api/lobby/leave/route.ts
 src/app/api/lobby/avatar/route.ts
 src/components/werwolf/werwolf-app.tsx
 src/components/werwolf/sky-background.tsx
+src/components/werwolf/game-table.tsx
 src/components/werwolf/walking-cat.tsx
 src/components/werwolf/role-icon.tsx
 src/components/werwolf/glass-card.tsx
@@ -1744,6 +1745,13 @@ export const MODES: GameMode[] = [
   },
 ];
 
+/** Maximale Teilnehmerzahl pro Lobby – inklusive Host (12 Spieler + Host). */
+export const MAX_LOBBY_PLAYERS = 13;
+/** Mindestanzahl Teilnehmer (inklusive Host), damit das Spiel starten kann. */
+export const MIN_PLAYERS_TO_START = 4;
+/** Anzahl der Sitzplätze am Spieltisch (ohne Host). */
+export const SEAT_COUNT = MAX_LOBBY_PLAYERS - 1;
+
 export const DEFAULT_COLOR = "#6b7280";
 
 export function randomName(): string {
@@ -1871,6 +1879,8 @@ import { getDb } from "@/db";
 import { gameMasterLines, lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
+  MAX_LOBBY_PLAYERS,
+  MIN_PLAYERS_TO_START,
   defaultRoleCounts,
   type LobbyNarration,
   type LobbyPlayer,
@@ -1901,8 +1911,8 @@ const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 /** Spieler-IDs sind UUIDs (Postgres `gen_random_uuid()`). */
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-/** Maximale Spielerzahl pro Lobby. */
-export const MAX_PLAYERS = 12;
+/** Maximale Teilnehmerzahl pro Lobby (inklusive Host). */
+export const MAX_PLAYERS = MAX_LOBBY_PLAYERS;
 
 let lastCleanupAt = 0;
 let lastPurgeAt = 0;
@@ -2481,18 +2491,23 @@ export async function getLobbyState(
   };
 }
 
+export type GameStartOutcome =
+  | { ok: true }
+  | { ok: false; reason: "not_host" | "not_enough_players" | "not_found" };
+
 /**
  * Startet (oder beendet) das Spiel für alle Spieler der Lobby.
- * Nur der Host darf den Status ändern.
+ * Nur der Host darf den Status ändern, und zum Start braucht es mindestens
+ * `MIN_PLAYERS_TO_START` Teilnehmer (inklusive Host).
  */
 export async function setGameStarted(
   codeInput: string,
   playerId: string,
   started: boolean,
   userId?: string | null,
-): Promise<boolean> {
+): Promise<GameStartOutcome> {
   const code = normalizeCode(codeInput);
-  if (code.length !== 6) return false;
+  if (code.length !== 6) return { ok: false, reason: "not_found" };
 
   const db = await getDb();
   const [host] = await db
@@ -2506,14 +2521,21 @@ export async function setGameStarted(
         ownerFilter(userId),
       ),
     );
-  if (!host) return false;
+  if (!host) return { ok: false, reason: "not_host" };
+
+  if (started) {
+    const current = await listPlayers(code);
+    if (current.length < MIN_PLAYERS_TO_START) {
+      return { ok: false, reason: "not_enough_players" };
+    }
+  }
 
   await db
     .update(lobbies)
     .set({ gameStarted: started })
     .where(eq(lobbies.code, code));
   await touchPlayer(code, playerId, userId);
-  return true;
+  return { ok: true };
 }
 
 /** Profil aktualisieren (Name, Farbe, Verlauf, Rahmen – Bild separat). */
@@ -3426,13 +3448,19 @@ export const POST = route("lobby:start", async (request) => {
   if (!guard.ok) return guard.response;
 
   const body = await readJson(request);
-  const ok = await setGameStarted(
+  const outcome = await setGameStarted(
     String(body.code ?? ""),
     String(body.playerId ?? ""),
     body.started !== false,
     guard.userId,
   );
-  if (!ok) {
+  if (!outcome.ok) {
+    if (outcome.reason === "not_enough_players") {
+      return json({ ok: false, reason: "not_enough_players" }, 409);
+    }
+    if (outcome.reason === "not_found") {
+      return json({ ok: false, reason: "not_found" }, 404);
+    }
     return json({ ok: false, reason: "not_host" }, 403);
   }
   return json({ ok: true });
@@ -3572,12 +3600,15 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { GameTable } from "@/components/werwolf/game-table";
 import { GlassCard } from "@/components/werwolf/glass-card";
 import { RoleIcon } from "@/components/werwolf/role-icon";
 import { SkyBackground } from "@/components/werwolf/sky-background";
 import { WalkingCat } from "@/components/werwolf/walking-cat";
 import {
   DEFAULT_COLOR,
+  MAX_LOBBY_PLAYERS,
+  MIN_PLAYERS_TO_START,
   MODES,
   ROLES,
   colorWash,
@@ -3605,6 +3636,13 @@ type SlidePhase = "idle" | "start" | "go";
 type JoinPanel = "closed" | "opening" | "open" | "closing";
 type Direction = "left" | "right";
 type ConnectionState = "ok" | "reconnecting";
+/** Ansicht innerhalb der Lobby: Wartezimmer oder Spieltisch nach Spielstart. */
+type GameView = "lobby" | "game";
+
+/** Schwarzer Vorhang beim Wechsel Lobby ⇄ Spieltisch: einblenden, kurz halten, ausblenden. */
+const CURTAIN_FADE_IN_MS = 600;
+const CURTAIN_HOLD_MS = 200;
+const CURTAIN_FADE_OUT_MS = 700;
 
 /** Laufende Sitzung (Lobbycode + eigene Spieler-ID) – übersteht ein Neuladen. */
 const SESSION_KEY = "werwolf-lobby-session";
@@ -3865,6 +3903,8 @@ export default function WerwolfApp() {
   const [roleCounts, setRoleCounts] = useState<Record<string, number>>(defaultCounts);
   const [cardModalOpen, setCardModalOpen] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
+  const [gameView, setGameView] = useState<GameView>("lobby");
+  const [curtain, setCurtain] = useState(false);
   const [busy, setBusy] = useState<null | "create" | "join" | "start">(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [slowHint, setSlowHint] = useState<string | null>(null);
@@ -4491,6 +4531,36 @@ export default function WerwolfApp() {
   const inLobby = screen === "lobbyEntering" || screen === "lobby";
   const isDark = (inMenu && mode.title === "WERWOLF") || inLobby;
   const selectedRoles = ROLES.filter((role) => roleCounts[role.name] > 0);
+  const canStartGame = players.length >= MIN_PLAYERS_TO_START;
+  // Eigener Eintrag mit den lokalen (sofort sichtbaren) Profildaten.
+  const tablePlayers = players.map((player) =>
+    player.id === selfId
+      ? { ...player, name: name || "NAME", color, fadeIntensity, image, frame }
+      : player,
+  );
+
+  // Spielstart/-ende: Ändert sich `gameStarted`, blendet ein schwarzer Vorhang
+  // ein, die Ansicht wird getauscht und der Vorhang blendet wieder aus. Bei
+  // erneuter Änderung während des Übergangs räumt der Cleanup den Timer ab und
+  // der Effekt läuft mit dem neuesten Zustand weiter.
+  useEffect(() => {
+    if (!inLobby) {
+      setGameView("lobby");
+      setCurtain(false);
+      return;
+    }
+    const target: GameView = gameStarted ? "game" : "lobby";
+    if (target === gameView) {
+      setCurtain(false);
+      return;
+    }
+    setCurtain(true);
+    const timer = setTimeout(
+      () => setGameView(target),
+      CURTAIN_FADE_IN_MS + CURTAIN_HOLD_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [gameStarted, gameView, inLobby]);
 
   const switchMode = (nextIndex: number, dir: Direction) => {
     if (modeLocked || screen !== "menu") return;
@@ -4683,7 +4753,7 @@ export default function WerwolfApp() {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         reason === "full"
-          ? "Die Lobby ist leider voll (max. 12 Spieler)."
+          ? `Die Lobby ist leider voll (max. ${MAX_LOBBY_PLAYERS - 1} Spieler + Host).`
           : reason === "not_found"
             ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
             : isTransient(reason)
@@ -4699,6 +4769,12 @@ export default function WerwolfApp() {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid || busy) return;
+    if (started && players.length < MIN_PLAYERS_TO_START) {
+      setActionError(
+        `Zum Start braucht es mindestens ${MIN_PLAYERS_TO_START} Teilnehmer (inklusive Host).`,
+      );
+      return;
+    }
     setActionError(null);
     setBusy("start");
     try {
@@ -4717,7 +4793,9 @@ export default function WerwolfApp() {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         started
-          ? isTransient(reason)
+          ? reason === "not_enough_players"
+            ? `Zum Start braucht es mindestens ${MIN_PLAYERS_TO_START} Teilnehmer (inklusive Host).`
+            : isTransient(reason)
             ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
             : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
           : "Das Spiel konnte nicht zurückgesetzt werden.",
@@ -5269,7 +5347,18 @@ export default function WerwolfApp() {
         </>
       )}
 
-      {inLobby && (
+      {inLobby && gameView === "game" && (
+        <GameTable
+          players={tablePlayers}
+          speakingId={isSpeaking ? selfId : null}
+          isHost={isHost}
+          busy={busy === "start"}
+          onBackToLobby={() => handleStartGame(false)}
+          onLeave={handleLeaveLobby}
+        />
+      )}
+
+      {inLobby && gameView === "lobby" && (
         <div
           className="absolute inset-0 z-20 px-4 py-4 text-white sm:px-6 sm:py-6 md:px-8 md:py-8"
           style={lobbyEnterStyle()}
@@ -5457,13 +5546,23 @@ export default function WerwolfApp() {
                       </button>
                     </div>
                   ) : (
-                    <button
-                      onClick={() => handleStartGame(true)}
-                      disabled={busy === "start"}
-                      className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:animate-pulse disabled:opacity-50"
-                    >
-                      {busy === "start" ? "Startet…" : "Spiel starten"}
-                    </button>
+                    <div className="flex flex-col gap-2">
+                      <button
+                        onClick={() => handleStartGame(true)}
+                        disabled={busy === "start" || !canStartGame}
+                        className={`rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:bg-white/15 disabled:hover:text-white ${
+                          busy === "start" ? "animate-pulse" : ""
+                        } ${canStartGame ? "" : "opacity-40"}`}
+                      >
+                        {busy === "start" ? "Startet…" : "Spiel starten"}
+                      </button>
+                      {!canStartGame && (
+                        <p className="text-center text-xs font-bold uppercase tracking-[0.14em] text-white/50">
+                          Mindestens {MIN_PLAYERS_TO_START} Teilnehmer nötig ({players.length}/
+                          {MIN_PLAYERS_TO_START})
+                        </p>
+                      )}
+                    </div>
                   )
                 ) : (
                   <div
@@ -5686,6 +5785,18 @@ export default function WerwolfApp() {
           )}
         </div>
       )}
+      {/* Schwarzer Vorhang für den Spielstart – fängt Eingaben ab, solange er liegt. */}
+      <div
+        aria-hidden
+        className={`fixed inset-0 z-[70] bg-black ease-in-out ${
+          curtain ? "pointer-events-auto" : "pointer-events-none"
+        }`}
+        style={{
+          opacity: curtain ? 1 : 0,
+          transitionProperty: "opacity",
+          transitionDuration: `${curtain ? CURTAIN_FADE_IN_MS : CURTAIN_FADE_OUT_MS}ms`,
+        }}
+      />
     </div>
   );
 }
@@ -5724,6 +5835,232 @@ export function SkyBackground({ isActive }: { isActive: boolean }) {
           eine Ausblendung der oberen Bildhälfte ließ die Wolken vor dem Dorf
           durchscheinen, obwohl die Ebene korrekt gestapelt war. */}
       <div className="absolute inset-0 z-20 bg-[url('/foreground.png')] bg-bottom bg-cover bg-no-repeat" />
+    </div>
+  );
+}
+```
+
+## Datei: `src/components/werwolf/game-table.tsx`
+
+```tsx
+"use client";
+
+import { LogOut } from "lucide-react";
+import type { ReactNode } from "react";
+
+import { WalkingCat } from "@/components/werwolf/walking-cat";
+import {
+  DEFAULT_COLOR,
+  SEAT_COUNT,
+  colorWash,
+  type LobbyPlayer,
+} from "@/lib/game";
+
+/**
+ * Spieltisch – Sitzordnung nach Skizze:
+ *
+ *   [ 1 ]  [11]    [ HOST ]    [12]  [ 2 ]
+ *   [ 3 ]                      [ 4 ]
+ *   [ 5 ]                      [ 6 ]
+ *   [ 7 ]                      [ 8 ]
+ *   [ 9 ]                      [10 ]
+ *
+ * Alle Angaben in Prozent der Spielfläche. Die Plätze werden in der
+ * Beitrittsreihenfolge besetzt (1, 2, 3, …), d. h. links und rechts wachsen
+ * immer im Wechsel – die Anordnung bleibt damit für jede Spielerzahl
+ * symmetrisch und füllt sich von oben nach unten.
+ */
+interface SeatBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+const SIDE_LEFT = 1;
+const SIDE_RIGHT = 82;
+const SIDE_WIDTH = 17;
+const ROW_HEIGHT = 18.6;
+const ROW_GAP = 1.2;
+const ROW_TOP = Array.from({ length: 5 }, (_, row) => 1 + row * (ROW_HEIGHT + ROW_GAP));
+const TOP_ROW_LEFT = 19.5;
+const TOP_ROW_RIGHT = 63.5;
+
+const HOST_BOX: SeatBox = { left: 39.5, top: 1, width: 21, height: 26 };
+
+/** Platz 1 bis 12 (Index 0–11). Ungerade Plätze links, gerade rechts. */
+export const SEAT_LAYOUT: SeatBox[] = [
+  ...ROW_TOP.flatMap((top) => [
+    { left: SIDE_LEFT, top, width: SIDE_WIDTH, height: ROW_HEIGHT },
+    { left: SIDE_RIGHT, top, width: SIDE_WIDTH, height: ROW_HEIGHT },
+  ]),
+  { left: TOP_ROW_LEFT, top: 1, width: SIDE_WIDTH, height: ROW_HEIGHT },
+  { left: TOP_ROW_RIGHT, top: 1, width: SIDE_WIDTH, height: ROW_HEIGHT },
+];
+
+export interface GameTableProps {
+  /** Teilnehmer inklusive Host; der eigene Eintrag ist bereits aufgelöst. */
+  players: LobbyPlayer[];
+  /** Spieler-ID, der gerade spricht (grüner Leuchtrand). */
+  speakingId: string | null;
+  isHost: boolean;
+  busy: boolean;
+  onBackToLobby: () => void;
+  onLeave: () => void;
+}
+
+export function GameTable({
+  players,
+  speakingId,
+  isHost,
+  busy,
+  onBackToLobby,
+  onLeave,
+}: GameTableProps) {
+  const host = players.find((player) => player.isHost) ?? null;
+  const guests = players.filter((player) => !player.isHost).slice(0, SEAT_COUNT);
+
+  return (
+    <div className="absolute inset-0 z-20 overflow-hidden bg-[#1e40af] text-white">
+      {host && (
+        <Seat box={HOST_BOX}>
+          <PlayerCard
+            player={host}
+            speaking={host.id === speakingId}
+            label="Host"
+          />
+        </Seat>
+      )}
+
+      {SEAT_LAYOUT.map((box, index) => {
+        const player = guests[index];
+        return (
+          <Seat key={`seat-${index}`} box={box} number={index + 1}>
+            {player ? (
+              <PlayerCard
+                player={player}
+                speaking={player.id === speakingId}
+                label="Player"
+              />
+            ) : null}
+          </Seat>
+        );
+      })}
+
+      <div className="pointer-events-none absolute left-1/2 top-[52%] flex -translate-x-1/2 flex-col items-center text-center">
+        <p className="text-[clamp(1.2rem,2.6vw,2.4rem)] font-black uppercase tracking-[0.24em] text-white">
+          Spiel läuft
+        </p>
+        <p className="mt-2 text-xs font-bold uppercase tracking-[0.3em] text-white/60">
+          {players.length} Teilnehmer
+        </p>
+      </div>
+
+      <div className="absolute bottom-[2.5%] left-1/2 flex -translate-x-1/2 items-center gap-3">
+        <button
+          onClick={onLeave}
+          className="flex items-center gap-2 rounded-[1rem] border border-white/25 bg-white/5 px-3 py-2 text-xs font-bold uppercase tracking-wide text-white/70 transition-all duration-200 hover:border-red-400/50 hover:bg-red-500/15 hover:text-red-100"
+        >
+          <LogOut size={16} />
+          Lobby verlassen
+        </button>
+        {isHost && (
+          <button
+            onClick={onBackToLobby}
+            disabled={busy}
+            className="rounded-[1rem] border border-white/20 bg-white/5 px-4 py-2 text-xs font-bold uppercase tracking-[0.18em] text-white/70 transition-all duration-200 hover:bg-white/15 hover:text-white disabled:opacity-50"
+          >
+            Zurück zur Lobby
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Seat({
+  box,
+  number,
+  children,
+}: {
+  box: SeatBox;
+  number?: number;
+  children?: ReactNode;
+}) {
+  return (
+    <div
+      className="absolute"
+      style={{
+        left: `${box.left}%`,
+        top: `${box.top}%`,
+        width: `${box.width}%`,
+        height: `${box.height}%`,
+      }}
+    >
+      {children ?? (
+        <div className="flex h-full w-full items-center justify-center rounded-[1.4rem] border-2 border-dashed border-white/20 text-white/30">
+          <span className="text-[clamp(0.9rem,2vw,1.6rem)] font-bold">{number}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlayerCard({
+  player,
+  speaking,
+  label,
+}: {
+  player: LobbyPlayer;
+  speaking: boolean;
+  label: string;
+}) {
+  const displayName = player.name || "NAME";
+  const hasColor = Boolean(player.color) && player.color !== DEFAULT_COLOR;
+
+  return (
+    <div
+      className={`relative flex h-full w-full flex-col items-center justify-center overflow-hidden rounded-[1.4rem] border-2 bg-[#172033] px-3 py-3 text-center transition-all duration-150 ${
+        speaking
+          ? "border-[#4ade80] shadow-[0_0_20px_rgba(34,197,94,0.95),0_0_44px_rgba(34,197,94,0.55),inset_0_0_20px_rgba(34,197,94,0.4)] ring-2 ring-[#4ade80]"
+          : "border-white/15"
+      }`}
+      style={{ containerType: "size" }}
+    >
+      {hasColor && (
+        <div
+          className="pointer-events-none absolute inset-0"
+          style={{
+            background: colorWash(player.color, player.fadeIntensity ?? 50, 70),
+          }}
+        />
+      )}
+      <div
+        className="relative z-10 flex items-center justify-center overflow-hidden rounded-full text-[clamp(1rem,30cqmin,2.5rem)] font-black uppercase text-white drop-shadow-md"
+        style={{ width: "38cqmin", height: "38cqmin" }}
+      >
+        {player.image ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={player.image} alt="Profile" className="h-full w-full object-cover" />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center bg-white/10">
+            {displayName.slice(0, 1) || "?"}
+          </div>
+        )}
+      </div>
+      <p
+        className="relative z-10 mt-[4cqmin] max-w-full break-all font-black uppercase leading-none text-white drop-shadow-md"
+        style={{ fontSize: "clamp(0.8rem, 13cqmin, 2.2rem)" }}
+      >
+        {displayName}
+      </p>
+      <p
+        className="relative z-10 mt-[2cqmin] font-bold uppercase tracking-[0.3em] text-white/50"
+        style={{ fontSize: "clamp(0.45rem, 5.5cqmin, 0.8rem)" }}
+      >
+        {label}
+      </p>
+      {player.frame === "frame1" && <WalkingCat cardWidth={200} />}
     </div>
   );
 }
@@ -6515,6 +6852,7 @@ const TEXT_FILES = [
   "src/app/api/lobby/avatar/route.ts",
   "src/components/werwolf/werwolf-app.tsx",
   "src/components/werwolf/sky-background.tsx",
+  "src/components/werwolf/game-table.tsx",
   "src/components/werwolf/walking-cat.tsx",
   "src/components/werwolf/role-icon.tsx",
   "src/components/werwolf/glass-card.tsx",
