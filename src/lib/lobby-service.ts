@@ -5,6 +5,8 @@ import { gameMasterLines, lobbies, players } from "@/db/schema";
 import {
   DEFAULT_COLOR,
   defaultRoleCounts,
+  MAX_PLAYERS,
+  MIN_PLAYERS,
   type LobbyNarration,
   type LobbyPlayer,
   type LobbyState,
@@ -33,9 +35,6 @@ const EMPTY_LOBBY_GRACE_MS = 10 * 60_000;
 const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 /** Spieler-IDs sind UUIDs (Postgres `gen_random_uuid()`). */
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-
-/** Maximale Spielerzahl pro Lobby. */
-export const MAX_PLAYERS = 12;
 
 let lastCleanupAt = 0;
 let lastPurgeAt = 0;
@@ -616,16 +615,21 @@ export async function getLobbyState(
 
 /**
  * Startet (oder beendet) das Spiel für alle Spieler der Lobby.
- * Nur der Host darf den Status ändern.
+ * Nur der Host darf den Status ändern; zum Starten müssen mindestens vier
+ * Spieler (einschließlich Host) in der Lobby sein.
  */
+export type StartGameOutcome =
+  | { ok: true }
+  | { ok: false; reason: "not_host" | "too_few" };
+
 export async function setGameStarted(
   codeInput: string,
   playerId: string,
   started: boolean,
   userId?: string | null,
-): Promise<boolean> {
+): Promise<StartGameOutcome> {
   const code = normalizeCode(codeInput);
-  if (code.length !== 6) return false;
+  if (code.length !== 6) return { ok: false, reason: "not_host" };
 
   const db = await getDb();
   const [host] = await db
@@ -639,14 +643,24 @@ export async function setGameStarted(
         ownerFilter(userId),
       ),
     );
-  if (!host) return false;
+  if (!host) return { ok: false, reason: "not_host" };
+
+  if (started) {
+    const currentPlayers = await db
+      .select({ id: players.id })
+      .from(players)
+      .where(eq(players.lobbyCode, code));
+    if (currentPlayers.length < MIN_PLAYERS) {
+      return { ok: false, reason: "too_few" };
+    }
+  }
 
   await db
     .update(lobbies)
     .set({ gameStarted: started })
     .where(eq(lobbies.code, code));
   await touchPlayer(code, playerId, userId);
-  return true;
+  return { ok: true };
 }
 
 /** Profil aktualisieren (Name, Farbe, Verlauf, Rahmen – Bild separat). */

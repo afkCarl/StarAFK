@@ -9,14 +9,17 @@ export const POST = route("lobby:start", async (request) => {
   if (!guard.ok) return guard.response;
 
   const body = await readJson(request);
-  const ok = await setGameStarted(
+  const result = await setGameStarted(
     String(body.code ?? ""),
     String(body.playerId ?? ""),
     body.started !== false,
     guard.userId,
   );
-  if (!ok) {
-    return json({ ok: false, reason: "not_host" }, 403);
+  if (!result.ok) {
+    return json(
+      { ok: false, reason: result.reason },
+      result.reason === "not_host" ? 403 : 409,
+    );
   }
   return json({ ok: true });
 });

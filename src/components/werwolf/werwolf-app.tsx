@@ -15,11 +15,14 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { GlassCard } from "@/components/werwolf/glass-card";
+import { LobbyStage } from "@/components/werwolf/lobby-stage";
 import { RoleIcon } from "@/components/werwolf/role-icon";
 import { SkyBackground } from "@/components/werwolf/sky-background";
 import { WalkingCat } from "@/components/werwolf/walking-cat";
 import {
   DEFAULT_COLOR,
+  MAX_PLAYERS,
+  MIN_PLAYERS,
   MODES,
   ROLES,
   colorWash,
@@ -42,7 +45,7 @@ const FRAME_OPTIONS = [
   { id: "frame5", name: "Rahmen 5" },
 ];
 
-type Screen = "menu" | "menuLeaving" | "lobbyEntering" | "lobby";
+type Screen = "menu" | "lobbyLoading" | "lobbyEntering" | "lobby";
 type SlidePhase = "idle" | "start" | "go";
 type JoinPanel = "closed" | "opening" | "open" | "closing";
 type Direction = "left" | "right";
@@ -62,6 +65,8 @@ const MAX_POLL_FAILURES = 8;
 /** Profilbilder werden im Browser verkleinert, damit sie schnell übertragen werden. */
 const AVATAR_MAX_SIZE = 256;
 const AVATAR_MAX_CHARS = 380_000;
+const MIN_LOBBY_LOADING_MS = 520;
+const LOBBY_REVEAL_MS = 460;
 
 type ApiResult<T> =
   | { ok: true; status: number; data: T }
@@ -328,8 +333,8 @@ export default function WerwolfApp() {
   const switchStartRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const switchEndRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const joinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lobbyTransitionStartedAtRef = useRef<number | null>(null);
   const lobbyCodeRef = useRef("");
   const selfIdRef = useRef<string | null>(null);
   const pollFailuresRef = useRef(0);
@@ -900,7 +905,7 @@ export default function WerwolfApp() {
 
   useEffect(
     () => () => {
-      [switchStartRef, switchEndRef, joinTimerRef, leaveTimerRef, enterTimerRef].forEach(
+      [switchStartRef, switchEndRef, joinTimerRef, enterTimerRef].forEach(
         (ref) => {
           if (ref.current) clearTimeout(ref.current);
         },
@@ -929,10 +934,11 @@ export default function WerwolfApp() {
   modeRef.current = mode;
   isHostRef.current = isHost;
   const prevMode = prevModeIndex !== null ? MODES[prevModeIndex] : null;
-  const inMenu = screen === "menu" || screen === "menuLeaving";
+  const inMenu = screen === "menu" || screen === "lobbyLoading";
   const inLobby = screen === "lobbyEntering" || screen === "lobby";
   const isDark = (inMenu && mode.title === "WERWOLF") || inLobby;
   const selectedRoles = ROLES.filter((role) => roleCounts[role.name] > 0);
+  const canStartGame = players.length >= MIN_PLAYERS;
 
   const switchMode = (nextIndex: number, dir: Direction) => {
     if (modeLocked || screen !== "menu") return;
@@ -979,6 +985,20 @@ export default function WerwolfApp() {
     });
   };
 
+  const beginLobbyTransition = () => {
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    enterTimerRef.current = null;
+    lobbyTransitionStartedAtRef.current = Date.now();
+    setScreen("lobbyLoading");
+  };
+
+  const cancelLobbyTransition = () => {
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    enterTimerRef.current = null;
+    lobbyTransitionStartedAtRef.current = null;
+    setScreen("menu");
+  };
+
   const enterLobby = (
     code: string,
     lobbyPlayers: LobbyPlayer[],
@@ -1004,11 +1024,16 @@ export default function WerwolfApp() {
     saveSession(code, id);
     lastAvatarRef.current = profileRef.current?.image ?? null;
     notifyOtherTabs(code);
-    setScreen("menuLeaving");
-    leaveTimerRef.current = setTimeout(() => {
+
+    if (lobbyTransitionStartedAtRef.current === null) beginLobbyTransition();
+    const elapsed = Date.now() - (lobbyTransitionStartedAtRef.current ?? Date.now());
+    const holdRemaining = Math.max(0, MIN_LOBBY_LOADING_MS - elapsed);
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+    enterTimerRef.current = setTimeout(() => {
+      lobbyTransitionStartedAtRef.current = null;
       setScreen("lobbyEntering");
-      enterTimerRef.current = setTimeout(() => setScreen("lobby"), 20);
-    }, 440);
+      enterTimerRef.current = setTimeout(() => setScreen("lobby"), LOBBY_REVEAL_MS);
+    }, holdRemaining);
   };
 
   /** Langsame Free-Instanzen: nach ein paar Sekunden einen Hinweis zeigen. */
@@ -1035,6 +1060,7 @@ export default function WerwolfApp() {
     setCopied(false);
     setRoleModalOpen(false);
     setActionError(null);
+    beginLobbyTransition();
     setBusy("create");
     try {
       const res = await withSlowHint(
@@ -1068,6 +1094,7 @@ export default function WerwolfApp() {
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
+      cancelLobbyTransition();
       setActionError(
         isTransient(reason)
           ? "Der Server ist gerade nicht erreichbar (Render-Free-Instanz wacht erst auf). Bitte warte ein paar Sekunden und versuche es noch einmal."
@@ -1088,6 +1115,7 @@ export default function WerwolfApp() {
     setCopied(false);
     setRoleModalOpen(false);
     setActionError(null);
+    beginLobbyTransition();
     setBusy("join");
     try {
       const res = await withSlowHint(
@@ -1123,9 +1151,10 @@ export default function WerwolfApp() {
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
+      cancelLobbyTransition();
       setActionError(
         reason === "full"
-          ? "Die Lobby ist leider voll (max. 12 Spieler)."
+          ? "Die Lobby ist leider voll (max. 13 Spieler inklusive Host)."
           : reason === "not_found"
             ? "Lobby mit diesem Code wurde nicht gefunden. Prüfe den Code noch einmal."
             : isTransient(reason)
@@ -1141,10 +1170,14 @@ export default function WerwolfApp() {
     const code = lobbyCodeRef.current;
     const pid = selfIdRef.current;
     if (!code || !pid || busy) return;
+    if (started && players.length < MIN_PLAYERS) {
+      setActionError(`Zum Starten müssen mindestens ${MIN_PLAYERS} Spieler in der Lobby sein.`);
+      return;
+    }
     setActionError(null);
     setBusy("start");
     try {
-      const res = await apiRequest(
+      const res = await apiRequest<{ ok: boolean; reason?: string }>(
         "/api/lobby/start",
         {
           method: "POST",
@@ -1153,15 +1186,18 @@ export default function WerwolfApp() {
         15_000,
       );
       if (!res.ok) throw new Error(res.reason);
+      if (!res.data.ok) throw new Error(res.data.reason ?? "server");
       setGameStarted(started);
       notifyOtherTabs(code);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "server";
       setActionError(
         started
-          ? isTransient(reason)
-            ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
-            : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
+          ? reason === "too_few"
+            ? `Zum Starten müssen mindestens ${MIN_PLAYERS} Spieler in der Lobby sein.`
+            : isTransient(reason)
+              ? "Der Server antwortet gerade nicht – bitte versuche es noch einmal."
+              : "Das Spiel konnte nicht gestartet werden. Bitte versuche es erneut."
           : "Das Spiel konnte nicht zurückgesetzt werden.",
       );
     } finally {
@@ -1175,9 +1211,8 @@ export default function WerwolfApp() {
     const pid = selfIdRef.current;
     clearSession();
     if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
-    if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current);
     enterTimerRef.current = null;
-    leaveTimerRef.current = null;
+    lobbyTransitionStartedAtRef.current = null;
     lobbyCodeRef.current = "";
     selfIdRef.current = null;
     setScreen("menu");
@@ -1278,38 +1313,6 @@ export default function WerwolfApp() {
             }
           : {};
 
-  const leftExitStyle = (): React.CSSProperties =>
-    screen === "menuLeaving"
-      ? {
-          transform: "translateX(-110vw)",
-          opacity: 0,
-          transition:
-            "transform 440ms cubic-bezier(0.4,0,0.2,1), opacity 300ms ease",
-        }
-      : { transform: "translateX(0)", opacity: 1 };
-
-  const rightExitStyle = (): React.CSSProperties =>
-    screen === "menuLeaving"
-      ? {
-          transform: "translateX(110vw)",
-          opacity: 0,
-          transition:
-            "transform 440ms cubic-bezier(0.4,0,0.2,1), opacity 300ms ease",
-        }
-      : { transform: "translateX(0)", opacity: 1 };
-
-  const lobbyEnterStyle = (): React.CSSProperties =>
-    screen === "lobbyEntering"
-      ? { transform: "translateY(110%)", opacity: 0, transition: "none" }
-      : screen === "lobby"
-        ? {
-            transform: "translateY(0)",
-            opacity: 1,
-            transition:
-              "transform 520ms cubic-bezier(0.22,1,0.36,1), opacity 520ms ease",
-          }
-        : {};
-
   const menuButtons =
     "w-fit text-left text-[1.75rem] font-bold uppercase transition-all duration-200 hover:translate-x-3 hover:text-neutral-400 sm:text-[2.1rem]";
 
@@ -1320,10 +1323,14 @@ export default function WerwolfApp() {
   return (
     <div
       className={`relative min-h-screen w-full overflow-hidden transition-colors duration-700 ${
-        isDark ? "bg-[#0b1220] text-white" : "bg-white text-black"
+        inLobby
+          ? "bg-[#155a91] text-white"
+          : isDark
+            ? "bg-[#0b1220] text-white"
+            : "bg-white text-black"
       }`}
     >
-      <SkyBackground isActive={isDark} />
+      <SkyBackground isActive={isDark && !inLobby} />
 
       {actionError && (
         <div
@@ -1357,10 +1364,7 @@ export default function WerwolfApp() {
 
       {inMenu && (
         <>
-          <div
-            className="relative z-10 flex min-h-screen flex-col px-4 py-3 sm:px-6 sm:py-4 md:px-8 md:py-5"
-            style={leftExitStyle()}
-          >
+          <div className="relative z-10 flex min-h-screen flex-col px-4 py-3 sm:px-6 sm:py-4 md:px-8 md:py-5">
             <div className="relative flex flex-col pt-0.5">
               <p className="text-[1.4rem] font-black uppercase tracking-wide sm:text-[1.6rem]">
                 SPIELMODUS {modeIndex + 1}/{MODES.length}
@@ -1412,7 +1416,6 @@ export default function WerwolfApp() {
             onClick={prevModeFn}
             className="absolute left-1 top-[42%] z-20 -translate-y-1/2 p-3 transition-all duration-200 hover:-translate-x-1 hover:scale-110 hover:text-neutral-400 sm:left-2 md:left-3"
             aria-label="Vorheriger Gamemode"
-            style={leftExitStyle()}
           >
             <ChevronLeft size={72} strokeWidth={1.5} />
           </button>
@@ -1420,15 +1423,11 @@ export default function WerwolfApp() {
             onClick={nextMode}
             className="absolute right-1 top-[42%] z-20 -translate-y-1/2 p-3 transition-all duration-200 hover:translate-x-1 hover:scale-110 hover:text-neutral-400 sm:right-2 md:right-3"
             aria-label="Nächster Gamemode"
-            style={rightExitStyle()}
           >
             <ChevronRight size={72} strokeWidth={1.5} />
           </button>
 
-          <div
-            className="absolute left-4 top-[calc(42%+120px)] z-20 flex flex-col gap-3 sm:left-6 md:left-8"
-            style={leftExitStyle()}
-          >
+          <div className="absolute left-4 top-[calc(42%+120px)] z-20 flex flex-col gap-3 sm:left-6 md:left-8">
             <button
               onClick={handleCreate}
               disabled={busy === "create"}
@@ -1712,215 +1711,181 @@ export default function WerwolfApp() {
       )}
 
       {inLobby && (
-        <div
-          className="absolute inset-0 z-20 px-4 py-4 text-white sm:px-6 sm:py-6 md:px-8 md:py-8"
-          style={lobbyEnterStyle()}
-        >
-          <div className="custom-scroll mx-auto h-full w-full max-w-[96rem] overflow-y-auto">
-            <div className="grid min-h-full grid-cols-1 gap-4 xl:h-full xl:min-h-0 xl:grid-cols-[minmax(0,2.4fr)_minmax(22rem,1fr)]">
-              <div className="flex min-h-0 flex-col gap-4">
-                <GlassCard className="grid shrink-0 gap-4 px-5 py-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:px-6 sm:py-6">
-                  <div className="min-w-0">
-                    <p className="text-sm font-black uppercase tracking-[0.32em] text-white/50">
-                      Lobbycode
-                    </p>
-                    <p className="mt-3 font-mono text-[clamp(2.3rem,6vw,4.8rem)] font-black uppercase tracking-[0.28em] text-white">
-                      {lobbyCode}
-                    </p>
-                    <div className="mt-4 flex flex-wrap items-center gap-3">
-                      <span
-                        className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-[0.68rem] font-bold uppercase tracking-[0.18em] ${
-                          connection === "ok"
-                            ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
-                            : "border-amber-400/50 bg-amber-400/15 text-amber-100"
-                        }`}
-                        title={
-                          connection === "ok"
-                            ? "Lobby wird live synchronisiert"
-                            : "Kurzer Hänger – die Verbindung wird automatisch wiederhergestellt"
-                        }
-                      >
-                        <span
-                          className={`h-2 w-2 rounded-full ${
-                            connection === "ok"
-                              ? "bg-emerald-400"
-                              : "animate-pulse bg-amber-300"
-                          }`}
-                        />
-                        {connection === "ok"
-                          ? "Live verbunden"
-                          : "Verbindung wird wiederhergestellt …"}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="flex flex-col gap-2 self-start">
-                    <button
-                      onClick={copyCode}
-                      className="flex items-center justify-center gap-2 rounded-[1rem] border border-white/30 bg-white/10 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/70"
-                    >
-                      {copied ? <Check size={18} /> : <Copy size={18} />}
-                      {copied ? "Kopiert" : "Kopieren"}
-                    </button>
-                    <button
-                      onClick={handleLeaveLobby}
-                      className="flex items-center justify-center gap-2 rounded-[1rem] border border-white/25 bg-white/5 px-3 py-2 text-sm font-bold uppercase tracking-wide text-white/70 transition-all duration-200 hover:border-red-400/50 hover:bg-red-500/15 hover:text-red-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/70"
-                    >
-                      <LogOut size={18} />
-                      Lobby verlassen
-                    </button>
-                  </div>
-                </GlassCard>
-                <GlassCard className="flex min-h-0 flex-1 flex-col p-3 sm:p-4">
-                  <div className="custom-scroll grid auto-rows-[minmax(11rem,1fr)] grid-cols-1 gap-3 overflow-y-auto p-2 md:grid-cols-2 2xl:grid-cols-3">
-                    {players.map((player) => {
-                      const isSelf = player.id === selfId;
-                      const displayName =
-                        isSelf ? name || "NAME" : player.name;
-                      const displayColor = isSelf ? color : player.color;
-                      const displayIntensity =
-                        isSelf ? fadeIntensity : player.fadeIntensity;
-                      const displayImage = isSelf ? image : player.image;
-                      const displayFrame = isSelf ? frame : player.frame;
-                      const playerSpeaking = isSelf && isSpeaking;
-                      return (
-                        <div
-                          key={player.id || player.name}
-                          className={`relative flex min-h-[11rem] flex-col items-center justify-center overflow-hidden rounded-[1.4rem] border-2 bg-[#172033] px-4 py-5 text-center transition-all duration-150 ${
-                            playerSpeaking
-                              ? "border-[#4ade80] shadow-[0_0_20px_rgba(34,197,94,0.95),0_0_44px_rgba(34,197,94,0.55),inset_0_0_20px_rgba(34,197,94,0.4)] ring-2 ring-[#4ade80]"
-                              : "border-white/15"
-                          }`}
-                        >
-                          {displayColor && displayColor !== DEFAULT_COLOR && (
-                            <div
-                              className="pointer-events-none absolute inset-0"
-                              style={{
-                                background: colorWash(
-                                  displayColor,
-                                  displayIntensity ?? 50,
-                                  70,
-                                ),
-                              }}
-                            />
-                          )}
-                          <div className="relative z-10 flex h-20 w-20 items-center justify-center overflow-hidden rounded-full text-xl font-black uppercase text-white drop-shadow-md">
-                            {displayImage ? (
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img
-                                src={displayImage}
-                                alt="Profile"
-                                className="h-full w-full object-cover"
-                              />
-                            ) : (
-                              <div className="flex h-full w-full items-center justify-center bg-white/10">
-                                {displayName.slice(0, 1) || "?"}
-                              </div>
-                            )}
-                          </div>
-                          {displayFrame === "frame1" && (
-                            <WalkingCat cardWidth={280} />
-                          )}
-                          <p className="relative z-10 mt-4 break-all text-[1.6rem] font-black uppercase leading-none text-white drop-shadow-md sm:text-[1.9rem]">
-                            {displayName}
-                          </p>
-                          <p className="relative z-10 mt-2 text-xs font-bold uppercase tracking-[0.3em] text-white/50">
-                            {player.isHost ? "Host" : "Player"}
-                          </p>
-                        </div>
-                      );
-                    })}
-                    <div className="min-h-[11rem] rounded-[1.4rem] border border-dashed border-white/20" />
-                    <div className="hidden min-h-[11rem] rounded-[1.4rem] border border-dashed border-white/20 md:block" />
-                    <div className="hidden min-h-[11rem] rounded-[1.4rem] border border-dashed border-white/20 2xl:block" />
-                  </div>
-                </GlassCard>
-              </div>
-              <aside className="flex min-h-0 flex-col gap-4">
-                <GlassCard className="flex min-h-0 flex-col p-4 xl:flex-[3]">
-                  <p className="shrink-0 text-xs font-black uppercase tracking-[0.28em] text-white/50">
-                    Rollen für diese Runde
+        <div className="absolute inset-0 z-20 text-white">
+          <div className="lobby-scene absolute inset-0" aria-hidden="true" />
+          <header className="absolute inset-x-3 top-3 z-30 flex flex-wrap items-center justify-between gap-2 sm:inset-x-5 sm:top-4 sm:gap-4">
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+              <GlassCard className="flex shrink-0 items-center gap-3 rounded-[1.15rem] px-3 py-2 sm:rounded-[1.4rem] sm:px-4 sm:py-2.5">
+                <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-sky-200/30 bg-sky-200/10 text-[0.7rem] font-black tracking-tight text-sky-50 sm:h-10 sm:w-10">
+                  W
+                </div>
+                <div>
+                  <p className="text-[0.6rem] font-black uppercase tracking-[0.24em] text-white/55 sm:text-[0.65rem]">
+                    Werwolf-Lobby
                   </p>
-                  <div className="custom-scroll mt-4 max-h-80 space-y-2 overflow-y-auto pr-1 xl:max-h-none xl:flex-1">
+                  <p className="text-sm font-black text-white sm:text-base">
+                    {players.length} / {MAX_PLAYERS} Spieler
+                  </p>
+                </div>
+              </GlassCard>
+              <div className="hidden flex-col gap-1.5 md:flex">
+                <span
+                  className={`flex items-center gap-2 text-xs font-bold ${
+                    connection === "ok" ? "text-emerald-100" : "text-amber-100"
+                  }`}
+                  title={
+                    connection === "ok"
+                      ? "Lobby wird live synchronisiert"
+                      : "Verbindung wird automatisch wiederhergestellt"
+                  }
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      connection === "ok"
+                        ? "bg-emerald-300"
+                        : "animate-pulse bg-amber-300"
+                    }`}
+                  />
+                  {connection === "ok" ? "Live verbunden" : "Verbindung wird wiederhergestellt …"}
+                </span>
+                <span className="text-[0.7rem] font-semibold text-white/65">
+                  {canStartGame
+                    ? "Genug Spieler — ihr könnt starten."
+                    : `Noch ${MIN_PLAYERS - players.length} Spieler bis zum Start.`}
+                </span>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+              <GlassCard className="flex items-center gap-2 rounded-[1.1rem] px-3 py-2 sm:gap-3 sm:rounded-[1.3rem] sm:px-4">
+                <span className="hidden text-[0.6rem] font-black uppercase tracking-[0.22em] text-white/45 sm:inline">
+                  Lobbycode
+                </span>
+                <span className="font-mono text-sm font-black tracking-[0.18em] text-white sm:text-base sm:tracking-[0.24em]">
+                  {lobbyCode}
+                </span>
+              </GlassCard>
+              <button
+                onClick={copyCode}
+                aria-label={copied ? "Lobbycode kopiert" : "Lobbycode kopieren"}
+                title={copied ? "Kopiert" : "Lobbycode kopieren"}
+                className="flex h-10 w-10 items-center justify-center rounded-[1rem] border border-white/25 bg-white/10 text-white transition hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/80 sm:h-11 sm:w-11"
+              >
+                {copied ? <Check size={18} /> : <Copy size={18} />}
+              </button>
+              <button
+                onClick={handleLeaveLobby}
+                aria-label="Lobby verlassen"
+                title="Lobby verlassen"
+                className="flex h-10 w-10 items-center justify-center rounded-[1rem] border border-white/25 bg-white/10 text-white/80 transition hover:border-red-200/50 hover:bg-red-400/20 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/80 sm:h-11 sm:w-11"
+              >
+                <LogOut size={18} />
+              </button>
+            </div>
+          </header>
+
+          <LobbyStage
+            players={players}
+            selfId={selfId}
+            profile={profile}
+            isSpeaking={isSpeaking}
+          />
+
+          <footer className="absolute inset-x-3 bottom-3 z-30 mx-auto max-w-6xl sm:inset-x-5 sm:bottom-4">
+            <GlassCard className="rounded-[1.35rem] border-white/20 bg-[#071a2c]/70 p-3 shadow-[0_16px_50px_rgba(0,0,0,0.28)] sm:rounded-[1.6rem] sm:px-4 sm:py-3">
+              <div className="flex flex-col gap-3 sm:gap-2 lg:flex-row lg:items-center lg:justify-between">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                    <p className="text-[0.62rem] font-black uppercase tracking-[0.24em] text-white/55">
+                      Rollen für diese Runde
+                    </p>
+                    <p className="text-[0.65rem] font-semibold text-white/40">
+                      Sonstige Regeln: keine besonderen Regeln
+                    </p>
+                  </div>
+                  <div className="custom-scroll mt-2 flex max-w-full gap-2 overflow-x-auto pb-1">
                     {selectedRoles.length > 0 ? (
                       selectedRoles.map((role) => (
                         <button
                           key={role.name}
                           onClick={() => setRoleDetail(role.name)}
-                          className="flex w-full items-center justify-between rounded-[1rem] border border-white/15 bg-white/5 px-3 py-2 text-left transition-all duration-150 hover:border-white/30 hover:bg-white/10"
+                          className="flex shrink-0 items-center gap-2 rounded-full border border-white/15 bg-white/[0.07] px-3 py-1.5 text-left transition hover:border-white/30 hover:bg-white/15"
+                          title={`${role.name} – Details anzeigen`}
                         >
-                          <div className="flex items-center gap-3">
-                            <div className="flex h-9 w-9 shrink-0 items-center justify-center text-[0.8rem] text-white/70">
-                              <RoleIcon name={role.name} short={role.short} />
-                            </div>
-                            <span className="text-[1.05rem] font-bold uppercase text-white">
-                              {role.name}
-                            </span>
-                          </div>
-                          <span className="text-[1.1rem] font-black text-white">
-                            {roleCounts[role.name]}
+                          <span className="flex h-5 w-5 items-center justify-center text-white/75">
+                            <RoleIcon name={role.name} short={role.short} />
+                          </span>
+                          <span className="text-[0.7rem] font-bold uppercase tracking-wide text-white/90">
+                            {role.name}
+                          </span>
+                          <span className="text-xs font-black text-sky-100">
+                            ×{roleCounts[role.name]}
                           </span>
                         </button>
                       ))
                     ) : (
-                      <div className="rounded-[1rem] border border-dashed border-white/20 bg-white/5 px-3 py-4 text-sm font-semibold text-white/45">
+                      <span className="py-1.5 text-xs font-semibold text-white/45">
                         Keine Rollen ausgewählt.
-                      </div>
+                      </span>
                     )}
                   </div>
+                </div>
+                <div className="flex shrink-0 flex-col gap-2 sm:flex-row sm:items-center">
                   {isHost && (
                     <button
                       onClick={() => setRoleModalOpen(true)}
-                      className="mt-4 rounded-[1rem] border border-white/30 bg-white/10 px-4 py-3 text-sm font-black uppercase tracking-[0.18em] text-white transition-all duration-200 hover:bg-white/20"
+                      className="rounded-[1rem] border border-white/25 bg-white/[0.07] px-4 py-2.5 text-xs font-black uppercase tracking-[0.15em] text-white transition hover:bg-white/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/80"
                     >
                       Rollen auswählen
                     </button>
                   )}
-                </GlassCard>
-                <GlassCard className="min-h-[10rem] p-5 xl:flex-[2]">
-                  <p className="text-xs font-black uppercase tracking-[0.28em] text-white/50">
-                    Sonstige Regeln
-                  </p>
-                  <p className="mt-3 text-sm font-semibold text-white/30">
-                    Keine besonderen Regeln festgelegt.
-                  </p>
-                </GlassCard>
-                {isHost ? (
-                  gameStarted ? (
-                    <div className="flex flex-col gap-2">
-                      <div className="rounded-[1.5rem] border border-green-400/40 bg-green-400/15 px-5 py-4 text-center text-[1.25rem] font-black uppercase tracking-[0.16em] text-green-200">
-                        Spiel läuft
+                  {isHost ? (
+                    gameStarted ? (
+                      <div className="flex items-center gap-2">
+                        <span className="rounded-full border border-emerald-300/35 bg-emerald-300/10 px-3 py-2 text-xs font-black uppercase tracking-wider text-emerald-100">
+                          Spiel läuft
+                        </span>
+                        <button
+                          onClick={() => handleStartGame(false)}
+                          disabled={busy === "start"}
+                          className="rounded-[1rem] border border-white/20 bg-white/5 px-3 py-2 text-xs font-bold uppercase tracking-wide text-white/75 transition hover:bg-white/15 disabled:opacity-50"
+                        >
+                          Zurück zur Lobby
+                        </button>
                       </div>
-                      <button
-                        onClick={() => handleStartGame(false)}
-                        disabled={busy === "start"}
-                        className="rounded-[1rem] border border-white/20 bg-white/5 px-4 py-2 text-xs font-bold uppercase tracking-[0.18em] text-white/60 transition-all duration-200 hover:bg-white/10 hover:text-white disabled:animate-pulse disabled:opacity-50"
-                      >
-                        Zurück zur Lobby
-                      </button>
-                    </div>
+                    ) : (
+                      <div className="flex flex-col gap-1.5">
+                        <button
+                          onClick={() => handleStartGame(true)}
+                          disabled={busy === "start" || !canStartGame}
+                          title={
+                            canStartGame
+                              ? "Spiel starten"
+                              : `Mindestens ${MIN_PLAYERS} Spieler erforderlich`
+                          }
+                          className="rounded-[1rem] border border-white/35 bg-white/15 px-5 py-2.5 text-sm font-black uppercase tracking-[0.13em] text-white backdrop-blur-sm transition hover:-translate-y-0.5 hover:bg-white hover:text-[#113b5b] disabled:cursor-not-allowed disabled:border-white/15 disabled:bg-white/[0.06] disabled:text-white/40 disabled:hover:translate-y-0 disabled:hover:bg-white/[0.06]"
+                        >
+                          {busy === "start" ? "Startet…" : "Spiel starten"}
+                        </button>
+                        {!canStartGame && (
+                          <p className="text-center text-[0.62rem] font-semibold text-white/55">
+                            Noch {MIN_PLAYERS - players.length} Spieler nötig
+                          </p>
+                        )}
+                      </div>
+                    )
                   ) : (
-                    <button
-                      onClick={() => handleStartGame(true)}
-                      disabled={busy === "start"}
-                      className="rounded-[1.5rem] border border-white/30 bg-white/15 px-5 py-4 text-[1.25rem] font-black uppercase tracking-[0.16em] text-white backdrop-blur-sm transition-all duration-200 hover:-translate-y-1 hover:bg-white hover:text-black disabled:animate-pulse disabled:opacity-50"
-                    >
-                      {busy === "start" ? "Startet…" : "Spiel starten"}
-                    </button>
-                  )
-                ) : (
-                  <div
-                    className={`rounded-[1.5rem] border px-5 py-4 text-center text-sm font-bold uppercase tracking-[0.16em] ${
-                      gameStarted
-                        ? "border-green-400/40 bg-green-400/15 text-green-200"
-                        : "border-white/10 bg-white/5 text-white/40"
-                    }`}
-                  >
-                    {gameStarted ? "Das Spiel läuft!" : "Warte auf Host…"}
-                  </div>
-                )}
-              </aside>
-            </div>
-          </div>
+                    <div className="rounded-[1rem] border border-white/15 bg-white/[0.05] px-4 py-2.5 text-center text-xs font-bold uppercase tracking-[0.12em] text-white/65">
+                      {gameStarted
+                        ? "Das Spiel läuft!"
+                        : canStartGame
+                          ? "Warte auf Host …"
+                          : `Noch ${MIN_PLAYERS - players.length} Spieler bis zum Start`}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </GlassCard>
+          </footer>
 
           {detailRole &&
             (() => {
@@ -2124,6 +2089,32 @@ export default function WerwolfApp() {
                   })}
                 </div>
               </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {(screen === "lobbyLoading" || screen === "lobbyEntering") && (
+        <div
+          className={`lobby-transition-overlay ${
+            screen === "lobbyLoading"
+              ? "lobby-transition-overlay--loading"
+              : "lobby-transition-overlay--revealing"
+          }`}
+          role={screen === "lobbyLoading" ? "status" : undefined}
+          aria-live={screen === "lobbyLoading" ? "polite" : undefined}
+        >
+          {screen === "lobbyLoading" && (
+            <div className="flex flex-col items-center gap-4 px-6 text-center">
+              <span className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-sky-300" />
+              <p className="text-xs font-black uppercase tracking-[0.34em] text-white/80">
+                Lobby wird vorbereitet
+              </p>
+              {slowHint && (
+                <p className="max-w-md text-sm font-medium leading-6 text-white/50">
+                  {slowHint}
+                </p>
+              )}
             </div>
           )}
         </div>
